@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AudioTest – Server</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+  body { font-family: monospace; background: white; color: black; margin: 20px; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  h2 { font-size: 14px; margin: 16px 0 6px; border-bottom: 1px solid black; padding-bottom: 2px; }
+  h3 { font-size: 13px; margin: 10px 0 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-bottom: 8px; }
+  th, td { border: 1px solid #aaa; padding: 4px 8px; text-align: left; }
+  th { background: #eee; }
+  input, select, textarea { font-family: monospace; font-size: 12px; border: 1px solid black; padding: 3px 6px; }
+  button { font-family: monospace; font-size: 12px; border: 1px solid black; background: white; padding: 3px 10px; cursor: pointer; }
+  button:hover { background: #eee; }
+  button:active { background: #ddd; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  .section { margin-bottom: 20px; }
+  #log-box { font-size: 11px; background: #f8f8f8; border: 1px solid #ccc; padding: 8px; height: 200px; overflow-y: auto; white-space: pre-wrap; }
+  .status-idle    { color: green; }
+  .status-running { color: orange; font-weight: bold; }
+  .status-stale   { color: gray; }
+  .status-disconnected { color: red; }
+  label { font-size: 12px; }
+  hr { border: none; border-top: 1px solid #ddd; margin: 12px 0; }
+  .note { font-size: 11px; color: #555; }
+</style>
+</head>
+<body>
+
+<h1>AudioTest — Server Dashboard</h1>
+<div class="note" id="server-info">Loading…</div>
+
+<h2>Connected Clients</h2>
+<table id="client-table">
+  <thead>
+    <tr>
+      <th>Client ID</th>
+      <th>IP</th>
+      <th>Status</th>
+      <th>CPU</th>
+      <th>MEM</th>
+      <th>Input Device</th>
+      <th>Output Device</th>
+      <th>Last Seen</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody id="client-tbody">
+    <tr><td colspan="9">No clients connected.</td></tr>
+  </tbody>
+</table>
+
+<h2>Client Details</h2>
+<div id="client-detail-area">
+  <div class="note">Click a client row to see its audio devices and controls.</div>
+</div>
+
+<h2>Run Test</h2>
+<div class="section">
+  <div class="row">
+    <label>Test:</label>
+    <select id="test-select" onchange="onTestSelect()"><option value="">-- loading --</option></select>
+    <button onclick="refreshTests()">↺</button>
+  </div>
+
+  <!-- Standalone test: simple client checkboxes -->
+  <div id="standalone-section">
+    <div class="row">
+      <label>Target clients:</label>
+      <div id="target-checkboxes" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+      <button onclick="checkAllClients()">All</button>
+      <button onclick="uncheckAllClients()">None</button>
+    </div>
+  </div>
+
+  <!-- Grouped test: one row per role -->
+  <div id="roles-section" style="display:none">
+    <div id="single-client-banner" style="margin-bottom:6px"></div>
+    <table id="roles-table" style="width:100%;font-size:12px;border-collapse:collapse;margin-bottom:8px">
+      <thead>
+        <tr>
+          <th style="border:1px solid #aaa;padding:4px 8px;background:#eee;text-align:left">Role / Script</th>
+          <th style="border:1px solid #aaa;padding:4px 8px;background:#eee;text-align:left">Assign clients</th>
+        </tr>
+      </thead>
+      <tbody id="roles-tbody"></tbody>
+    </table>
+    <div class="note" id="roles-note">Assign clients to roles. A client assigned to multiple roles runs them sequentially.</div>
+  </div>
+
+  <div class="row" style="margin-top:8px">
+    <label>Extra params (JSON):</label>
+    <input type="text" id="test-params" value="{}" style="width:300px">
+  </div>
+  <div class="row">
+    <button onclick="runTest()">▶ Run Test</button>
+    <button onclick="stopAll()" style="margin-left:16px;color:red;font-weight:bold">■ Stop All</button>
+    <span id="run-status" class="note"></span>
+  </div>
+</div>
+
+<!-- <h2>Shell Command</h2>
+<div class="section">
+  <div class="row">
+    <label>Target:</label>
+    <select id="cmd-target"><option value="__all__">All clients</option></select>
+  </div>
+  <div class="row">
+    <input type="text" id="cmd-input" placeholder="e.g. ls /tests" style="width:400px"
+           onkeydown="if(event.key==='Enter') sendCommand()">
+    <button onclick="sendCommand()">▶ Run</button>
+  </div>
+  <div id="cmd-output" style="margin-top:6px;"></div>
+</div> -->
+
+<h2>Results</h2>
+<div class="row">
+  <button onclick="loadResults()">↺ Refresh</button>
+</div>
+<div id="results-area" class="note">Click refresh to load.</div>
+
+<h2>Server Log</h2>
+<div class="row">
+  <button onclick="clearLog()">Clear</button>
+  <button onclick="loadLog()">↺ Refresh</button>
+</div>
+<div id="log-box"></div>
+
+<script>
+const socket = io();
+let clients = {};
+
+socket.on('connect', () => {
+  loadClients();  // re-seed after reconnect
+});
+
+// ── Initial load ──────────────────────────────────────────────────────────────
+window.onload = () => {
+  loadServerInfo();
+  loadClients();       // seed table from server state on every page load/refresh
+  refreshTests();
+  loadLog();
+  setInterval(loadServerInfo, 5000);
+  setInterval(loadClients, 8000);  // re-sync periodically in case of missed events
+};
+
+function loadClients() {
+  fetch('/api/clients').then(r=>r.json()).then(d => {
+    const incoming = d.clients || {};
+    // Merge: add/update without wiping clients that sent a socket event just now
+    let changed = false;
+    for (const [id, info] of Object.entries(incoming)) {
+      if (JSON.stringify(clients[id]) !== JSON.stringify(info)) {
+        clients[id] = info;
+        changed = true;
+      }
+    }
+    // Remove clients no longer on server
+    for (const id of Object.keys(clients)) {
+      if (!incoming[id]) { delete clients[id]; changed = true; }
+    }
+    if (changed) {
+      renderClientTable();
+      updateTargetCheckboxes();
+      updateCmdTarget();
+    }
+  });
+}
+
+function loadServerInfo() {
+  fetch('/api/status').then(r=>r.json()).then(d => {
+    document.getElementById('server-info').textContent =
+      `role: server | clients: ${d.clients_connected} | ${new Date().toLocaleTimeString()}`;
+  });
+}
+
+// ── Socket.IO ─────────────────────────────────────────────────────────────────
+socket.on('client_joined', data => {
+  clients[data.client_id] = data.info;
+  renderClientTable();
+  updateTargetCheckboxes();
+  updateCmdTarget();
+  logLine(`[join] ${data.client_id} connected from ${data.info.ip}`);
+});
+
+socket.on('client_left', data => {
+  delete clients[data.client_id];
+  renderClientTable();
+  updateTargetCheckboxes();
+  updateCmdTarget();
+  logLine(`[leave] ${data.client_id} disconnected`);
+});
+
+socket.on('client_stats', data => {
+  if (clients[data.client_id]) {
+    clients[data.client_id].stats  = data.stats  || {};
+    clients[data.client_id].status = data.status || 'idle';
+    updateClientRow(data.client_id);
+  }
+});
+
+socket.on('client_device_changed', data => {
+  if (clients[data.client_id]) {
+    clients[data.client_id].selected_input  = data.input;
+    clients[data.client_id].selected_output = data.output;
+    updateClientRow(data.client_id);
+    // Refresh detail pane if this client is currently open
+    const area = document.getElementById('client-detail-area');
+    if (area.querySelector(`h3`)?.textContent.startsWith(`Client: ${data.client_id}`)) {
+      showClientDetail(data.client_id);
+    }
+  }
+});
+
+socket.on('server_log', entry => {
+  logLine(`[${entry.ts}][${entry.client}][${entry.level}] ${entry.msg}`);
+});
+
+socket.on('test_result_update', data => {
+  const s = data.status === 'ok' ? 'OK' : 'ERROR';
+  logLine(`[test result] ${data.client_id} → ${s} (rc=${data.returncode})`);
+  if (data.output) {
+    const area = document.getElementById('cmd-output');
+    area.innerHTML = `<b>Test output from ${data.client_id}:</b><pre style="background:#f8f8f8;border:1px solid #ccc;padding:8px;font-size:11px;overflow-x:auto">${escHtml(data.output)}</pre>`;
+  }
+  document.getElementById('run-status').textContent =
+    `${data.client_id}: ${s}`;
+});
+
+socket.on('command_result_update', data => {
+  const area = document.getElementById('cmd-output');
+  area.innerHTML = `<b>Output from ${data.client_id}:</b><pre style="background:#f8f8f8;border:1px solid #ccc;padding:8px;font-size:11px;overflow-x:auto">$ ${escHtml(data.command)}\n${escHtml(data.stdout)}${data.stderr ? '\n[stderr]\n'+escHtml(data.stderr) : ''}</pre>`;
+});
+
+// ── Client table ──────────────────────────────────────────────────────────────
+function renderClientTable() {
+  const tbody = document.getElementById('client-tbody');
+  const ids = Object.keys(clients);
+  if (!ids.length) {
+    tbody.innerHTML = '<tr><td colspan="9">No clients connected.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = ids.map(id => clientRow(id)).join('');
+}
+
+function devName(devices, id) {
+  if (id === null || id === undefined) return '—';
+  const d = (devices || []).find(x => x.id == id);
+  return d ? `#${id} ${d.name}` : `#${id}`;
+}
+
+function clientRow(id) {
+  const c  = clients[id];
+  const s  = c.stats || {};
+  const st = c.status || 'idle';
+  const devs = c.devices || {};
+  const inp = devName(devs.inputs,  c.selected_input);
+  const out = devName(devs.outputs, c.selected_output);
+  const ts  = c.last_seen ? new Date(c.last_seen*1000).toLocaleTimeString() : '—';
+  return `<tr id="crow-${id}">
+    <td><b>${id}</b></td>
+    <td>${c.ip || '—'}:${c.port || ''}</td>
+    <td class="status-${st}">${st}</td>
+    <td>${s.cpu_pct != null ? s.cpu_pct+'%' : '—'}</td>
+    <td>${s.mem_pct != null ? s.mem_pct+'%' : '—'}</td>
+    <td>${inp}</td>
+    <td>${out}</td>
+    <td>${ts}</td>
+    <td>
+      <button onclick="showClientDetail('${id}')">Devices</button>
+      <button onclick="sendDevicePrompt('${id}')">Set Device</button>
+    </td>
+  </tr>`;
+}
+
+function updateClientRow(id) {
+  const el = document.getElementById(`crow-${id}`);
+  if (el) el.outerHTML = clientRow(id);
+}
+
+// ── Client detail / device selection ─────────────────────────────────────────
+function showClientDetail(id) {
+  const c = clients[id];
+  if (!c) return;
+  const devs    = c.devices || {};
+  const inputs  = devs.inputs  || [];
+  const outputs = devs.outputs || [];
+  const selIn   = c.selected_input;
+  const selOut  = c.selected_output;
+
+  // Look up names for header summary
+  const inDev  = inputs.find(d => d.id == selIn);
+  const outDev = outputs.find(d => d.id == selOut);
+  const inStr  = inDev  ? `#${inDev.id} — ${escHtml(inDev.name)}`   : (selIn  !== null && selIn  !== undefined ? `#${selIn}`  : '—');
+  const outStr = outDev ? `#${outDev.id} — ${escHtml(outDev.name)}` : (selOut !== null && selOut !== undefined ? `#${selOut}` : '—');
+
+  let html = `<h3>Client: ${id} (${c.ip})</h3>`;
+  html += `<div class="note" style="margin-bottom:8px">
+    Input: <b>${inStr}</b> &nbsp;|&nbsp; Output: <b>${outStr}</b>
+  </div>`;
+
+  const devRow = (d, type, sel) => {
+    const isSel = d.id == sel;
+    return `<tr style="${isSel ? 'background:#ffe;font-weight:bold' : ''}">
+      <td>${d.id}</td><td>${escHtml(d.name)}</td><td>${d.channels}</td><td>${d.sample_rate}</td>
+      <td><button onclick="setClientDevice('${id}','${type}',${d.id})">${isSel ? '✓ Active' : 'Use'}</button></td>
+    </tr>`;
+  };
+
+  html += `<b>Input devices:</b>
+  <table>
+    <thead><tr><th>#</th><th>Name</th><th>Channels</th><th>Sample Rate</th><th></th></tr></thead>
+    <tbody>${inputs.map(d => devRow(d,'input',selIn)).join('') || '<tr><td colspan="5">None found</td></tr>'}</tbody>
+  </table>`;
+
+  html += `<b>Output devices:</b>
+  <table>
+    <thead><tr><th>#</th><th>Name</th><th>Channels</th><th>Sample Rate</th><th></th></tr></thead>
+    <tbody>${outputs.map(d => devRow(d,'output',selOut)).join('') || '<tr><td colspan="5">None found</td></tr>'}</tbody>
+  </table>`;
+
+  document.getElementById('client-detail-area').innerHTML = html;
+}
+
+function setClientDevice(clientId, type, deviceId) {
+  const body = {};
+  body[type] = deviceId;
+  fetch(`/api/clients/${clientId}/set_device`, {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+  }).then(r => r.json()).then(d => {
+    logLine(`Set ${type} device #${deviceId} on ${clientId}`);
+    if (clients[clientId]) {
+      if (type === 'input')  clients[clientId].selected_input  = deviceId;
+      if (type === 'output') clients[clientId].selected_output = deviceId;
+      updateClientRow(clientId);
+      showClientDetail(clientId);
+    }
+  });
+}
+
+function sendDevicePrompt(id) {
+  showClientDetail(id);
+  document.getElementById('client-detail-area').scrollIntoView({behavior:'smooth'});
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+let _allTests = [];  // populated by refreshTests
+
+function refreshTests() {
+  fetch('/api/tests').then(r=>r.json()).then(d => {
+    _allTests = d.tests || [];
+    const sel = document.getElementById('test-select');
+    if (!_allTests.length) {
+      sel.innerHTML = '<option value="">No test scripts found</option>';
+      return;
+    }
+    sel.innerHTML = _allTests.map(t => {
+      const label = t.roles.length
+        ? `${t.name}  [${t.roles.map(r=>r.role).join(' | ')}]`
+        : t.name;
+      return `<option value="${escAttr(t.name)}">${escHtml(label)}</option>`;
+    }).join('');
+    onTestSelect();
+  });
+}
+
+function onTestSelect() {
+  const name = document.getElementById('test-select').value;
+  const test = _allTests.find(t => t.name === name);
+  if (!test) return;
+  const hasRoles = test.roles && test.roles.length > 0;
+  document.getElementById('standalone-section').style.display = hasRoles ? 'none' : '';
+  document.getElementById('roles-section').style.display      = hasRoles ? ''     : 'none';
+  if (hasRoles) { renderRolesTable(test.roles); updateRolesNote(); }
+  else          updateTargetCheckboxes();
+}
+
+function assignAllRoles(clientId) {
+  document.querySelectorAll('.role-cb').forEach(cb => {
+    cb.checked = (cb.value === clientId);
+  });
+  updateRolesNote();
+}
+
+function renderRolesTable(roles) {
+  const clientIds = Object.keys(clients);
+
+  // Single-client shortcut banner
+  const banner = document.getElementById('single-client-banner');
+  if (clientIds.length === 1) {
+    const id = clientIds[0];
+    banner.innerHTML = `<b>Only one client connected.</b>
+      <button onclick="assignAllRoles('${escAttr(id)}')" style="margin-left:8px">
+        Assign all roles to ${escHtml(id)}
+      </button>
+      <span class="note" style="margin-left:6px">(roles run concurrently on the same machine)</span>`;
+  } else {
+    banner.innerHTML = '';
+  }
+
+  const tbody = document.getElementById('roles-tbody');
+  tbody.innerHTML = roles.map(r => {
+    const checkboxes = clientIds.map(id =>
+      `<label style="margin-right:8px">
+        <input type="checkbox" class="role-cb" data-role="${escAttr(r.role)}" value="${id}"> ${id}
+       </label>`
+    ).join('');
+    return `<tr>
+      <td style="border:1px solid #aaa;padding:4px 8px;vertical-align:top">
+        <b>${escHtml(r.role)}</b><br>
+        <span class="note">${escHtml(r.filename)}</span>
+      </td>
+      <td style="border:1px solid #aaa;padding:4px 8px">${checkboxes || '<span class="note">no clients</span>'}</td>
+    </tr>`;
+  }).join('');
+
+  // When a checkbox changes, update the sequential-mode note
+  tbody.querySelectorAll('.role-cb').forEach(cb => {
+    cb.addEventListener('change', updateRolesNote);
+  });
+  updateRolesNote();
+}
+
+function updateRolesNote() {
+  const note = document.getElementById('roles-note');
+  if (!note) return;
+  // Find any client assigned to more than one role
+  const clientRoles = {};
+  document.querySelectorAll('.role-cb:checked').forEach(cb => {
+    clientRoles[cb.value] = (clientRoles[cb.value] || 0) + 1;
+  });
+  const sequential = Object.entries(clientRoles).filter(([,n]) => n > 1).map(([id]) => id);
+  if (sequential.length) {
+    note.textContent = `Note: ${sequential.join(', ')} assigned to multiple roles — roles run concurrently on that client.`;
+  } else {
+    note.textContent = 'Assign clients to roles. A client can be assigned to multiple roles - they run concurrently.';
+  }
+}
+
+function updateTargetCheckboxes() {
+  const wrap = document.getElementById('target-checkboxes');
+  wrap.innerHTML = Object.keys(clients).map(id =>
+    `<label><input type="checkbox" class="client-cb" value="${id}" checked> ${id}</label>`
+  ).join('');
+}
+
+function updateCmdTarget() {
+  const sel = document.getElementById('cmd-target');
+  const cur = sel.value;
+  sel.innerHTML = `<option value="__all__">All clients</option>` +
+    Object.keys(clients).map(id => `<option value="${id}">${id}</option>`).join('');
+  sel.value = cur || '__all__';
+}
+
+function checkAllClients()   { document.querySelectorAll('.client-cb').forEach(c => c.checked=true);  }
+function uncheckAllClients() { document.querySelectorAll('.client-cb').forEach(c => c.checked=false); }
+
+function runTest() {
+  const testName = document.getElementById('test-select').value;
+  if (!testName) { alert('Select a test first.'); return; }
+  const test = _allTests.find(t => t.name === testName);
+  if (!test) return;
+
+  let params = {};
+  try { params = JSON.parse(document.getElementById('test-params').value || '{}'); }
+  catch(e) { alert('Invalid JSON in params field.'); return; }
+
+  let body;
+  if (test.roles && test.roles.length) {
+    // Build roles map from checkboxes
+    const rolesMap = {};
+    document.querySelectorAll('.role-cb:checked').forEach(cb => {
+      const role = cb.dataset.role;
+      if (!rolesMap[role]) rolesMap[role] = [];
+      rolesMap[role].push(cb.value);
+    });
+    const total = Object.values(rolesMap).flat().length;
+    if (!total) { alert('Assign at least one client to a role.'); return; }
+    body = { test: testName, params, roles: rolesMap };
+    logLine(`[run] test=${testName} roles=${JSON.stringify(rolesMap)}`);
+  } else {
+    const checked = [...document.querySelectorAll('.client-cb:checked')].map(c => c.value);
+    if (!checked.length) { alert('Select at least one target client.'); return; }
+    body = { test: testName, params, clients: checked };
+    logLine(`[run] test=${testName} clients=${checked.join(',')}`);
+  }
+
+  document.getElementById('run-status').textContent = 'Dispatching…';
+  fetch('/api/tests/run', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  }).then(r=>r.json()).then(d => {
+    const msg = d.ok ? `run_id: ${d.run_id}` : `error: ${d.error}`;
+    document.getElementById('run-status').textContent = msg;
+    if (d.unreachable && d.unreachable.length)
+      logLine(`[warn] unreachable: ${d.unreachable.join(',')}`);
+  });
+}
+
+function stopAll() {
+  if (!confirm('Send stop signal to all clients?')) return;
+  fetch('/api/stop/all', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      const msg = d.ok ? `Stopped: ${(d.stopped||[]).join(', ') || 'none running'}` : `error: ${d.error}`;
+      document.getElementById('run-status').textContent = msg;
+      logLine(`[stop] ${msg}`);
+    });
+}
+
+// ── Shell command ─────────────────────────────────────────────────────────────
+function sendCommand() {
+  const cmd    = document.getElementById('cmd-input').value.trim();
+  const target = document.getElementById('cmd-target').value;
+  if (!cmd) return;
+
+  const targets = target === '__all__' ? Object.keys(clients) : [target];
+  targets.forEach(id => {
+    fetch(`/api/clients/${id}/command`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ command: cmd })
+    });
+  });
+  logLine(`[cmd] → ${targets.join(',')} : ${cmd}`);
+  document.getElementById('cmd-input').value = '';
+}
+
+// ── Results ───────────────────────────────────────────────────────────────────
+function loadResults() {
+  fetch('/api/results').then(r=>r.json()).then(d => {
+    const area = document.getElementById('results-area');
+    const runs = d.results || [];
+    if (!runs.length) { area.textContent = 'No results yet.'; return; }
+
+    area.innerHTML = runs.map(r => {
+      const files = (r.files || []).join(', ');
+      return `<div style="margin-bottom:10px;border:1px solid #ccc;padding:8px">
+        <b>${r.run_id}</b><br>
+        <span class="note">files: ${escHtml(files)}</span><br>
+        ${r.summary && Object.keys(r.summary).length
+          ? `<pre style="font-size:11px;margin:4px 0">${escHtml(JSON.stringify(r.summary,null,2))}</pre>`
+          : ''}
+      </div>`;
+    }).join('');
+  });
+}
+
+// ── Log ───────────────────────────────────────────────────────────────────────
+function loadLog() {
+  fetch('/api/logs').then(r=>r.json()).then(d => {
+    const box = document.getElementById('log-box');
+    box.textContent = (d.logs||[]).map(l =>
+      `[${l.ts}][${l.client}][${l.level}] ${l.msg}`
+    ).join('\n');
+    box.scrollTop = box.scrollHeight;
+  });
+}
+
+function logLine(msg) {
+  const box = document.getElementById('log-box');
+  box.textContent += (box.textContent ? '\n' : '') + msg;
+  box.scrollTop = box.scrollHeight;
+}
+
+function clearLog() { document.getElementById('log-box').textContent = ''; }
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function escAttr(s) {
+  return String(s||'').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+/audiotestserver/__pycache__
+/audiotestserver/results
+/audiotestserver/tests/__pycache__
+*.wav
+audiotestserver/config/clients.json
+*.json

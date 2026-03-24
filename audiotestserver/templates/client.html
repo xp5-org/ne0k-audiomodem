@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>AudioTest – Client</title>
+<style>
+  body { font-family: monospace; background: white; color: black; margin: 20px; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  h2 { font-size: 14px; margin: 16px 0 6px; border-bottom: 1px solid black; padding-bottom: 2px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; margin-bottom: 8px; }
+  th, td { border: 1px solid #aaa; padding: 4px 8px; text-align: left; }
+  th { background: #eee; }
+  input, select { font-family: monospace; font-size: 12px; border: 1px solid black; padding: 3px 6px; }
+  button { font-family: monospace; font-size: 12px; border: 1px solid black; background: white; padding: 3px 10px; cursor: pointer; }
+  button:hover { background: #eee; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  #log-box { font-size: 11px; background: #f8f8f8; border: 1px solid #ccc; padding: 8px; height: 180px; overflow-y: auto; white-space: pre-wrap; }
+  .note { font-size: 11px; color: #555; }
+  .ok  { color: green; }
+  .err { color: red; }
+  .section { margin-bottom: 16px; }
+</style>
+</head>
+<body>
+
+<h1>AudioTest — Client</h1>
+<div class="note">
+  Client ID: <b id="disp-client-id">{{ client_id }}</b> |
+  Port: <b>{{ client_port }}</b> |
+  Status: <b id="disp-status">disconnected</b>
+</div>
+
+<h2>1. Set Client ID</h2>
+<div class="row">
+  <label>Client ID:</label>
+  <input type="text" id="inp-client-id" value="{{ client_id }}" style="width:160px">
+  <button onclick="setClientId()">Set</button>
+  <span id="id-note" class="note"></span>
+</div>
+
+<h2>2. Connect to Server</h2>
+<div class="section">
+  <div class="row">
+    <label>Server IP:</label>
+    <input type="text" id="inp-server-ip" placeholder="192.168.1.x" style="width:160px">
+    <label>Port:</label>
+    <input type="number" id="inp-server-port" value="5000" style="width:70px">
+    <button onclick="connect()" id="btn-connect">Connect</button>
+    <button onclick="disconnect()">Disconnect</button>
+    <span id="conn-status" class="note"></span>
+  </div>
+</div>
+
+<h2>3. Audio Devices</h2>
+<div class="row">
+  <button onclick="loadDevices()">↺ Refresh Devices</button>
+</div>
+
+<b>Input devices:</b>
+<table id="input-table">
+  <thead><tr><th>#</th><th>Name</th><th>Channels</th><th>Sample Rate</th><th>Select</th></tr></thead>
+  <tbody><tr><td colspan="5">Click "Refresh Devices"</td></tr></tbody>
+</table>
+
+<b>Output devices:</b>
+<table id="output-table">
+  <thead><tr><th>#</th><th>Name</th><th>Channels</th><th>Sample Rate</th><th>Select</th></tr></thead>
+  <tbody><tr><td colspan="5">Click "Refresh Devices"</td></tr></tbody>
+</table>
+
+<div class="note" id="dev-selection">No devices selected.</div>
+
+<h2>Stop</h2>
+<div class="row">
+  <button onclick="stopLocal()" style="color:red;font-weight:bold">■ Stop Current Test</button>
+  <span id="stop-status" class="note"></span>
+</div>
+
+<h2>Stats</h2>
+<div id="stats-area" class="note">Not connected.</div>
+
+<h2>Log</h2>
+<div class="row">
+  <button onclick="loadLog()">↺ Refresh</button>
+  <button onclick="clearLog()">Clear</button>
+</div>
+<div id="log-box"></div>
+
+<script>
+let selectedInput  = null;
+let selectedOutput = null;
+
+window.onload = () => {
+  // Load status first so selectedInput/Output are set before device table renders
+  loadStatus().then(() => loadDevices());
+  loadLog();
+  setInterval(loadStatus, 3000);
+  setInterval(loadLog,    4000);
+};
+
+function loadStatus() {
+  return fetch('/api/status').then(r=>r.json()).then(d => {
+    document.getElementById('disp-status').textContent = d.status || 'unknown';
+    document.getElementById('conn-status').textContent =
+      d.connected ? `connected to ${d.server_ip}` : 'not connected';
+
+    const prevIn  = selectedInput;
+    const prevOut = selectedOutput;
+    // Use strict null check — device index 0 is valid, must not be treated as falsy
+    if (d.selected_input  !== null && d.selected_input  !== undefined) selectedInput  = d.selected_input;
+    if (d.selected_output !== null && d.selected_output !== undefined) selectedOutput = d.selected_output;
+    updateSelectionNote();
+
+    // Re-render device tables if selection changed so highlight stays correct
+    if (prevIn !== selectedInput || prevOut !== selectedOutput) {
+      loadDevices();
+    }
+
+    const statsEl = document.getElementById('stats-area');
+    if (d.connected) {
+      statsEl.textContent = `status: ${d.status} | run: ${d.current_run || 'none'}`;
+    }
+  });
+}
+
+function setClientId() {
+  const id = document.getElementById('inp-client-id').value.trim();
+  if (!id) return;
+  document.getElementById('disp-client-id').textContent = id;
+  document.getElementById('id-note').textContent = 'ID set. Reconnect to server to apply.';
+}
+
+function connect() {
+  const ip   = document.getElementById('inp-server-ip').value.trim();
+  const port = document.getElementById('inp-server-port').value.trim();
+  const id   = document.getElementById('inp-client-id').value.trim();
+  if (!ip) { alert('Enter server IP first.'); return; }
+
+  document.getElementById('conn-status').textContent = 'Connecting…';
+  fetch('/api/connect', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ server_ip: ip, server_port: parseInt(port)||5000, client_id: id })
+  }).then(r=>r.json()).then(d => {
+    if (d.ok) {
+      document.getElementById('conn-status').textContent = `connected to ${d.url}`;
+      document.getElementById('disp-client-id').textContent = id;
+      logLine(`Connected to ${d.url} as ${id}`);
+    } else {
+      document.getElementById('conn-status').textContent = `error: ${d.error}`;
+      logLine(`Connection failed: ${d.error}`);
+    }
+  }).catch(e => {
+    document.getElementById('conn-status').textContent = `error: ${e}`;
+  });
+}
+
+function disconnect() {
+  fetch('/api/disconnect', { method: 'POST' }).then(r=>r.json()).then(() => {
+    document.getElementById('conn-status').textContent = 'disconnected';
+    logLine('Disconnected from server.');
+  });
+}
+
+function loadDevices() {
+  fetch('/api/devices').then(r=>r.json()).then(d => {
+    if (d.error) { logLine('Device error: ' + d.error); return; }
+    renderDeviceTable('input-table',  d.inputs  || [], 'input');
+    renderDeviceTable('output-table', d.outputs || [], 'output');
+  });
+}
+
+// Store device lists so we can look up names for the selection note
+let _inputDevices = [], _outputDevices = [];
+
+function renderDeviceTable(tableId, devices, type) {
+  if (type === 'input')  _inputDevices  = devices;
+  if (type === 'output') _outputDevices = devices;
+  const tbody = document.querySelector(`#${tableId} tbody`);
+  if (!devices.length) {
+    tbody.innerHTML = `<tr><td colspan="5">No ${type} devices found.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = devices.map(d => {
+    // Use == (not ===) — device id may be int from API or coerced string in some paths
+    const selected = (type === 'input' ? selectedInput : selectedOutput) == d.id;
+    return `<tr style="${selected ? 'background:#ffe;font-weight:bold' : ''}">
+      <td>${d.id}</td>
+      <td>${esc(d.name)}</td>
+      <td>${d.channels}</td>
+      <td>${d.sample_rate}</td>
+      <td><button onclick="selectDevice('${type}', ${d.id})">${selected ? '✓ Selected' : 'Select'}</button></td>
+    </tr>`;
+  }).join('');
+  updateSelectionNote();
+}
+
+function selectDevice(type, id) {
+  const body = {};
+  body[type] = id;
+  fetch('/api/select_device', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  }).then(r=>r.json()).then(d => {
+    if (type === 'input')  selectedInput  = d.selected_input;
+    if (type === 'output') selectedOutput = d.selected_output;
+    updateSelectionNote();
+    loadDevices();
+    logLine(`Selected ${type} device #${id}`);
+  });
+}
+
+function updateSelectionNote() {
+  const inDev  = _inputDevices.find(d => d.id == selectedInput);
+  const outDev = _outputDevices.find(d => d.id == selectedOutput);
+  const inStr  = inDev  ? `#${inDev.id} ${inDev.name}`   : (selectedInput  !== null ? `#${selectedInput}`  : 'none');
+  const outStr = outDev ? `#${outDev.id} ${outDev.name}` : (selectedOutput !== null ? `#${selectedOutput}` : 'none');
+  document.getElementById('dev-selection').textContent =
+    `Selected — input: ${inStr} | output: ${outStr}`;
+}
+
+function loadLog() {
+  fetch('/api/logs').then(r=>r.json()).then(d => {
+    const box = document.getElementById('log-box');
+    const wasAtBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 20;
+    box.textContent = (d.logs||[]).map(l =>
+      `[${l.ts}][${l.level}] ${l.msg}`
+    ).join('\n');
+    if (wasAtBottom) box.scrollTop = box.scrollHeight;
+  });
+}
+
+function logLine(msg) {
+  const box = document.getElementById('log-box');
+  box.textContent += (box.textContent ? '\n' : '') + msg;
+  box.scrollTop = box.scrollHeight;
+}
+
+function clearLog() { document.getElementById('log-box').textContent = ''; }
+
+function stopLocal() {
+  fetch('/api/stop', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('stop-status').textContent = d.ok ? 'stopped.' : 'nothing running.';
+      logLine('Stop requested locally.');
+    });
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>
