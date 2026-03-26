@@ -323,9 +323,9 @@ def main():
     log(f"  RS errors total  : {total_errs}")
     log(f"  Avg ECC headroom : {avg_headroom:.1f}%")
     log(f"  Avg SNR (EVM)    : {avg_snr:.1f}dB")
-    log(f"  Avg EVM          : {avg_evm:.1f}%  (lower=cleaner, <10%=excellent)")
-    log(f"  Avg AGC gain     : {avg_agc:+.1f}dB  (how much mic boost was applied)")
-    log(f"  Avg input level  : {avg_input:.1f}dBFS  (pre-AGC mic level)")
+    log(f"  Avg EVM          : {avg_evm:.1f}%")
+    log(f"  Avg AGC gain     : {avg_agc:+.1f}dB")
+    log(f"  Avg pre-AGC level  : {avg_input:.1f}dBFS")
     log(f"  Avg ZC quality   : {avg_zc:.3f}  (sync confidence, 1.0=perfect)")
     if frame_stats:
         log(f"  Net bitrate      : {frame_stats[0]['net_bps']} bps")
