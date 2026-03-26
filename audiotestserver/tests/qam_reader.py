@@ -633,56 +633,98 @@ class Demodulator:
 
         return candidates
 
+
+
+
     def decode_frame(
         self, sym_stream: np.ndarray, pos: int
     ) -> tuple[int, bytes, int] | None:
-        """
-        Attempt to decode one frame whose preamble starts at sym_stream[pos].
 
-        Processing steps
-        ----------------
-        1. ZC coarse phase  : mean(ZC_rx · conj(ZC_ref)) → bulk rotation.
-        2. Frequency offset : linear phase slope across preamble → ramp removal.
-        3. AGC              : normalise to ZC unit-power reference.
-        4. Pilot phase track: residual drift measured at each pilot, interpolated
-                             piecewise-linearly, applied to data section.
-        5. Symbol decisions : nearest-neighbour in 16-QAM.
-        6. Descramble + RS  : recover payload bytes.
-
-        Returns (seq_num, chunk_bytes, err_count) or None on RS failure.
-        Exposed for unit testing.
-        """
         end = pos + self.n_pre + self.frame_syms_with_pilots
         if end > len(sym_stream):
             return None
 
         frame = sym_stream[pos:end].copy()
 
-        # ── 1. Bulk phase correction from ZC preamble ──────────────────
         zc_rx   = frame[: self.n_pre]
         product = zc_rx * np.conj(self.preamble_syms)
         phase   = np.angle(np.mean(product))
         frame  *= np.exp(-1j * phase)
 
-        # ── 2. Residual frequency offset (linear phase drift across preamble) ──
         phases   = np.unwrap(np.angle(frame[: self.n_pre] * np.conj(self.preamble_syms)))
         freq_err = float(np.polyfit(np.arange(self.n_pre), phases, 1)[0])
         if abs(freq_err) > 1e-4:
             frame *= np.exp(-1j * freq_err * np.arange(len(frame)))
 
-        # ── 3. AGC — ZC has unit magnitude so reference power = 1.0 ────
         pre_power = float(np.mean(np.abs(frame[: self.n_pre]) ** 2))
         frame    *= 1.0 / (math.sqrt(pre_power) + 1e-10)
 
-        # ── 4. Pilot-aided phase tracking on data section ───────────────
+        # ── Adaptive FIR equalizer ─────────────────────────────────────
+
+        if not hasattr(self, "_eq_taps"):
+            NTAPS = 9
+            self._eq_taps = np.zeros(NTAPS, dtype=np.complex64)
+            self._eq_taps[NTAPS // 2] = 1.0 + 0j
+            self._eq_mu = 0.003
+
+        taps = self._eq_taps
+        mu   = self._eq_mu
+        NTAPS = len(taps)
+        mid   = NTAPS // 2
+
+        def _eq_apply(x):
+            y = np.zeros_like(x, dtype=np.complex64)
+            for n in range(len(x)):
+                acc = 0j
+                for k in range(NTAPS):
+                    idx = n - k
+                    if idx >= 0:
+                        acc += taps[k] * x[idx]
+                y[n] = acc
+            return y
+
+        def _eq_train(x, ref):
+            for n in range(len(x)):
+                acc = 0j
+                for k in range(NTAPS):
+                    idx = n - k
+                    if idx >= 0:
+                        acc += taps[k] * x[idx]
+
+                e = ref[n] - acc
+
+                for k in range(NTAPS):
+                    idx = n - k
+                    if idx >= 0:
+                        taps[k] += mu * e * np.conj(x[idx])
+
+        # Train on ZC preamble (strong, known symbols)
+        _eq_train(frame[: self.n_pre], self.preamble_syms)
+
+        # Apply equalizer to full frame
+        frame = _eq_apply(frame)
+
+        # ── Continue normal processing ─────────────────────────────────
+
         data_section   = frame[self.n_pre :]
         data_corrected = self._pilot_phase_track(data_section)
 
-        # ── 4b. Measure EVM and ZC quality for diagnostics ─────────────
-        # EVM (Error Vector Magnitude): RMS distance between received symbols
-        # and their nearest ideal constellation point, normalised to signal power.
-        # SNR_evm = -20*log10(EVM_rms)  — good channel: >25dB, marginal: 15-25dB
-        _zc_quality = float(np.sqrt(pre_power))  # pre-AGC ZC correlation quality
+        # Optional: light decision-directed refinement on data
+        for i in range(len(data_corrected)):
+            y = data_corrected[i]
+
+            diffs   = y * math.sqrt(10) - self._const_points
+            nearest = self._const_points[np.argmin(np.abs(diffs))]
+            target  = nearest / math.sqrt(10)
+
+            e = target - y
+
+            for k in range(NTAPS):
+                idx = i - k
+                if idx >= 0:
+                    taps[k] += (mu * 0.5) * e * np.conj(data_section[idx])
+
+        _zc_quality = float(np.sqrt(pre_power))
         try:
             _scaled  = data_corrected * math.sqrt(10)
             _diffs   = _scaled[:, None] - self._const_points[None, :]
@@ -693,6 +735,7 @@ class Demodulator:
             _snr_db  = round(-20 * math.log10(_evm_norm + 1e-9), 1)
         except Exception:
             _snr_db, _evm_norm = 0.0, 1.0
+
         self._last_diag = {
             "snr_evm_db":   _snr_db,
             "evm_pct":      round(_evm_norm * 100, 1),
@@ -700,7 +743,6 @@ class Demodulator:
             "freq_err_rad": round(abs(freq_err), 6),
         }
 
-        # ── 5. Symbol decisions ─────────────────────────────────────────
         rx_bits = self._symbols_to_bits(data_corrected)
         rx_desc = self._descramble(rx_bits)
 
@@ -711,7 +753,6 @@ class Demodulator:
             if i + 8 <= len(rx_desc)
         )
 
-        # ── 6. Reed-Solomon ─────────────────────────────────────────────
         decoded, err_count, failed = self._rs_decode(rx_bytes)
         if failed or decoded is None:
             return None
