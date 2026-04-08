@@ -41,10 +41,6 @@ from reedsolo import RSCodec
 
 
 class Modulator:
-    """
-    Encode a UTF-8 string -> int16 WAV + config.json sidecar.
-    """
-
     PILOT_INTERVAL: int     = 8
     PILOT_SYMBOL:   complex = (1 + 1j) / math.sqrt(2)
     ZC_LENGTH:      int     = 63
@@ -183,7 +179,6 @@ class Modulator:
                 out.append(self.PILOT_SYMBOL)
             out.append(sym)
         return np.array(out)
-
 
     def _validate(self) -> None:
         if self.sample_rate % self.symbol_rate != 0:

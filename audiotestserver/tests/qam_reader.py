@@ -192,10 +192,6 @@ class Demodulator:
         self._stats_out:     str | None       = None
         self._last_diag:     dict             = {}   # set by decode_frame
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def process_wav(self, filename: str) -> str:
         """
         Decode a WAV file.
@@ -633,9 +629,6 @@ class Demodulator:
 
         return candidates
 
-
-
-
     def decode_frame(
         self, sym_stream: np.ndarray, pos: int
     ) -> tuple[int, bytes, int] | None:
@@ -761,10 +754,6 @@ class Demodulator:
         chunk_data = bytes(decoded[self.SEQ_BYTES :])
         return seq_num, chunk_data, err_count
 
-    # ------------------------------------------------------------------
-    # Private — phase tracking
-    # ------------------------------------------------------------------
-
     def _pilot_phase_track(self, data_with_pilots: np.ndarray) -> np.ndarray:
         """
         Measure residual phase error at each pilot, interpolate across the
@@ -814,10 +803,6 @@ class Demodulator:
             mixed_idx += 1      # data slot
         return positions
 
-    # ------------------------------------------------------------------
-    # Private — symbol layer
-    # ------------------------------------------------------------------
-
     def _symbols_to_bits(self, symbols: np.ndarray) -> np.ndarray:
         scaled  = symbols * math.sqrt(10)
         diffs   = scaled[:, None] - self._const_points[None, :]
@@ -859,10 +844,6 @@ class Demodulator:
         )
         return raw.rstrip(b"\x00").decode("utf-8", errors="replace")
 
-    # ------------------------------------------------------------------
-    # Stats emission
-    # ------------------------------------------------------------------
-
     def _emit_frame_stat(self, seq: int, err_count: int,
                          agc_gain_db: float = 0.0,
                          input_rms_db: float = -60.0) -> None:
@@ -901,10 +882,6 @@ class Demodulator:
         with open(self._stats_out, "w") as f:
             _json.dump(summary, f, indent=2)
 
-    # ------------------------------------------------------------------
-    # Static helpers — shared logic with Modulator
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _make_zadoff_chu(length: int = 63, root: int = 25) -> np.ndarray:
         n = np.arange(length)
@@ -939,10 +916,6 @@ class Demodulator:
         h /= np.sqrt(np.sum(h ** 2))
         return h
 
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Acoustic QAM decoder")

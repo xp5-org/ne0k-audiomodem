@@ -45,12 +45,12 @@ TESTS_DIR  = Path(__file__).parent
 # Sweep config
 CARRIER_START        = int(PARAMS.get("carrier_start",        800))
 CARRIER_STEP         = int(PARAMS.get("carrier_step",          400))
-CARRIER_NUM_STEPS    = int(PARAMS.get("carrier_num_steps",       8))
-SR_START             = int(PARAMS.get("symbol_rate_start",     20))
+CARRIER_NUM_STEPS    = int(PARAMS.get("carrier_num_steps",       3))
+SR_START             = int(PARAMS.get("symbol_rate_start",     40))
 SR_STEP              = int(PARAMS.get("symbol_rate_step",       40))
-SR_NUM_STEPS         = int(PARAMS.get("symbol_rate_num_steps",   2))
+SR_NUM_STEPS         = int(PARAMS.get("symbol_rate_num_steps",   6))
 SAMPLE_RATE          = int(PARAMS.get("sample_rate",         48000))
-CHUNK_BYTES          = int(PARAMS.get("chunk_bytes",            32))  # 0 = auto-scale
+CHUNK_BYTES          = int(PARAMS.get("chunk_bytes",            8))  # 0 = auto-scale
 ECC_BYTES            = int(PARAMS.get("ecc_bytes",               8))
 SEQ_BYTES            = int(PARAMS.get("seq_bytes",               2))
 AMPLITUDE            = float(PARAMS.get("amplitude",           0.8))
@@ -59,7 +59,7 @@ TARGET_BLOCK_SECS    = float(PARAMS.get("target_block_secs",   5.0))  # keep rea
 
 # Short message — enough for 2-3 frames without taking too long
 PROBE_MESSAGE = (
-    "The quick brown fox jumps over the lazy dog. "
+    "The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog The quick brown fox jumps over the lazy dog "
 )
 
 

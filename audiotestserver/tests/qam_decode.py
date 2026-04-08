@@ -17,7 +17,7 @@ Params (from server UI JSON field):
 {
     "timeout":      60,
     "mic_gain_db":  0,
-    "zc_threshold": 0.45
+    "zc_threshold": 0.35
 }
 """
 

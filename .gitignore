@@ -4,3 +4,4 @@
 *.wav
 audiotestserver/config/clients.json
 *.json
+info.txt

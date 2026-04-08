@@ -87,15 +87,15 @@ def main():
 
     # Build encode config from params
     encode_cfg = {
-        "input_str":    PARAMS.get("input_str"),   # None = use writer's default
+        "input_str":    PARAMS.get("input_str"),
         "output":       str(wav_path),
         "config_out":   str(config_path),
-        "chunk_bytes":  PARAMS.get("chunk_bytes",  64),
+        "chunk_bytes":  PARAMS.get("chunk_bytes",  16),
         "ecc_bytes":    PARAMS.get("ecc_bytes",    8),
         "seq_bytes":    PARAMS.get("seq_bytes",    2),
         "sample_rate":  PARAMS.get("sample_rate",  48000),
-        "carrier_freq": PARAMS.get("carrier_freq", 4000),
-        "symbol_rate":  PARAMS.get("symbol_rate",  80),
+        "carrier_freq": PARAMS.get("carrier_freq", 1400),
+        "symbol_rate":  PARAMS.get("symbol_rate",  40),
     }
     # Remove None so writer uses its own default message
     encode_cfg = {k: v for k, v in encode_cfg.items() if v is not None}
