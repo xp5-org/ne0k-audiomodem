@@ -74,6 +74,28 @@ def rs_decode_frame(frame_bytes, codec):
 
 
 # ---------------------------------------------------------------------------
+# Block de-interleaver (mirrors css_encoder.py interleave_bits exactly)
+# ---------------------------------------------------------------------------
+
+def deinterleave_bits(bits, rows, orig_len):
+    """
+    Inverse of the encoder's block interleaver.
+
+    Encoder wrote bits row-by-row into (rows × cols) and transmitted
+    column-by-column.  We received in column-major order, so reshape as
+    (cols × rows), transpose to (rows × cols), read row-by-row.
+
+    bits     : received bit list, length = rows * cols
+    rows     : interleave_rows from info.json
+    orig_len : base_bits from info.json (trims interleave padding zeros)
+    """
+    if rows <= 1:
+        return list(bits[:orig_len])
+    cols = len(bits) // rows
+    return np.array(bits, dtype=np.int8).reshape(cols, rows).T.flatten().tolist()[:orig_len]
+
+
+# ---------------------------------------------------------------------------
 # Chirp generation
 # ---------------------------------------------------------------------------
 
@@ -285,6 +307,7 @@ def decode(cfg, stop_event=None):
     crc_bytes     = int(  conf.get("crc_bytes", CRC_BYTES))
     rs_t          = int(  conf.get("rs_t",      0))
     rs_parity     = rs_t * 2
+    interleave_rows = int(conf.get("interleave_rows", 0))
 
     rs_codec = _make_rs_codec(rs_t)
     if rs_t > 0 and rs_codec is None:
@@ -292,11 +315,14 @@ def decode(cfg, stop_event=None):
 
     sps      = int(fs * dur)
     buf_size = sps * 3
-    # Read exactly sps samples per symbol. No hop/ssls complexity.
-    # Fractional timing correction adjusts n_read by ±1 sample as needed.
 
-    frame_bytes    = 1 + chunk_size + crc_bytes + rs_parity
-    bits_per_frame = frame_bytes * 8
+    # base_bits: the unpadded frame size (what RS operates on)
+    base_bits = int(conf.get("base_bits",
+                             (1 + chunk_size + crc_bytes + rs_parity) * 8))
+
+    # frame_symbols: what the decoder actually collects per frame.
+    # With interleaving this may be > base_bits due to padding.
+    frame_symbols = int(conf.get("frame_symbols", base_bits))
 
     up_ref   = generate_chirp(f_min, f_max, dur, fs)
     down_ref = generate_chirp(f_max, f_min, dur, fs)
@@ -314,7 +340,8 @@ def decode(cfg, stop_event=None):
     print(f"LISTENING fs={fs} sps={sps} dur={dur}s "
           f"f={f_min:.0f}-{f_max:.0f}Hz "
           f"chunk={chunk_size}B crc={crc_bytes}B rs_t={rs_t} "
-          f"bits/frame={bits_per_frame} "
+          f"interleave_rows={interleave_rows} "
+          f"base_bits={base_bits} frame_symbols={frame_symbols} "
           f"sync_word={len(sync_word)} threshold={sync_threshold} "
           f"search_range=±{correlator.search_range}",
           flush=True)
@@ -419,13 +446,20 @@ def decode(cfg, stop_event=None):
                 else:
                     bit_stream.append(bit)
 
-                    if len(bit_stream) >= bits_per_frame:
-                        frame_bits = bit_stream[:bits_per_frame]
-                        bit_stream = bit_stream[bits_per_frame:]
+                    if len(bit_stream) >= frame_symbols:
+                        frame_bits = bit_stream[:frame_symbols]
+                        bit_stream = bit_stream[frame_symbols:]
+
+                        # De-interleave (if enabled) before RS decoding.
+                        # Must mirror the encoder's interleave_bits exactly.
+                        if interleave_rows > 1:
+                            frame_bits = deinterleave_bits(
+                                frame_bits, interleave_rows, base_bits)
+
                         raw_bytes  = get_bytes_from_bits(frame_bits)
 
-                        frame_snr = (float(np.mean(snr_history[-bits_per_frame:]))
-                                     if len(snr_history) >= bits_per_frame else snr_db)
+                        frame_snr = (float(np.mean(snr_history[-frame_symbols:]))
+                                     if len(snr_history) >= frame_symbols else snr_db)
 
                         rs_errors = 0
                         if rs_codec is not None:

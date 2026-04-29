@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>AudioTest – Server</title>
+<title>AudioTest – {{ role|title }}</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
 <style>
   body { font-family: monospace; background: white; color: black; margin: 20px; }
@@ -16,36 +16,56 @@
   button { font-family: monospace; font-size: 12px; border: 1px solid black; background: white; padding: 3px 10px; cursor: pointer; }
   button:hover { background: #eee; }
   button:active { background: #ddd; }
+  button:disabled { color: #aaa; border-color: #ccc; cursor: default; background: white; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
   .section { margin-bottom: 20px; }
   #log-box { font-size: 11px; background: #f8f8f8; border: 1px solid #ccc; padding: 8px; height: 200px; overflow-y: auto; white-space: pre-wrap; }
-  .status-idle    { color: green; }
-  .status-running { color: orange; font-weight: bold; }
-  .status-stale   { color: gray; }
+  .status-idle         { color: green; }
+  .status-running      { color: orange; font-weight: bold; }
+  .status-stale        { color: gray; }
   .status-disconnected { color: red; }
   label { font-size: 12px; }
-  hr { border: none; border-top: 1px solid #ddd; margin: 12px 0; }
+  hr  { border: none; border-top: 1px solid #ddd; margin: 12px 0; }
   .note { font-size: 11px; color: #555; }
+  /* role badge */
+  .badge { font-size: 10px; padding: 1px 6px; border: 1px solid; vertical-align: middle; }
+  .badge-server { border-color: #666; color: #666; }
+  .badge-client { border-color: #06c; color: #06c; }
+  /* masks the Run Test section in client mode */
+  .masked { opacity: 0.38; pointer-events: none; user-select: none; }
+  /* params builder table — no inner cell borders */
+  #params-table { width: auto; }
+  #params-table td { padding: 3px 5px; border: none; }
+  #params-table th { padding: 3px 5px; }
+  #params-preview { font-size: 11px; background: #f0f0f0; padding: 2px 6px;
+                    border: 1px solid #ccc; display: inline-block;
+                    max-width: 520px; word-break: break-all; }
+  /* connect section */
+  .conn-ok   { color: green; font-weight: bold; }
+  .conn-fail { color: red; }
+  /* param conflict warning */
+  .param-conflict td:first-child { background: #fff8e1; }
+  .conflict-badge { font-size: 10px; color: #b85c00; border: 1px solid #b85c00;
+                    padding: 0 4px; margin-left: 4px; cursor: help; }
 </style>
 </head>
 <body>
 
-<h1>AudioTest — Server Dashboard</h1>
+<h1>AudioTest — {{ role|title }} Dashboard
+  <span class="badge badge-{{ role }}">{{ role }}</span>
+</h1>
 <div class="note" id="server-info">Loading…</div>
 
+<!-- ═══════════════════════════════════════════════════════════
+     SERVER-ONLY: connected clients + client detail
+     ═══════════════════════════════════════════════════════════ -->
+{% if role == 'server' %}
 <h2>Connected Clients</h2>
 <table id="client-table">
   <thead>
     <tr>
-      <th>Client ID</th>
-      <th>IP</th>
-      <th>Status</th>
-      <th>CPU</th>
-      <th>MEM</th>
-      <th>Input Device</th>
-      <th>Output Device</th>
-      <th>Last Seen</th>
-      <th>Actions</th>
+      <th>Client ID</th><th>IP</th><th>Status</th><th>CPU</th><th>MEM</th>
+      <th>Input Device</th><th>Output Device</th><th>Last Seen</th><th>Actions</th>
     </tr>
   </thead>
   <tbody id="client-tbody">
@@ -57,16 +77,62 @@
 <div id="client-detail-area">
   <div class="note">Click a client row to see its audio devices and controls.</div>
 </div>
+{% endif %}
 
-<h2>Run Test</h2>
+<!-- ═══════════════════════════════════════════════════════════
+     CLIENT-ONLY: server connection panel
+     ═══════════════════════════════════════════════════════════ -->
+{% if role == 'client' %}
+<h2>Server Connection</h2>
 <div class="section">
   <div class="row">
+    <label>Server IP:</label>
+    <input type="text" id="connect-ip" value="{{ server_ip or '' }}"
+           style="width:160px" placeholder="192.168.1.x">
+    <label>Port:</label>
+    <input type="text" id="connect-port" value="{{ server_port or 8001 }}"
+           style="width:60px">
+    <label>Node ID:</label>
+    <input type="text" id="connect-nodeid" value="{{ node_id }}"
+           style="width:110px">
+  </div>
+  <div class="row">
+    <button onclick="doConnect()">&#x26A1; Connect</button>
+    <button onclick="doDisconnect()">&#x2715; Disconnect</button>
+    <span id="conn-status" class="note"></span>
+  </div>
+</div>
+{% endif %}
+
+<!-- ═══════════════════════════════════════════════════════════
+     BOTH ROLES: local device selection
+     ═══════════════════════════════════════════════════════════ -->
+<h2>My Devices <span class="note">({{ node_id }})</span></h2>
+<div id="my-devices-area"><div class="note">Loading…</div></div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     RUN TEST
+     Rendered for both roles so the layout is stable.
+     Client mode: CSS-masked (.masked) + JS guard in runTest()
+     ensures /api/tests/run is never called from a client node.
+     ═══════════════════════════════════════════════════════════ -->
+<h2>Run Test
+  {% if role == 'client' %}
+    <span class="badge badge-server"
+          title="Only the server node can dispatch tests">server only</span>
+  {% endif %}
+</h2>
+<div class="section{% if role == 'client' %} masked{% endif %}">
+
+  <div class="row">
     <label>Test:</label>
-    <select id="test-select" onchange="onTestSelect()"><option value="">-- loading --</option></select>
-    <button onclick="refreshTests()">↺</button>
+    <select id="test-select" onchange="onTestSelect()">
+      <option value="">-- loading --</option>
+    </select>
+    <button onclick="refreshTests()">&#x21BA;</button>
   </div>
 
-  <!-- Standalone test: simple client checkboxes -->
+  <!-- standalone: simple client checkboxes -->
   <div id="standalone-section">
     <div class="row">
       <label>Target clients:</label>
@@ -76,10 +142,11 @@
     </div>
   </div>
 
-  <!-- Grouped test: one row per role -->
+  <!-- grouped: one row per role -->
   <div id="roles-section" style="display:none">
     <div id="single-client-banner" style="margin-bottom:6px"></div>
-    <table id="roles-table" style="width:100%;font-size:12px;border-collapse:collapse;margin-bottom:8px">
+    <table id="roles-table"
+           style="width:100%;font-size:12px;border-collapse:collapse;margin-bottom:8px">
       <thead>
         <tr>
           <th style="border:1px solid #aaa;padding:4px 8px;background:#eee;text-align:left">Role / Script</th>
@@ -88,186 +155,257 @@
       </thead>
       <tbody id="roles-tbody"></tbody>
     </table>
-    <div class="note" id="roles-note">Assign clients to roles. A client assigned to multiple roles runs them sequentially.</div>
+    <div class="note" id="roles-note">Assign clients to roles.</div>
   </div>
 
-  <div class="row" style="margin-top:8px">
-    <label>Extra params (JSON):</label>
-    <input type="text" id="test-params" value="{}" style="width:300px">
+  <!-- ── Params builder ──────────────────────────────────────── -->
+  <div style="margin-top:10px">
+    <div style="margin-bottom:4px"><b>Test Parameters</b></div>
+
+    <table id="params-table">
+      <thead>
+        <tr>
+          <th style="width:160px">Key</th>
+          <th style="width:90px">Type</th>
+          <th style="width:210px">Value</th>
+          <th style="width:28px"></th>
+        </tr>
+      </thead>
+      <tbody id="params-tbody"></tbody>
+    </table>
+
+    <div class="row" style="margin-top:4px">
+      <button onclick="addParam()">+ Add param</button>
+      <button onclick="clearParams()">Clear all</button>
+      <button onclick="toggleRawJson()" id="raw-toggle-btn">&#x2328; Raw JSON</button>
+    </div>
+
+    <!-- raw JSON override, hidden by default -->
+    <div id="raw-json-area" style="display:none;margin-top:6px">
+      <div class="row">
+        <label>Raw JSON:</label>
+        <input type="text" id="raw-json-input" value="{}"
+               style="width:340px" placeholder='{"key":"value"}'>
+        <button onclick="applyRawJson()">Apply &#x2192;</button>
+      </div>
+      <div class="note" id="raw-json-err" style="color:red"></div>
+    </div>
+
+    <div style="margin-top:5px">
+      <span class="note">JSON: </span><code id="params-preview">{}</code>
+    </div>
   </div>
-  <div class="row">
-    <button onclick="runTest()">▶ Run Test</button>
-    <button onclick="stopAll()" style="margin-left:16px;color:red;font-weight:bold">■ Stop All</button>
+  <!-- ── /Params builder ─────────────────────────────────────── -->
+
+  <div class="row" style="margin-top:10px">
+    <button onclick="runTest()">&#x25B6; Run Test</button>
+    <button onclick="stopAll()"
+            style="margin-left:16px;color:red;font-weight:bold">&#x25A0; Stop All</button>
     <span id="run-status" class="note"></span>
   </div>
 </div>
 
-<!-- <h2>Shell Command</h2>
-<div class="section">
-  <div class="row">
-    <label>Target:</label>
-    <select id="cmd-target"><option value="__all__">All clients</option></select>
-  </div>
-  <div class="row">
-    <input type="text" id="cmd-input" placeholder="e.g. ls /tests" style="width:400px"
-           onkeydown="if(event.key==='Enter') sendCommand()">
-    <button onclick="sendCommand()">▶ Run</button>
-  </div>
-  <div id="cmd-output" style="margin-top:6px;"></div>
-</div> -->
-
+<!-- ═══════════════════════════════════════════════════════════
+     SERVER-ONLY: results
+     ═══════════════════════════════════════════════════════════ -->
+{% if role == 'server' %}
 <h2>Results</h2>
 <div class="row">
-  <button onclick="loadResults()">↺ Refresh</button>
+  <button onclick="loadResults()">&#x21BA; Refresh</button>
 </div>
 <div id="results-area" class="note">Click refresh to load.</div>
+{% endif %}
 
-<h2>Server Log</h2>
+<!-- ═══════════════════════════════════════════════════════════
+     BOTH ROLES: log
+     ═══════════════════════════════════════════════════════════ -->
+<h2>Log</h2>
 <div class="row">
   <button onclick="clearLog()">Clear</button>
-  <button onclick="loadLog()">↺ Refresh</button>
+  <button onclick="loadLog()">&#x21BA; Refresh</button>
 </div>
 <div id="log-box"></div>
 
+
 <script>
+// ── Injected by Flask ─────────────────────────────────────────────────────────
+const NODE_ROLE = "{{ role }}";
+const NODE_ID   = "{{ node_id }}";
+
+// ── Socket.IO ─────────────────────────────────────────────────────────────────
 const socket = io();
 let clients = {};
 
-socket.on('connect', () => {
-  loadClients();  // re-seed after reconnect
-});
+socket.on('connect', () => { if (NODE_ROLE === 'server') loadClients(); });
 
-// ── Initial load ──────────────────────────────────────────────────────────────
+// ── Boot ──────────────────────────────────────────────────────────────────────
 window.onload = () => {
   loadServerInfo();
-  loadClients();       // seed table from server state on every page load/refresh
-  refreshTests();
+  loadMyDevices();
   loadLog();
   setInterval(loadServerInfo, 5000);
-  setInterval(loadClients, 8000);  // re-sync periodically in case of missed events
+
+  if (NODE_ROLE === 'server') {
+    loadClients();
+    refreshTests();
+    setInterval(loadClients, 8000);
+  }
 };
 
-function loadClients() {
-  fetch('/api/clients').then(r=>r.json()).then(d => {
-    const incoming = d.clients || {};
-    // Merge: add/update without wiping clients that sent a socket event just now
-    let changed = false;
-    for (const [id, info] of Object.entries(incoming)) {
-      if (JSON.stringify(clients[id]) !== JSON.stringify(info)) {
-        clients[id] = info;
-        changed = true;
-      }
-    }
-    // Remove clients no longer on server
-    for (const id of Object.keys(clients)) {
-      if (!incoming[id]) { delete clients[id]; changed = true; }
-    }
-    if (changed) {
-      renderClientTable();
-      updateTargetCheckboxes();
-      updateCmdTarget();
-    }
-  });
-}
-
+// ── Status bar ────────────────────────────────────────────────────────────────
 function loadServerInfo() {
-  fetch('/api/status').then(r=>r.json()).then(d => {
-    document.getElementById('server-info').textContent =
-      `role: server | clients: ${d.clients_connected} | ${new Date().toLocaleTimeString()}`;
+  fetch('/api/status').then(r => r.json()).then(d => {
+    let txt = `role: ${d.role} | node: ${d.node_id} | status: ${d.status}`;
+    if (d.role === 'server') txt += ` | clients: ${d.clients_connected}`;
+    if (d.role === 'client') txt += ` | server: ${d.server_ip || '\u2014'} | connected: ${d.connected}`;
+    txt += ` | ${new Date().toLocaleTimeString()}`;
+    document.getElementById('server-info').textContent = txt;
   });
 }
 
-// ── Socket.IO ─────────────────────────────────────────────────────────────────
+// ── My Devices (both roles) ───────────────────────────────────────────────────
+function loadMyDevices() {
+  Promise.all([
+    fetch('/api/devices').then(r => r.json()),
+    fetch('/api/status').then(r => r.json()),
+  ]).then(([devs, status]) => {
+    const inputs  = devs.inputs  || [];
+    const outputs = devs.outputs || [];
+    const selIn   = status.selected_input;
+    const selOut  = status.selected_output;
+
+    const rows = (list, type, sel) =>
+      list.map(d => {
+        const active = d.id == sel;
+        return `<tr style="${active ? 'background:#ffe;font-weight:bold' : ''}">
+          <td>${d.id}</td><td>${escHtml(d.name)}</td>
+          <td>${d.channels}</td><td>${d.sample_rate}</td>
+          <td><button onclick="selectMyDevice('${type}',${d.id})">
+            ${active ? '\u2713 Active' : 'Use'}
+          </button></td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="5">None found</td></tr>';
+
+    const hdr = '<thead><tr><th>#</th><th>Name</th><th>Ch</th><th>Rate</th><th></th></tr></thead>';
+    document.getElementById('my-devices-area').innerHTML =
+      `<b>Input:</b><table>${hdr}<tbody>${rows(inputs,'input',selIn)}</tbody></table>` +
+      `<b>Output:</b><table>${hdr}<tbody>${rows(outputs,'output',selOut)}</tbody></table>`;
+  });
+}
+
+function selectMyDevice(type, id) {
+  const body = {}; body[type] = id;
+  fetch('/api/select_device', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  }).then(() => loadMyDevices());
+}
+
+// ── Client connect / disconnect  (client role only) ───────────────────────────
+{% if role == 'client' %}
+function doConnect() {
+  const ip     = document.getElementById('connect-ip').value.trim();
+  const port   = parseInt(document.getElementById('connect-port').value) || 8001;
+  const nodeId = document.getElementById('connect-nodeid').value.trim();
+  if (!ip) { alert('Enter a server IP.'); return; }
+  const el = document.getElementById('conn-status');
+  el.textContent = 'Connecting\u2026'; el.className = 'note';
+  fetch('/api/connect', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ server_ip: ip, server_port: port, node_id: nodeId }),
+  }).then(r => r.json()).then(d => {
+    if (d.ok) { el.textContent = `Connected \u2192 ${d.url}`; el.className = 'conn-ok'; }
+    else      { el.textContent = `Failed: ${d.error}`;        el.className = 'conn-fail'; }
+  }).catch(e => { el.textContent = `Error: ${e}`; el.className = 'conn-fail'; });
+}
+
+function doDisconnect() {
+  fetch('/api/disconnect', { method: 'POST' }).then(() => {
+    const el = document.getElementById('conn-status');
+    el.textContent = 'Disconnected'; el.className = 'note';
+  });
+}
+{% endif %}
+
+// ── Socket events ─────────────────────────────────────────────────────────────
 socket.on('client_joined', data => {
   clients[data.client_id] = data.info;
-  renderClientTable();
-  updateTargetCheckboxes();
-  updateCmdTarget();
-  logLine(`[join] ${data.client_id} connected from ${data.info.ip}`);
+  renderClientTable(); updateTargetCheckboxes();
+  logLine(`[join] ${data.client_id} from ${data.info.ip}`);
 });
-
 socket.on('client_left', data => {
   delete clients[data.client_id];
-  renderClientTable();
-  updateTargetCheckboxes();
-  updateCmdTarget();
+  renderClientTable(); updateTargetCheckboxes();
   logLine(`[leave] ${data.client_id} disconnected`);
 });
-
 socket.on('client_stats', data => {
-  if (clients[data.client_id]) {
-    clients[data.client_id].stats  = data.stats  || {};
-    clients[data.client_id].status = data.status || 'idle';
-    updateClientRow(data.client_id);
-  }
+  if (!clients[data.client_id]) return;
+  clients[data.client_id].stats  = data.stats  || {};
+  clients[data.client_id].status = data.status || 'idle';
+  updateClientRow(data.client_id);
 });
-
 socket.on('client_device_changed', data => {
-  if (clients[data.client_id]) {
-    clients[data.client_id].selected_input  = data.input;
-    clients[data.client_id].selected_output = data.output;
-    updateClientRow(data.client_id);
-    // Refresh detail pane if this client is currently open
-    const area = document.getElementById('client-detail-area');
-    if (area.querySelector(`h3`)?.textContent.startsWith(`Client: ${data.client_id}`)) {
-      showClientDetail(data.client_id);
-    }
-  }
+  if (!clients[data.client_id]) return;
+  clients[data.client_id].selected_input  = data.input;
+  clients[data.client_id].selected_output = data.output;
+  updateClientRow(data.client_id);
+  const area = document.getElementById('client-detail-area');
+  if (area?.querySelector('h3')?.textContent.startsWith(`Client: ${data.client_id}`))
+    showClientDetail(data.client_id);
 });
-
 socket.on('server_log', entry => {
   logLine(`[${entry.ts}][${entry.client}][${entry.level}] ${entry.msg}`);
 });
-
 socket.on('test_result_update', data => {
   const s = data.status === 'ok' ? 'OK' : 'ERROR';
-  logLine(`[test result] ${data.client_id} → ${s} (rc=${data.returncode})`);
-  if (data.output) {
-    const area = document.getElementById('cmd-output');
-    area.innerHTML = `<b>Test output from ${data.client_id}:</b><pre style="background:#f8f8f8;border:1px solid #ccc;padding:8px;font-size:11px;overflow-x:auto">${escHtml(data.output)}</pre>`;
-  }
-  document.getElementById('run-status').textContent =
-    `${data.client_id}: ${s}`;
+  logLine(`[result] ${data.client_id} \u2192 ${s} (rc=${data.returncode})`);
+  document.getElementById('run-status').textContent = `${data.client_id}: ${s}`;
 });
 
-socket.on('command_result_update', data => {
-  const area = document.getElementById('cmd-output');
-  area.innerHTML = `<b>Output from ${data.client_id}:</b><pre style="background:#f8f8f8;border:1px solid #ccc;padding:8px;font-size:11px;overflow-x:auto">$ ${escHtml(data.command)}\n${escHtml(data.stdout)}${data.stderr ? '\n[stderr]\n'+escHtml(data.stderr) : ''}</pre>`;
-});
+// ── Client table (server only) ────────────────────────────────────────────────
+function loadClients() {
+  if (NODE_ROLE !== 'server') return;
+  fetch('/api/clients').then(r => r.json()).then(d => {
+    const incoming = d.clients || {};
+    let changed = false;
+    for (const [id, info] of Object.entries(incoming)) {
+      if (JSON.stringify(clients[id]) !== JSON.stringify(info)) {
+        clients[id] = info; changed = true;
+      }
+    }
+    for (const id of Object.keys(clients)) {
+      if (!incoming[id]) { delete clients[id]; changed = true; }
+    }
+    if (changed) { renderClientTable(); updateTargetCheckboxes(); }
+  });
+}
 
-// ── Client table ──────────────────────────────────────────────────────────────
 function renderClientTable() {
-  const tbody = document.getElementById('client-tbody');
+  const tbody = document.getElementById('client-tbody'); if (!tbody) return;
   const ids = Object.keys(clients);
-  if (!ids.length) {
-    tbody.innerHTML = '<tr><td colspan="9">No clients connected.</td></tr>';
-    return;
-  }
-  tbody.innerHTML = ids.map(id => clientRow(id)).join('');
+  tbody.innerHTML = ids.length
+    ? ids.map(clientRow).join('')
+    : '<tr><td colspan="9">No clients connected.</td></tr>';
 }
 
 function devName(devices, id) {
-  if (id === null || id === undefined) return '—';
+  if (id == null) return '\u2014';
   const d = (devices || []).find(x => x.id == id);
   return d ? `#${id} ${d.name}` : `#${id}`;
 }
 
 function clientRow(id) {
-  const c  = clients[id];
-  const s  = c.stats || {};
-  const st = c.status || 'idle';
+  const c = clients[id], s = c.stats || {}, st = c.status || 'idle';
   const devs = c.devices || {};
-  const inp = devName(devs.inputs,  c.selected_input);
-  const out = devName(devs.outputs, c.selected_output);
-  const ts  = c.last_seen ? new Date(c.last_seen*1000).toLocaleTimeString() : '—';
+  const ts   = c.last_seen ? new Date(c.last_seen*1000).toLocaleTimeString() : '\u2014';
   return `<tr id="crow-${id}">
     <td><b>${id}</b></td>
-    <td>${c.ip || '—'}:${c.port || ''}</td>
+    <td>${c.ip||'\u2014'}:${c.port||''}</td>
     <td class="status-${st}">${st}</td>
-    <td>${s.cpu_pct != null ? s.cpu_pct+'%' : '—'}</td>
-    <td>${s.mem_pct != null ? s.mem_pct+'%' : '—'}</td>
-    <td>${inp}</td>
-    <td>${out}</td>
+    <td>${s.cpu_pct != null ? s.cpu_pct+'%' : '\u2014'}</td>
+    <td>${s.mem_pct != null ? s.mem_pct+'%' : '\u2014'}</td>
+    <td>${devName(devs.inputs,  c.selected_input)}</td>
+    <td>${devName(devs.outputs, c.selected_output)}</td>
     <td>${ts}</td>
     <td>
       <button onclick="showClientDetail('${id}')">Devices</button>
@@ -281,57 +419,49 @@ function updateClientRow(id) {
   if (el) el.outerHTML = clientRow(id);
 }
 
-// ── Client detail / device selection ─────────────────────────────────────────
+// ── Client detail (server only) ───────────────────────────────────────────────
 function showClientDetail(id) {
-  const c = clients[id];
-  if (!c) return;
-  const devs    = c.devices || {};
-  const inputs  = devs.inputs  || [];
-  const outputs = devs.outputs || [];
-  const selIn   = c.selected_input;
-  const selOut  = c.selected_output;
-
-  // Look up names for header summary
+  const area = document.getElementById('client-detail-area'); if (!area) return;
+  const c = clients[id]; if (!c) return;
+  const devs = c.devices || {}, inputs = devs.inputs||[], outputs = devs.outputs||[];
+  const selIn = c.selected_input, selOut = c.selected_output;
   const inDev  = inputs.find(d => d.id == selIn);
   const outDev = outputs.find(d => d.id == selOut);
-  const inStr  = inDev  ? `#${inDev.id} — ${escHtml(inDev.name)}`   : (selIn  !== null && selIn  !== undefined ? `#${selIn}`  : '—');
-  const outStr = outDev ? `#${outDev.id} — ${escHtml(outDev.name)}` : (selOut !== null && selOut !== undefined ? `#${selOut}` : '—');
-
-  let html = `<h3>Client: ${id} (${c.ip})</h3>`;
-  html += `<div class="note" style="margin-bottom:8px">
-    Input: <b>${inStr}</b> &nbsp;|&nbsp; Output: <b>${outStr}</b>
-  </div>`;
+  const inStr  = inDev  ? `#${inDev.id} \u2014 ${escHtml(inDev.name)}`   : (selIn  != null ? `#${selIn}`  : '\u2014');
+  const outStr = outDev ? `#${outDev.id} \u2014 ${escHtml(outDev.name)}` : (selOut != null ? `#${selOut}` : '\u2014');
 
   const devRow = (d, type, sel) => {
-    const isSel = d.id == sel;
-    return `<tr style="${isSel ? 'background:#ffe;font-weight:bold' : ''}">
+    const active = d.id == sel;
+    return `<tr style="${active ? 'background:#ffe;font-weight:bold' : ''}">
       <td>${d.id}</td><td>${escHtml(d.name)}</td><td>${d.channels}</td><td>${d.sample_rate}</td>
-      <td><button onclick="setClientDevice('${id}','${type}',${d.id})">${isSel ? '✓ Active' : 'Use'}</button></td>
+      <td><button onclick="setClientDevice('${id}','${type}',${d.id})">
+        ${active ? '\u2713 Active' : 'Use'}
+      </button></td>
     </tr>`;
   };
 
-  html += `<b>Input devices:</b>
-  <table>
-    <thead><tr><th>#</th><th>Name</th><th>Channels</th><th>Sample Rate</th><th></th></tr></thead>
-    <tbody>${inputs.map(d => devRow(d,'input',selIn)).join('') || '<tr><td colspan="5">None found</td></tr>'}</tbody>
-  </table>`;
-
-  html += `<b>Output devices:</b>
-  <table>
-    <thead><tr><th>#</th><th>Name</th><th>Channels</th><th>Sample Rate</th><th></th></tr></thead>
-    <tbody>${outputs.map(d => devRow(d,'output',selOut)).join('') || '<tr><td colspan="5">None found</td></tr>'}</tbody>
-  </table>`;
-
-  document.getElementById('client-detail-area').innerHTML = html;
+  const hdr = '<thead><tr><th>#</th><th>Name</th><th>Channels</th><th>Sample Rate</th><th></th></tr></thead>';
+  area.innerHTML =
+    `<h3>Client: ${id} (${c.ip})</h3>
+     <div class="note" style="margin-bottom:8px">
+       Input: <b>${inStr}</b> &nbsp;|&nbsp; Output: <b>${outStr}</b>
+     </div>
+     <b>Input devices:</b>
+     <table>${hdr}<tbody>
+       ${inputs.map(d => devRow(d,'input',selIn)).join('') || '<tr><td colspan="5">None found</td></tr>'}
+     </tbody></table>
+     <b>Output devices:</b>
+     <table>${hdr}<tbody>
+       ${outputs.map(d => devRow(d,'output',selOut)).join('') || '<tr><td colspan="5">None found</td></tr>'}
+     </tbody></table>`;
 }
 
 function setClientDevice(clientId, type, deviceId) {
-  const body = {};
-  body[type] = deviceId;
+  const body = {}; body[type] = deviceId;
   fetch(`/api/clients/${clientId}/set_device`, {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
-  }).then(r => r.json()).then(d => {
-    logLine(`Set ${type} device #${deviceId} on ${clientId}`);
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+  }).then(r => r.json()).then(() => {
+    logLine(`Set ${type} #${deviceId} on ${clientId}`);
     if (clients[clientId]) {
       if (type === 'input')  clients[clientId].selected_input  = deviceId;
       if (type === 'output') clients[clientId].selected_output = deviceId;
@@ -347,19 +477,19 @@ function sendDevicePrompt(id) {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-let _allTests = [];  // populated by refreshTests
+let _allTests = [];
 
 function refreshTests() {
-  fetch('/api/tests').then(r=>r.json()).then(d => {
+  if (NODE_ROLE !== 'server') return;
+  fetch('/api/tests').then(r => r.json()).then(d => {
     _allTests = d.tests || [];
     const sel = document.getElementById('test-select');
     if (!_allTests.length) {
-      sel.innerHTML = '<option value="">No test scripts found</option>';
-      return;
+      sel.innerHTML = '<option value="">No test scripts found</option>'; return;
     }
     sel.innerHTML = _allTests.map(t => {
       const label = t.roles.length
-        ? `${t.name}  [${t.roles.map(r=>r.role).join(' | ')}]`
+        ? `${t.name}  [${t.roles.map(r => r.role).join(' | ')}]`
         : t.name;
       return `<option value="${escAttr(t.name)}">${escHtml(label)}</option>`;
     }).join('');
@@ -375,20 +505,74 @@ function onTestSelect() {
   document.getElementById('standalone-section').style.display = hasRoles ? 'none' : '';
   document.getElementById('roles-section').style.display      = hasRoles ? ''     : 'none';
   if (hasRoles) { renderRolesTable(test.roles); updateRolesNote(); }
-  else          updateTargetCheckboxes();
+  else updateTargetCheckboxes();
+
+  // Load param defaults from schema — preserve values user has already typed
+  _loadParamsFromSchema(test.params_schema || []);
+}
+
+function _loadParamsFromSchema(schema) {
+  // Keep any keys the user has manually set so edits survive test re-select
+  const existing = {};
+  for (const r of _paramRows) existing[r.key] = r;
+
+  _paramRows = [];
+  const conflicts = [];
+
+  for (const p of schema) {
+    const prev = existing[p.key];
+    // If user already has this key, keep their value; otherwise use the default
+    const value = prev
+      ? prev.value
+      : (p.type === 'json'
+          ? (p.default == null ? '{}' : JSON.stringify(p.default))
+          : (p.default == null ? ''   : p.default));
+
+    _paramRows.push({
+      id:       ++_paramCounter,
+      key:      p.key,
+      type:     p.type,
+      value,
+      conflict: p.conflict || false,
+      sources:  p.sources  || [],
+      conflict_defaults: p.conflict_defaults || null,
+    });
+
+    if (p.conflict) conflicts.push(p);
+  }
+
+  _renderParams();
+
+  // Show/hide conflict warning banner
+  let banner = document.getElementById('params-conflict-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'params-conflict-banner';
+    document.getElementById('params-table').before(banner);
+  }
+  if (conflicts.length) {
+    banner.innerHTML = `<div class="note" style="color:#b85c00;margin-bottom:4px">
+      \u26A0 ${conflicts.length} param(s) have different defaults across role scripts
+      \u2014 hover the \u26A0 badge to see which files disagree:
+      ${conflicts.map(c => {
+        const detail = c.conflict_defaults
+          ? Object.entries(c.conflict_defaults).map(([f,v]) => `${f}: ${JSON.stringify(v)}`).join(', ')
+          : '';
+        return `<b>${escHtml(c.key)}</b>${detail ? ` (${escHtml(detail)})` : ''}`;
+      }).join('; ')}
+    </div>`;
+  } else {
+    banner.innerHTML = '';
+  }
 }
 
 function assignAllRoles(clientId) {
-  document.querySelectorAll('.role-cb').forEach(cb => {
-    cb.checked = (cb.value === clientId);
-  });
+  document.querySelectorAll('.role-cb').forEach(cb => { cb.checked = (cb.value === clientId); });
   updateRolesNote();
 }
 
 function renderRolesTable(roles) {
   const clientIds = Object.keys(clients);
-
-  // Single-client shortcut banner
   const banner = document.getElementById('single-client-banner');
   if (clientIds.length === 1) {
     const id = clientIds[0];
@@ -396,16 +580,15 @@ function renderRolesTable(roles) {
       <button onclick="assignAllRoles('${escAttr(id)}')" style="margin-left:8px">
         Assign all roles to ${escHtml(id)}
       </button>
-      <span class="note" style="margin-left:6px">(roles run concurrently on the same machine)</span>`;
-  } else {
-    banner.innerHTML = '';
-  }
+      <span class="note" style="margin-left:6px">(roles run concurrently)</span>`;
+  } else banner.innerHTML = '';
 
   const tbody = document.getElementById('roles-tbody');
   tbody.innerHTML = roles.map(r => {
-    const checkboxes = clientIds.map(id =>
+    const cbs = clientIds.map(id =>
       `<label style="margin-right:8px">
-        <input type="checkbox" class="role-cb" data-role="${escAttr(r.role)}" value="${id}"> ${id}
+         <input type="checkbox" class="role-cb"
+                data-role="${escAttr(r.role)}" value="${id}"> ${id}
        </label>`
     ).join('');
     return `<tr>
@@ -413,72 +596,197 @@ function renderRolesTable(roles) {
         <b>${escHtml(r.role)}</b><br>
         <span class="note">${escHtml(r.filename)}</span>
       </td>
-      <td style="border:1px solid #aaa;padding:4px 8px">${checkboxes || '<span class="note">no clients</span>'}</td>
+      <td style="border:1px solid #aaa;padding:4px 8px">
+        ${cbs || '<span class="note">no clients</span>'}
+      </td>
     </tr>`;
   }).join('');
-
-  // When a checkbox changes, update the sequential-mode note
-  tbody.querySelectorAll('.role-cb').forEach(cb => {
-    cb.addEventListener('change', updateRolesNote);
-  });
+  tbody.querySelectorAll('.role-cb').forEach(cb => cb.addEventListener('change', updateRolesNote));
   updateRolesNote();
 }
 
 function updateRolesNote() {
-  const note = document.getElementById('roles-note');
-  if (!note) return;
-  // Find any client assigned to more than one role
-  const clientRoles = {};
+  const note = document.getElementById('roles-note'); if (!note) return;
+  const cnt = {};
   document.querySelectorAll('.role-cb:checked').forEach(cb => {
-    clientRoles[cb.value] = (clientRoles[cb.value] || 0) + 1;
+    cnt[cb.value] = (cnt[cb.value] || 0) + 1;
   });
-  const sequential = Object.entries(clientRoles).filter(([,n]) => n > 1).map(([id]) => id);
-  if (sequential.length) {
-    note.textContent = `Note: ${sequential.join(', ')} assigned to multiple roles — roles run concurrently on that client.`;
-  } else {
-    note.textContent = 'Assign clients to roles. A client can be assigned to multiple roles - they run concurrently.';
-  }
+  const multi = Object.entries(cnt).filter(([,n]) => n > 1).map(([id]) => id);
+  note.textContent = multi.length
+    ? `Note: ${multi.join(', ')} assigned to multiple roles \u2014 run concurrently on that client.`
+    : 'Assign clients to roles. A client can be assigned to multiple roles \u2014 they run concurrently.';
 }
 
 function updateTargetCheckboxes() {
-  const wrap = document.getElementById('target-checkboxes');
+  const wrap = document.getElementById('target-checkboxes'); if (!wrap) return;
   wrap.innerHTML = Object.keys(clients).map(id =>
     `<label><input type="checkbox" class="client-cb" value="${id}" checked> ${id}</label>`
   ).join('');
 }
 
-function updateCmdTarget() {
-  const sel = document.getElementById('cmd-target');
-  const cur = sel.value;
-  sel.innerHTML = `<option value="__all__">All clients</option>` +
-    Object.keys(clients).map(id => `<option value="${id}">${id}</option>`).join('');
-  sel.value = cur || '__all__';
-}
-
 function checkAllClients()   { document.querySelectorAll('.client-cb').forEach(c => c.checked=true);  }
 function uncheckAllClients() { document.querySelectorAll('.client-cb').forEach(c => c.checked=false); }
 
+// ── Params builder ────────────────────────────────────────────────────────────
+let _paramRows = [], _paramCounter = 0;
+const _typeDefaults = { string: '', number: 0, boolean: false, json: '{}' };
+
+function addParam(key='', type='string', value='') {
+  _paramRows.push({ id: ++_paramCounter, key, type, value });
+  _renderParams();
+}
+
+function removeParam(id) {
+  _paramRows = _paramRows.filter(r => r.id !== id);
+  _renderParams();
+}
+
+function _renderParams() {
+  const tbody = document.getElementById('params-tbody');
+  if (!_paramRows.length) {
+    tbody.innerHTML =
+      '<tr><td colspan="4" style="padding:4px 6px;border:none" class="note">' +
+      'No params \u2014 click \u201c+ Add param\u201d to add.</td></tr>';
+    _previewParams(); return;
+  }
+  tbody.innerHTML = _paramRows.map(r => {
+    const conflictBadge = r.conflict
+      ? `<span class="conflict-badge" title="Defaults differ: ${escAttr(
+          r.conflict_defaults
+            ? Object.entries(r.conflict_defaults).map(([f,v]) => `${f}=${JSON.stringify(v)}`).join(', ')
+            : 'see banner'
+        )}">\u26A0</span>`
+      : '';
+    const sourceTip = r.sources && r.sources.length
+      ? ` title="from: ${escAttr(r.sources.join(', '))}"`
+      : '';
+    return `
+    <tr class="${r.conflict ? 'param-conflict' : ''}">
+      <td><input type="text" value="${escAttr(r.key)}" style="width:130px"
+                 oninput="updateParamField(${r.id},'key',this.value)"
+                 placeholder="param name"${sourceTip}>${conflictBadge}</td>
+      <td><select style="width:82px"
+                  onchange="updateParamField(${r.id},'type',this.value)">
+            ${['string','number','boolean','json'].map(t =>
+              `<option value="${t}"${r.type===t?' selected':''}>${t}</option>`
+            ).join('')}
+          </select></td>
+      <td>${_valueInput(r)}</td>
+      <td><button onclick="removeParam(${r.id})" title="Remove">\u2715</button></td>
+    </tr>`;
+  }).join('');
+  _previewParams();
+}
+
+function _valueInput(r) {
+  if (r.type === 'boolean') {
+    const t = (r.value === true || r.value === 'true');
+    return `<select style="width:78px"
+                    onchange="updateParamField(${r.id},'value',this.value==='true')">
+              <option value="true"${t?' selected':''}>true</option>
+              <option value="false"${!t?' selected':''}>false</option>
+            </select>`;
+  }
+  const v = r.type === 'json'
+    ? (typeof r.value === 'string' ? r.value : JSON.stringify(r.value))
+    : String(r.value ?? '');
+  return `<input type="${r.type==='number'?'number':'text'}" value="${escAttr(v)}"
+                 style="width:198px"
+                 oninput="updateParamField(${r.id},'value',this.value)"
+                 placeholder="${r.type==='json'?'{}':'value'}">`;
+}
+
+function updateParamField(id, field, value) {
+  const row = _paramRows.find(r => r.id === id); if (!row) return;
+  if (field === 'type') {
+    row.type  = value;
+    row.value = _typeDefaults[value];
+    _renderParams();   // swap input widget type
+    return;
+  }
+  row[field] = value;
+  _previewParams();
+}
+
+function _previewParams() {
+  document.getElementById('params-preview').textContent = JSON.stringify(_buildParams());
+}
+
+function _buildParams() {
+  const out = {};
+  for (const r of _paramRows) {
+    const k = r.key.trim(); if (!k) continue;
+    if (r.type === 'number')  { out[k] = Number(r.value); continue; }
+    if (r.type === 'boolean') { out[k] = (r.value === true || r.value === 'true'); continue; }
+    if (r.type === 'json') {
+      try { out[k] = JSON.parse(r.value); } catch { out[k] = r.value; }
+      continue;
+    }
+    out[k] = String(r.value ?? '');
+  }
+  return out;
+}
+
+function clearParams() { _paramRows = []; _renderParams(); }
+
+// raw JSON toggle
+let _rawOpen = false;
+function toggleRawJson() {
+  _rawOpen = !_rawOpen;
+  document.getElementById('raw-json-area').style.display = _rawOpen ? '' : 'none';
+  document.getElementById('raw-toggle-btn').textContent  = _rawOpen ? '\u2715 Raw JSON' : '\u2328 Raw JSON';
+  if (_rawOpen)
+    document.getElementById('raw-json-input').value = JSON.stringify(_buildParams());
+}
+
+function applyRawJson() {
+  const raw = document.getElementById('raw-json-input').value.trim();
+  const err = document.getElementById('raw-json-err');
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch(e) { err.textContent = `Invalid JSON: ${e.message}`; return; }
+  if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+    err.textContent = 'Must be a JSON object {}'; return;
+  }
+  err.textContent = '';
+  _paramRows = [];
+  for (const [k, v] of Object.entries(parsed)) {
+    const type  = typeof v === 'number'  ? 'number'
+                : typeof v === 'boolean' ? 'boolean'
+                : typeof v === 'object'  ? 'json'
+                : 'string';
+    const value = type === 'json' ? JSON.stringify(v) : v;
+    _paramRows.push({ id: ++_paramCounter, key: k, type, value });
+  }
+  _renderParams();
+  toggleRawJson();   // close raw panel
+}
+
+// boot: show empty table
+_renderParams();
+
+// ── Run test ──────────────────────────────────────────────────────────────────
 function runTest() {
+  // ── GUARD: /api/tests/run must never be called from a client node ──────────
+  if (NODE_ROLE !== 'server') return;
+
   const testName = document.getElementById('test-select').value;
   if (!testName) { alert('Select a test first.'); return; }
   const test = _allTests.find(t => t.name === testName);
   if (!test) return;
 
-  let params = {};
-  try { params = JSON.parse(document.getElementById('test-params').value || '{}'); }
-  catch(e) { alert('Invalid JSON in params field.'); return; }
+  const params = _buildParams();
 
   let body;
   if (test.roles && test.roles.length) {
-    // Build roles map from checkboxes
     const rolesMap = {};
     document.querySelectorAll('.role-cb:checked').forEach(cb => {
-      const role = cb.dataset.role;
-      if (!rolesMap[role]) rolesMap[role] = [];
-      rolesMap[role].push(cb.value);
+      if (!rolesMap[cb.dataset.role]) rolesMap[cb.dataset.role] = [];
+      rolesMap[cb.dataset.role].push(cb.value);
     });
-    const total = Object.values(rolesMap).flat().length;
-    if (!total) { alert('Assign at least one client to a role.'); return; }
+    if (!Object.values(rolesMap).flat().length) {
+      alert('Assign at least one client to a role.'); return;
+    }
     body = { test: testName, params, roles: rolesMap };
     logLine(`[run] test=${testName} roles=${JSON.stringify(rolesMap)}`);
   } else {
@@ -488,56 +796,37 @@ function runTest() {
     logLine(`[run] test=${testName} clients=${checked.join(',')}`);
   }
 
-  document.getElementById('run-status').textContent = 'Dispatching…';
+  document.getElementById('run-status').textContent = 'Dispatching\u2026';
   fetch('/api/tests/run', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(body)
-  }).then(r=>r.json()).then(d => {
-    const msg = d.ok ? `run_id: ${d.run_id}` : `error: ${d.error}`;
-    document.getElementById('run-status').textContent = msg;
-    if (d.unreachable && d.unreachable.length)
+    body: JSON.stringify(body),
+  }).then(r => r.json()).then(d => {
+    document.getElementById('run-status').textContent =
+      d.ok ? `run_id: ${d.run_id}` : `error: ${d.error}`;
+    if (d.unreachable?.length)
       logLine(`[warn] unreachable: ${d.unreachable.join(',')}`);
   });
 }
 
 function stopAll() {
   if (!confirm('Send stop signal to all clients?')) return;
-  fetch('/api/stop/all', { method: 'POST' })
-    .then(r => r.json())
-    .then(d => {
-      const msg = d.ok ? `Stopped: ${(d.stopped||[]).join(', ') || 'none running'}` : `error: ${d.error}`;
-      document.getElementById('run-status').textContent = msg;
-      logLine(`[stop] ${msg}`);
-    });
-}
-
-// ── Shell command ─────────────────────────────────────────────────────────────
-function sendCommand() {
-  const cmd    = document.getElementById('cmd-input').value.trim();
-  const target = document.getElementById('cmd-target').value;
-  if (!cmd) return;
-
-  const targets = target === '__all__' ? Object.keys(clients) : [target];
-  targets.forEach(id => {
-    fetch(`/api/clients/${id}/command`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ command: cmd })
-    });
+  fetch('/api/stop/all', { method: 'POST' }).then(r => r.json()).then(d => {
+    const msg = d.ok
+      ? `Stopped: ${(d.stopped||[]).join(', ') || 'none running'}`
+      : `error: ${d.error}`;
+    document.getElementById('run-status').textContent = msg;
+    logLine(`[stop] ${msg}`);
   });
-  logLine(`[cmd] → ${targets.join(',')} : ${cmd}`);
-  document.getElementById('cmd-input').value = '';
 }
 
-// ── Results ───────────────────────────────────────────────────────────────────
+// ── Results (server only) ─────────────────────────────────────────────────────
 function loadResults() {
-  fetch('/api/results').then(r=>r.json()).then(d => {
-    const area = document.getElementById('results-area');
+  fetch('/api/results').then(r => r.json()).then(d => {
+    const area = document.getElementById('results-area'); if (!area) return;
     const runs = d.results || [];
     if (!runs.length) { area.textContent = 'No results yet.'; return; }
-
     area.innerHTML = runs.map(r => {
-      const files = (r.files || []).join(', ');
+      const files = (r.files||[]).join(', ');
       return `<div style="margin-bottom:10px;border:1px solid #ccc;padding:8px">
         <b>${r.run_id}</b><br>
         <span class="note">files: ${escHtml(files)}</span><br>
@@ -551,21 +840,18 @@ function loadResults() {
 
 // ── Log ───────────────────────────────────────────────────────────────────────
 function loadLog() {
-  fetch('/api/logs').then(r=>r.json()).then(d => {
+  fetch('/api/logs').then(r => r.json()).then(d => {
     const box = document.getElementById('log-box');
-    box.textContent = (d.logs||[]).map(l =>
-      `[${l.ts}][${l.client}][${l.level}] ${l.msg}`
-    ).join('\n');
+    box.textContent = (d.logs||[])
+      .map(l => `[${l.ts}][${l.client}][${l.level}] ${l.msg}`).join('\n');
     box.scrollTop = box.scrollHeight;
   });
 }
-
 function logLine(msg) {
   const box = document.getElementById('log-box');
   box.textContent += (box.textContent ? '\n' : '') + msg;
   box.scrollTop = box.scrollHeight;
 }
-
 function clearLog() { document.getElementById('log-box').textContent = ''; }
 
 // ── Utils ─────────────────────────────────────────────────────────────────────

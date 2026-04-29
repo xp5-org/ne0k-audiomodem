@@ -515,11 +515,14 @@ def _make_server_client() -> sio_module.Client:
 
 @app.route("/")
 def index():
-    template = "server.html" if state["role"] == "server" else "client.html"
-    return render_template(template,
-                           node_id=state["node_id"],
-                           role=state["role"],
-                           port=state["port"])
+    return render_template(
+        "server.html",               # single unified template for both roles
+        node_id=state["node_id"],
+        role=state["role"],
+        port=state["port"],
+        server_ip=state.get("server_ip") or "",
+        server_port=state.get("server_port") or 8001,
+    )
 
 
 @app.route("/api/status")
@@ -643,10 +646,131 @@ def api_clients():
     return jsonify({"clients": _clients})
 
 
+# ── PATCH for app.py ──────────────────────────────────────────────────────────
+# 1. Add _parse_test_params() anywhere near the top of the file (after imports).
+# 2. Replace the existing api_tests() route with the one below.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import ast
+import re as _re
+
+def _parse_test_params(script_path: str) -> list[dict]:
+    """
+    Scan a test .py file for every  PARAMS.get("key")  or
+    PARAMS.get("key", default)  call and return a list of:
+
+        { "key": str, "default": <python value | None>, "type": str }
+
+    Type is inferred from the default: int/float → "number",
+    bool → "boolean", list/dict → "json", str → "string", None → "string".
+
+    Duplicate keys within the same file are deduplicated (first wins).
+    """
+    try:
+        source = Path(script_path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, IOError):
+        return []
+
+    # Match: PARAMS.get( "key" )  or  PARAMS.get( "key", <expr> )
+    # We capture everything after the comma up to the closing paren so we can
+    # eval it safely with ast.literal_eval.
+    pattern = _re.compile(
+        r"""PARAMS\s*\.\s*get\s*\(\s*["']([^"']+)["']\s*(?:,\s*(.*?))?\s*\)""",
+        _re.DOTALL,
+    )
+
+    seen: dict[str, dict] = {}
+    for m in pattern.finditer(source):
+        key      = m.group(1)
+        raw_expr = (m.group(2) or "").strip()
+
+        if key in seen:
+            continue  # first occurrence wins
+
+        default = None
+        py_type = "string"
+
+        if raw_expr:
+            # Strip trailing comment (e.g.  0.8,  # amplitude)
+            raw_expr = _re.sub(r"#.*$", "", raw_expr, flags=_re.MULTILINE).strip()
+            # Remove trailing comma that sometimes slips in
+            raw_expr = raw_expr.rstrip(",").strip()
+            try:
+                default = ast.literal_eval(raw_expr)
+            except Exception:
+                default = raw_expr   # keep as raw string if unparseable
+
+        if isinstance(default, bool):
+            py_type = "boolean"
+        elif isinstance(default, (int, float)):
+            py_type = "number"
+        elif isinstance(default, (list, dict)):
+            py_type = "json"
+        else:
+            py_type = "string"
+
+        seen[key] = {"key": key, "default": default, "type": py_type}
+
+    return list(seen.values())
+
+
+def _merge_params_schema(role_scripts: list[tuple[str, str]]) -> list[dict]:
+    """
+    Merge param schemas from multiple role scripts into one list.
+
+    role_scripts: [(role_name, script_path), ...]
+
+    Returns a list of param dicts, each with an added "sources" list and an
+    optional "conflict" flag when the same key appears with different defaults
+    across files.
+    """
+    merged: dict[str, dict] = {}
+
+    for role_name, script_path in role_scripts:
+        for p in _parse_test_params(script_path):
+            key = p["key"]
+            if key not in merged:
+                merged[key] = {**p, "sources": [role_name], "conflict": False}
+            else:
+                merged[key]["sources"].append(role_name)
+                if merged[key]["default"] != p["default"]:
+                    merged[key]["conflict"] = True
+                    # Keep both defaults in a dict keyed by role for UI display
+                    if not isinstance(merged[key].get("conflict_defaults"), dict):
+                        merged[key]["conflict_defaults"] = {
+                            merged[key]["sources"][0]: merged[key]["default"]
+                        }
+                    merged[key]["conflict_defaults"][role_name] = p["default"]
+
+    return list(merged.values())
+
+
+# ── Replace existing api_tests() with this ────────────────────────────────────
+
 @app.route("/api/tests")
 @_server_only
 def api_tests():
-    return jsonify({"tests": shared.list_tests()})
+    tests = shared.list_tests()   # existing call — returns list of test dicts
+
+    for t in tests:
+        roles = t.get("roles", [])
+        if roles:
+            # Role-based test: aggregate across all role scripts
+            role_scripts = [
+                (r["role"], str(shared.TESTS_DIR / r["filename"]))
+                for r in roles
+            ]
+            t["params_schema"] = _merge_params_schema(role_scripts)
+        else:
+            # Standalone test: single script
+            script_path = str(shared.TESTS_DIR / f"{t['name']}.py")
+            params = _parse_test_params(script_path)
+            for p in params:
+                p["sources"] = [t["name"]]
+                p["conflict"] = False
+            t["params_schema"] = params
+
+    return jsonify({"tests": tests})
 
 
 @app.route("/api/results")
@@ -733,10 +857,13 @@ def api_run_test():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     server_ip = _clients.get(state["node_id"], {}).get("ip", "127.0.0.1")
+    remote_server_url = f"http://{server_ip}:{state['port']}"
+    local_server_url  = f"http://127.0.0.1:{state['port']}"   # for local subprocs
+
     params.update({
         "run_id":     run_id,
         "test_name":  test_name,
-        "server_url": f"http://{server_ip}:{state['port']}",
+        "server_url": remote_server_url,   # default; overridden for local below
     })
 
     role_to_nodes = {}
@@ -758,21 +885,23 @@ def api_run_test():
         test_path   = str(shared.TESTS_DIR / f"{script}.py")
 
         if nid == state["node_id"]:
-            # server runs it locally via the shared _exec_test
+            # Server running its own slice: force 127.0.0.1 so coord HTTP calls
+            # always succeed regardless of LAN firewall / routing rules.
+            local_params = {**node_params, "server_url": local_server_url}
             threading.Thread(
-                target=_exec_test, args=(test_path, node_params), daemon=True
+                target=_exec_test, args=(test_path, local_params), daemon=True
             ).start()
             _log(f"Running '{script}' locally (server node, role={role or '-'})", client_id=nid)
         elif nid in _client_sids:
+            # Remote client: keep the LAN IP so it can reach back to the server.
             sio.emit("run_test", {"test": script, "params": node_params},
                      to=_client_sids[nid])
             _log(f"Dispatched '{script}' -> {nid} (role={role or '-'})", client_id=nid)
         else:
             unreachable.append(nid)
-            _log(f"Node {nid} not connected — skipped", "warn", client_id=nid)
+            _log(f"Node {nid} not connected  skipped", "warn", client_id=nid)
 
     return jsonify({"ok": True, "run_id": run_id, "unreachable": unreachable})
-
 
 @app.route("/api/stop/all", methods=["POST"])
 @_server_only
@@ -816,6 +945,15 @@ def coord_clear(run_id: str):
         _coord.pop(run_id, None)
     return jsonify({"ok": True})
 
+@app.route("/api/coord/<run_id>", methods=["GET"])
+@_server_only
+def coord_dump(run_id: str):
+    """Return all signals registered for a run — useful for debugging timeouts."""
+    with _coord_lock:
+        data = {k: list(v) for k, v in _coord.get(run_id, {}).items()}
+    return jsonify({"run_id": run_id, "signals": data})
+
+
 
 # ===========================================================================
 # server helpers
@@ -852,6 +990,8 @@ def _register_server_self():
     state["status"] = "idle"
     _log(f"server self-registered as '{state['node_id']}' ({ip}:{state['port']})")
     sio.emit("client_joined", {"client_id": state["node_id"], "info": info})
+
+
 
 
 # ===========================================================================

@@ -28,7 +28,8 @@ try:
     from css_decoder import (
         generate_chirp, ChirpCorrelator, PeakAGC,
         SoftPreambleDetector, get_bytes_from_bits, check_crc,
-        _make_rs_codec, rs_decode_frame, BARKER_13, CRC_BYTES,
+        _make_rs_codec, rs_decode_frame, deinterleave_bits,
+        BARKER_13, CRC_BYTES,
     )
 except ImportError as e:
     sys.exit(f"ERROR: cannot import css_decoder.py -- {e}")
@@ -109,10 +110,11 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
     f_min         = float(cfg.get("f_min",           conf_j["f_min"]))
     f_max         = float(cfg.get("f_max",           conf_j["f_max"]))
     full_preamble = list( cfg.get("preamble",        conf_j.get("preamble", BARKER_13)))
-    sync_word     = list( conf_j.get("sync_word",    full_preamble[-13:]))
+    sync_word     = full_preamble   # always use full preamble; ignore stale sync_word in JSON
     chunk_size    = int(  cfg.get("chunk_size",      conf_j["chunk_size"]))
     crc_bytes_n   = int(  conf_j.get("crc_bytes",    CRC_BYTES))
     rs_t          = int(  conf_j.get("rs_t",         0))
+    interleave_rows = int(conf_j.get("interleave_rows", 0))
     sync_thr      = float(cfg.get("sync_threshold",  0.65))
     alpha         = float(cfg.get("timing_loop_gain",   0.10))
     search_frac   = float(cfg.get("timing_search_frac", 0.25))
@@ -123,8 +125,9 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
     sps      = int(fs * dur)
     buf_size = sps * 3
 
-    frame_bytes    = 1 + chunk_size + crc_bytes_n + rs_parity
-    bits_per_frame = frame_bytes * 8
+    base_bits     = int(conf_j.get("base_bits",
+                                   (1 + chunk_size + crc_bytes_n + rs_parity) * 8))
+    frame_symbols = int(conf_j.get("frame_symbols", base_bits))
 
     up_ref   = generate_chirp(f_min, f_max, dur, fs)
     down_ref = generate_chirp(f_max, f_min, dur, fs)
@@ -142,8 +145,8 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
     print(f"OFFLINE DECODE")
     print(f"  WAV:    {len(samples)} samples @ {fs}Hz  ({len(samples)/fs:.2f}s)")
     print(f"  sps={sps}  buf_size={buf_size}  expected_peak={expected_peak}")
-    print(f"  search_range=±{correlator.search_range}  bits/frame={bits_per_frame}")
-    print(f"  sync_threshold={sync_thr}  timing_alpha={alpha}")
+    print(f"  search_range=±{correlator.search_range}  base_bits={base_bits}  frame_symbols={frame_symbols}")
+    print(f"  sync_threshold={sync_thr}  timing_alpha={alpha}  interleave_rows={interleave_rows}")
     print(f"  sync_word ({len(sync_word)}): {sync_word}")
     print(f"{'='*82}")
 
@@ -224,9 +227,13 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
             bit_stream.append(bit)
             event = ""
 
-            if len(bit_stream) >= bits_per_frame:
-                frame_bits = bit_stream[:bits_per_frame]
-                bit_stream = bit_stream[bits_per_frame:]
+            if len(bit_stream) >= frame_symbols:
+                frame_bits = bit_stream[:frame_symbols]
+                bit_stream = bit_stream[frame_symbols:]
+
+                if interleave_rows > 1:
+                    frame_bits = deinterleave_bits(frame_bits, interleave_rows, base_bits)
+
                 raw_bytes  = get_bytes_from_bits(frame_bits)
 
                 rs_errors = 0
@@ -304,13 +311,15 @@ def main():
     if wav_path is None:
         print("No --wav specified. Generating test WAV...")
         enc_cfg = {
-            "message":    args.message,
-            "fs":         cfg.get("fs",          44100),
-            "f_min":      cfg.get("f_min",        400),
-            "f_max":      cfg.get("f_max",        6000),
-            "symbol_dur": cfg.get("symbol_dur",   0.25),
-            "chunk_size": cfg.get("chunk_size",   8),
-            "amplitude":  0.8,
+            "message":         args.message,
+            "fs":              cfg.get("fs",             44100),
+            "f_min":           cfg.get("f_min",           400),
+            "f_max":           cfg.get("f_max",          6000),
+            "symbol_dur":      cfg.get("symbol_dur",      0.25),
+            "chunk_size":      cfg.get("chunk_size",      8),
+            "amplitude":       cfg.get("amplitude",       0.8),
+            "rs_t":            cfg.get("rs_t",            0),
+            "interleave_rows": cfg.get("interleave_rows", 0),
         }
         wav_path, info_path = generate_test_wav(enc_cfg)
         print(f"Generated: {wav_path}  info: {info_path}")

@@ -1,41 +1,51 @@
 """
 css_encoder.py  -  Standalone CSS encoder.
 
-Frame structure (no FEC):  [seq(1)] [data(chunk_size)] [crc32(4)]
-Frame structure (RS FEC):  [seq(1)] [data(chunk_size)] [crc32(4)] [rs_parity(2*t)]
+Frame structure (no FEC):   [seq(1)] [data(chunk_size)] [crc32(4)]
+Frame structure (RS only):  [seq(1)] [data(chunk_size)] [crc32(4)] [rs_parity(2*t)]
+Frame structure (RS+IL):    interleave( [seq(1)] [data(N)] [crc32(4)] [rs_parity(2*t)] )
 
 Encoding is ABSOLUTE: bit 1 → up-chirp, bit 0 → down-chirp.
-No differential encoding is applied. The decoder must match.
 
-CRC32 -- stdlib zlib, identical on all platforms, no external dependencies.
-Reed-Solomon -- optional; requires `pip install reedsolo`.  Set rs_t > 0 to enable.
-  rs_t is the number of byte errors correctable per frame (parity = 2*rs_t bytes).
+Block interleaver (interleave_rows > 0):
+  Applied AFTER RS encoding, BEFORE chirp modulation.
+  Converts a contiguous burst of B symbol errors into at most ceil(B/rows)
+  errors per row, allowing RS to recover from fades far longer than it
+  could otherwise handle.
 
-Usage:
-    python css_encoder.py                     # uses css_encode_config.json
-    python css_encoder.py my_config.json
-    python css_encoder.py --print-schema
+  Matrix layout (rows x cols, read column-by-column):
+    col 0:  bit 0, bit cols, bit 2*cols, ...   ← symbol stream
+    col 1:  bit 1, bit cols+1, ...
+    ...
+
+  A fade lasting B symbols destroys B consecutive columns.
+  Each row loses at most ceil(B/rows) bits.
+  RS(t) corrects up to t byte errors per frame -- with interleaving the
+  frame can survive a fade of up to rows * t * 8 symbols.
+
+  Example: rows=8, rs_t=4, symbol_dur=0.15s
+    Protected fade length = 8 * 4 * 8 * 0.15s = 38.4 s  (theoretical max)
+    Practical target: protect ~1-2 s multipath/echo fades.
 
 Config JSON (all optional):
 {
-    "message":    "Hello world",
-    "output":     "css_output.wav",
-    "info_out":   "css_info.json",
-    "result_out": "css_encode_result.json",
-    "fs":         44100,
-    "f_min":      400,
-    "f_max":      6000,
-    "symbol_dur": 0.25,
-    "chunk_size": 8,
-    "amplitude":  0.8,
-    "preamble":   [1,1,1,1,1,0,0,1,1,0,1,0,1],
-    "rs_t":       0
+    "message":         "Hello world",
+    "output":          "css_output.wav",
+    "info_out":        "css_info.json",
+    "result_out":      "css_encode_result.json",
+    "fs":              44100,
+    "f_min":           400,
+    "f_max":           6000,
+    "symbol_dur":      0.25,
+    "chunk_size":      8,
+    "amplitude":       0.8,
+    "preamble":        [1,1,1,1,1,0,0,1,1,0,1,0,1],
+    "rs_t":            0,
+    "interleave_rows": 0
 }
 
-chunk_size is auto-scaled to keep frame_duration under 30s.
-rs_t=0 disables Reed-Solomon (default, backward-compatible).
-rs_t=2 corrects up to 2 byte errors per frame (adds 4 parity bytes).
-rs_t=4 corrects up to 4 byte errors per frame (adds 8 parity bytes).
+interleave_rows=0 disables interleaving (default, backward-compatible).
+Recommended: interleave_rows=8 with rs_t=4 for multipath environments.
 """
 
 import json
@@ -47,21 +57,22 @@ from pathlib import Path
 import numpy as np
 
 BARKER_13  = [1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1]
-CRC_BYTES  = 4   # zlib.crc32 is 32-bit = 4 bytes
+CRC_BYTES  = 4
 
 EXAMPLE_CONFIG = {
-    "message":    "Hello world",
-    "output":     "css_output.wav",
-    "info_out":   "css_info.json",
-    "result_out": "css_encode_result.json",
-    "fs":         44100,
-    "f_min":      400,
-    "f_max":      6000,
-    "symbol_dur": 0.5,
-    "chunk_size": 12,
-    "amplitude":  0.8,
-    "preamble":   BARKER_13,
-    "rs_t":       0,
+    "message":         "Hello world",
+    "output":          "css_output.wav",
+    "info_out":        "css_info.json",
+    "result_out":      "css_encode_result.json",
+    "fs":              44100,
+    "f_min":           400,
+    "f_max":           6000,
+    "symbol_dur":      0.25,
+    "chunk_size":      8,
+    "amplitude":       0.8,
+    "preamble":        BARKER_13,
+    "rs_t":            0,
+    "interleave_rows": 0,
 }
 
 DEFAULT_MSG = "Lorem ipsum dolor sit amet"
@@ -72,12 +83,11 @@ DEFAULT_MSG = "Lorem ipsum dolor sit amet"
 # ---------------------------------------------------------------------------
 
 def _make_rs_codec(rs_t):
-    """Return an RSCodec instance, or None if reedsolo not available / rs_t==0."""
     if rs_t <= 0:
         return None
     try:
         import reedsolo
-        return reedsolo.RSCodec(rs_t * 2)   # nsym = 2*t parity bytes
+        return reedsolo.RSCodec(rs_t * 2)
     except ImportError:
         print("WARNING: reedsolo not installed -- RS FEC disabled. "
               "Install with: pip install reedsolo", flush=True)
@@ -85,12 +95,45 @@ def _make_rs_codec(rs_t):
 
 
 def rs_encode_frame(payload: bytes, codec) -> bytes:
-    """Append RS parity to payload. Returns payload + parity."""
     if codec is None:
         return payload
-    encoded = codec.encode(payload)
-    # reedsolo.encode returns bytearray of (payload + parity)
-    return bytes(encoded)
+    return bytes(codec.encode(payload))
+
+
+# ---------------------------------------------------------------------------
+# Block interleaver
+# ---------------------------------------------------------------------------
+
+def interleave_bits(bits, rows):
+    """
+    Block interleaver: write bits into a (rows × cols) matrix row-by-row,
+    then read out column-by-column.
+
+    A burst of B consecutive errors in the output (transmitted) stream
+    hits at most ceil(B / rows) bits in any single row of the original
+    data, allowing RS to correct fades far longer than the RS block size.
+
+    Pads with zeros to fill the matrix; decoder trims to original length.
+    Returns list of ints (0/1), length = rows * cols >= len(bits).
+    """
+    if rows <= 1:
+        return list(bits)
+    cols   = -(-len(bits) // rows)          # ceil(len/rows)
+    padded = list(bits) + [0] * (rows * cols - len(bits))
+    # reshape row-by-row, then read column-by-column (= transpose + flatten)
+    return np.array(padded, dtype=np.int8).reshape(rows, cols).T.flatten().tolist()
+
+
+def deinterleave_bits(bits, rows, orig_len):
+    """
+    Inverse of interleave_bits.  bits must have length rows * cols.
+    Returns first orig_len bits of the de-interleaved sequence.
+    """
+    if rows <= 1:
+        return list(bits[:orig_len])
+    cols = len(bits) // rows
+    # received is column-major; reshape as (cols × rows), transpose = (rows × cols)
+    return np.array(bits, dtype=np.int8).reshape(cols, rows).T.flatten().tolist()[:orig_len]
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +153,6 @@ def get_bits(byte_val):
 
 
 def frame_crc(seq, data):
-    """4-byte CRC32 over [seq_byte + data_bytes]."""
     payload = bytes([seq]) + data
     crc = zlib.crc32(payload) & 0xFFFFFFFF
     return crc.to_bytes(4, "big")
@@ -121,35 +163,47 @@ def frame_crc(seq, data):
 # ---------------------------------------------------------------------------
 
 def encode(cfg):
-    fs         = int(  cfg.get("fs",          44100))
-    f_min      = float(cfg.get("f_min",        400))
-    f_max      = float(cfg.get("f_max",       6000))
-    symbol_dur = float(cfg.get("symbol_dur",   0.25))
-    amplitude  = float(cfg.get("amplitude",    0.8))
-    preamble   = list( cfg.get("preamble",     BARKER_13))
-    message    = cfg.get("message",            DEFAULT_MSG)
-    out_path   = Path( cfg.get("output",       "css_output.wav"))
-    info_path  = Path( cfg.get("info_out",     "css_info.json"))
-    result_path = Path(cfg.get("result_out",   "css_encode_result.json"))
-    rs_t       = int(  cfg.get("rs_t",         0))
+    fs             = int(  cfg.get("fs",             44100))
+    f_min          = float(cfg.get("f_min",           400))
+    f_max          = float(cfg.get("f_max",          6000))
+    symbol_dur     = float(cfg.get("symbol_dur",      0.25))
+    amplitude      = float(cfg.get("amplitude",       0.8))
+    preamble       = list( cfg.get("preamble",        BARKER_13))
+    message        = cfg.get("message",               DEFAULT_MSG)
+    out_path       = Path( cfg.get("output",          "css_output.wav"))
+    info_path      = Path( cfg.get("info_out",        "css_info.json"))
+    result_path    = Path( cfg.get("result_out",      "css_encode_result.json"))
+    rs_t           = int(  cfg.get("rs_t",            0))
+    interleave_rows = int( cfg.get("interleave_rows", 0))
 
-    rs_parity_bytes = rs_t * 2   # 0 when disabled
+    rs_parity_bytes = rs_t * 2
 
     # Auto-scale chunk_size so frame_duration <= 30 s
-    # frame = (1 + chunk_size + CRC_BYTES + rs_parity_bytes) * 8 symbols
     overhead = 1 + CRC_BYTES + rs_parity_bytes
     max_cs   = max(1, int(30.0 / (symbol_dur * 8) - overhead))
     chunk_size = int(cfg.get("chunk_size", min(8, max_cs)))
 
-    frame_symbols = (1 + chunk_size + CRC_BYTES + rs_parity_bytes) * 8
-    frame_dur     = frame_symbols * symbol_dur
+    # Base bits per frame (before interleave padding)
+    base_bits = (1 + chunk_size + CRC_BYTES + rs_parity_bytes) * 8
+
+    # Interleaved bits per frame (>= base_bits, padded to rows*cols)
+    if interleave_rows > 1:
+        il_cols      = -(-base_bits // interleave_rows)
+        frame_symbols = interleave_rows * il_cols
+    else:
+        interleave_rows = 0
+        frame_symbols   = base_bits
+
+    frame_dur = frame_symbols * symbol_dur
     print(f"symbol_dur={symbol_dur}s  chunk_size={chunk_size}  crc=4B  "
           f"rs_t={rs_t} (parity={rs_parity_bytes}B)  "
+          f"interleave_rows={interleave_rows}  "
+          f"base_bits={base_bits}  frame_symbols={frame_symbols}  "
           f"frame_duration={frame_dur:.1f}s", flush=True)
 
     rs_codec = _make_rs_codec(rs_t)
     if rs_t > 0 and rs_codec is None:
-        rs_parity_bytes = 0   # disabled due to missing lib
+        rs_parity_bytes = 0
 
     result = {
         "status": "error", "error": None,
@@ -163,33 +217,37 @@ def encode(cfg):
         raw_data   = message.encode("utf-8", "ignore")
         buf        = []
 
-        # --- Preamble (absolute: 1→up, 0→down) ---
+        # Preamble
         for b in preamble:
             buf.extend(up_chirp if b == 1 else down_chirp)
 
-        # --- Data frames ---
         num_frames = 0
         for i in range(0, len(raw_data), chunk_size):
             chunk   = raw_data[i : i + chunk_size]
             seq_num = (i // chunk_size) % 256
             crc     = frame_crc(seq_num, chunk)
 
-            # Inner payload = [seq] + [data] + [crc]
+            # Build RS-encoded frame bytes
             inner = bytes([seq_num]) + chunk + crc
-
-            # Outer payload = inner + RS parity (if enabled)
             frame = rs_encode_frame(inner, rs_codec)
 
-            # Absolute encoding: bit 1 → up-chirp, bit 0 → down-chirp
+            # Convert to bits
+            bits = []
             for byte in frame:
-                for bit in get_bits(byte):
-                    buf.extend(up_chirp if bit == 1 else down_chirp)
+                bits.extend(get_bits(byte))
+
+            # Apply block interleaver (after RS, before modulation)
+            if interleave_rows > 1:
+                bits = interleave_bits(bits, interleave_rows)
+
+            # Modulate: bit 1 → up-chirp, bit 0 → down-chirp
+            for bit in bits:
+                buf.extend(up_chirp if bit == 1 else down_chirp)
 
             num_frames += 1
             print(f"encoded frame {num_frames} seq={seq_num} "
                   f"({i + len(chunk)}/{len(raw_data)} bytes)", flush=True)
 
-        # Tail silence so decoder ring buffer flushes the last frame
         sps  = int(fs * symbol_dur)
         tail = np.zeros(sps * 10, dtype=np.float32)
         audio = np.clip(
@@ -205,13 +263,16 @@ def encode(cfg):
             wf.writeframes(pcm.tobytes())
 
         duration_s    = round(len(audio) / fs, 2)
-        symbols_total = len(preamble) + num_frames * (1 + chunk_size + CRC_BYTES + rs_parity_bytes) * 8
+        symbols_total = len(preamble) + num_frames * frame_symbols
 
         info = {
             "fs": fs, "f_min": f_min, "f_max": f_max,
             "symbol_dur": symbol_dur, "chunk_size": chunk_size,
             "crc_bytes": CRC_BYTES, "rs_t": rs_t,
             "rs_parity_bytes": rs_parity_bytes,
+            "interleave_rows": interleave_rows,
+            "base_bits": base_bits,
+            "frame_symbols": frame_symbols,
             "preamble": preamble,
             "amplitude": amplitude, "message_len": len(raw_data),
             "frames": num_frames, "duration_s": duration_s,
@@ -248,4 +309,3 @@ if __name__ == "__main__":
     cfg = json.loads(Path(config_path).read_text()) if Path(config_path).exists() else {}
     result = encode(cfg)
     sys.exit(0 if result["status"] == "ok" else 1)
-    

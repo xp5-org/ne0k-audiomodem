@@ -64,7 +64,7 @@ def main():
         "fs":         PARAMS.get("fs",          44100),
         "f_min":      PARAMS.get("f_min",        400),
         "f_max":      PARAMS.get("f_max",       6000),
-        "symbol_dur": PARAMS.get("symbol_dur",   0.5),
+        "symbol_dur": PARAMS.get("symbol_dur",   0.25),
         "chunk_size": PARAMS.get("chunk_size",    12),
         "amplitude":  PARAMS.get("amplitude",    0.8),
         "preamble":   PARAMS.get("preamble", [1,1,1,1,0,0,1,1]),
