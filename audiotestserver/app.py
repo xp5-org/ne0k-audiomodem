@@ -73,6 +73,7 @@ _coord_lock   = threading.Lock()
 
 # Active subprocesses (both roles)
 _active_procs:    dict[str, subprocess.Popen] = {}   # role_key -> proc
+_proc_gen:        dict[str, int] = {}               # role_key -> generation counter
 _proc_lock        = threading.Lock()
 _server_proc_lock    = threading.Lock()   # extra lock for server's own proc reference
 
@@ -147,6 +148,24 @@ def _exec_test(test_path: str, params: dict):
     """
     run_id   = params.get("run_id", "unknown")
     role_key = params.get("role") or test_path    # unique key per concurrent role
+
+    # Each invocation gets a unique generation id. The finally block only
+    # cleans _active_procs when it is still the current generation, so a
+    # late-exiting cancelled thread cannot evict its successor's proc.
+    with _proc_lock:
+        _proc_gen[role_key] = _proc_gen.get(role_key, 0) + 1
+        my_gen = _proc_gen[role_key]
+        stale  = _active_procs.pop(role_key, None)
+    if stale and stale.poll() is None:
+        _log(f"Evicting stale proc role={role_key!r} (gen={my_gen-1}) before re-run", "warn")
+        try:
+            stale.terminate()
+            stale.wait(timeout=3)
+        except Exception:
+            try:
+                stale.kill()
+            except Exception:
+                pass
 
     state["status"]      = "running"
     state["current_run"] = run_id
@@ -225,7 +244,10 @@ def _exec_test(test_path: str, params: dict):
         }, run_id)
     finally:
         with _proc_lock:
-            _active_procs.pop(role_key, None)
+            # Only remove our slot — don't evict a newer generation's proc
+            if _proc_gen.get(role_key) == my_gen:
+                _active_procs.pop(role_key, None)
+                _proc_gen.pop(role_key, None)
         if not _active_procs:
             state["status"]      = "idle"
             state["current_run"] = None
@@ -698,7 +720,7 @@ def _parse_test_params(script_path: str) -> list[dict]:
             try:
                 default = ast.literal_eval(raw_expr)
             except Exception:
-                default = raw_expr   # keep as raw string if unparseable
+                default = None   # variable reference, not a literal — don't prefill
 
         if isinstance(default, bool):
             py_type = "boolean"

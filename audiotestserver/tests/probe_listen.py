@@ -1,5 +1,5 @@
 """
-tests/specprobe_listen.py  -  role: listen  (pair with specprobe_play.py)
+tests/probe_listen.py  -  role: listen  (pair with probe_play.py)
 
 Records the probe sequence and analyses each frequency window.
 
@@ -10,26 +10,31 @@ Key improvements over v1:
 - ASCII SNR chart printed to log for quick visual inspection
 - Clear per-frequency verdict with reason
 
+WAV capture
+-----------
+The full recording is saved to  <RUN_DIR>/<CLIENT_ID>_input.wav  immediately
+after recording completes, before analysis.  Use this WAV later to:
+  · regenerate the spectrograph with different parameters
+  · compare captures across runs
+  · feed into offline analysis scripts
+
 Outputs:
-  specprobe_report.json  - full per-frequency measurements
-  result_<client>.json   - summary + recommended QAM subcarrier set
+  <CLIENT_ID>_input.wav      - raw mic recording (NEW)
+  specprobe_report.json      - full per-frequency measurements
+  result_<client>.json       - summary + recommended QAM subcarrier set
 """
 
 import json
-import os
-import sys
-import time
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
-CLIENT_ID   = os.environ.get("AUDIOTOOL_CLIENT_ID", "unknown")
-INPUT_DEV   = os.environ.get("AUDIOTOOL_INPUT_DEVICE", "")
-RUN_DIR     = Path(os.environ.get("AUDIOTOOL_RUN_DIR", "."))
-SERVER_URL  = os.environ.get("AUDIOTOOL_SERVER_URL", "http://127.0.0.1:8000")
-PARAMS      = json.loads(os.environ.get("AUDIOTOOL_PARAMS", "{}"))
-RUN_ID      = os.environ.get("AUDIOTOOL_RUN_ID", "unknown")
+from testlib import (
+    CLIENT_ID, INPUT_DEV, RUN_DIR, PARAMS, RUN_ID, SERVER_URL,
+    log, to_int_dev, coord_signal, coord_check, coord_wait_any, save_wav,
+)
 
 TAIL_SECS   = float(PARAMS.get("tail_secs",    2.0))
 SNR_64QAM   = float(PARAMS.get("snr_64qam",   30.0))
@@ -37,58 +42,7 @@ SNR_16QAM   = float(PARAMS.get("snr_16qam",   20.0))
 SNR_4QAM    = float(PARAMS.get("snr_4qam",    12.0))
 MAX_THD_DB  = float(PARAMS.get("max_thd_db",  -15.0))
 MAX_ECHO_DB = float(PARAMS.get("max_echo_db", -10.0))
-# How many samples tolerance when searching for alignment
 ALIGN_SEARCH_SECS = float(PARAMS.get("align_search_secs", 2.0))
-
-
-def log(msg):
-    print(msg, flush=True)
-
-
-def to_int_dev(val):
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return None
-
-
-def coord_signal(signal):
-    import urllib.request
-    url  = f"{SERVER_URL}/api/coord/{RUN_ID}/{signal}"
-    body = json.dumps({"client_id": CLIENT_ID}).encode()
-    req  = urllib.request.Request(url, data=body,
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        log(f"  [coord] {signal} failed: {e}")
-
-
-def coord_wait_any(signal, timeout=30, poll=0.3):
-    import urllib.request
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            url = f"{SERVER_URL}/api/coord/{RUN_ID}/{signal}"
-            with urllib.request.urlopen(url, timeout=5) as r:
-                clients = json.loads(r.read()).get("clients", [])
-            if clients:
-                return clients
-        except Exception:
-            pass
-        time.sleep(poll)
-    return []
-
-
-def coord_check(signal):
-    import urllib.request
-    try:
-        url = f"{SERVER_URL}/api/coord/{RUN_ID}/{signal}"
-        with urllib.request.urlopen(url, timeout=5) as r:
-            return json.loads(r.read()).get("clients", [])
-    except Exception:
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -96,17 +50,11 @@ def coord_check(signal):
 # ---------------------------------------------------------------------------
 
 def fft_power_at(window, target_freq, fs):
-    """
-    Power at target_freq using windowed FFT.
-    Single call - much faster than Goertzel Python loop.
-    Returns linear power normalised to signal amplitude.
-    """
     n   = len(window)
     win = np.hanning(n)
     X   = np.fft.rfft(window * win)
     f   = np.fft.rfftfreq(n, 1.0 / fs)
     idx = int(np.argmin(np.abs(f - target_freq)))
-    # Normalise: 2 * |X|^2 / (win_energy * n)
     win_energy = float(np.sum(win ** 2))
     return float(2 * np.abs(X[idx]) ** 2 / (win_energy * n))
 
@@ -137,21 +85,11 @@ def db(power, ref=1.0):
 
 
 def find_alignment_offset(recording, manifest, fs):
-    """
-    Find where the probe sequence actually starts in the recording.
-
-    The listener arms slightly before the player plays, so the recording
-    has some pre-play silence. We find the first tone by looking for the
-    first window where energy exceeds the noise floor significantly.
-
-    Returns sample offset to subtract from all manifest sample positions.
-    """
     first_tone_start = manifest["sequence"][0]["tone_start"]
     first_freq       = manifest["sequence"][0]["freq"]
     tone_samples     = int(manifest["tone_dur"] * fs)
     search_samples   = int(ALIGN_SEARCH_SECS * fs)
 
-    # Scan forward in search_samples steps looking for the first tone
     best_offset = 0
     best_power  = -1.0
 
@@ -166,9 +104,6 @@ def find_alignment_offset(recording, manifest, fs):
             best_power  = p
             best_offset = offset
 
-    # The manifest says the first tone starts at first_tone_start samples.
-    # We found it at best_offset in the recording.
-    # So manifest_sample = recording_sample - (best_offset - first_tone_start)
     correction = best_offset - first_tone_start
     log(f"  timing alignment: first tone found at sample {best_offset} "
         f"(manifest says {first_tone_start}), correction={correction:+d} smp "
@@ -177,17 +112,12 @@ def find_alignment_offset(recording, manifest, fs):
 
 
 def analyse_recording(recording, manifest, fs):
-    """
-    Analyse each frequency window using a single FFT per window.
-    Returns list of per-frequency measurement dicts.
-    """
     correction = find_alignment_offset(recording, manifest, fs)
     results    = []
 
     for entry in manifest["sequence"]:
         freq = entry["freq"]
 
-        # Apply timing correction
         ns = max(0, entry["noise_start"] + correction)
         ts = max(0, entry["tone_start"]  + correction)
         te = min(len(recording), entry["tone_end"]   + correction)
@@ -203,7 +133,6 @@ def analyse_recording(recording, manifest, fs):
                              "snr_db": -120, "thd_db": 0, "echo_db": 0})
             continue
 
-        # All tone-window measurements in one FFT
         measure_freqs = [freq]
         if freq * 2 < fs / 2:
             measure_freqs.append(freq * 2)
@@ -220,12 +149,10 @@ def analyse_recording(recording, manifest, fs):
         thd_power = h2_power + h3_power
         thd_db    = db(thd_power, ref=sig_power)
 
-        # Noise floor from pre-tone silence
         noise_power = rms_power(noise_win) if len(noise_win) >= 64 else 1e-12
         noise_db    = db(noise_power)
         snr_db      = sig_db - noise_db
 
-        # Echo: residual at target freq in post-tone silence
         if len(decay_win) >= 64:
             decay_power = fft_power_at(decay_win, freq, fs)
             echo_db     = db(decay_power, ref=sig_power)
@@ -246,7 +173,6 @@ def analyse_recording(recording, manifest, fs):
 
 
 def ascii_snr_chart(freq_results, width=50):
-    """Print a simple ASCII bar chart of SNR across frequencies."""
     ok = [r for r in freq_results if r.get("status") == "ok"]
     if not ok:
         return
@@ -261,15 +187,14 @@ def ascii_snr_chart(freq_results, width=50):
         freq  = r["freq"]
         snr   = r["snr_db"]
         bar_w = max(0, int(snr / scale * width))
-        # Pick character based on QAM tier
         if snr >= SNR_64QAM:
-            ch = "#"   # 64-QAM
+            ch = "#"
         elif snr >= SNR_16QAM:
-            ch = "="   # 16-QAM
+            ch = "="
         elif snr >= SNR_4QAM:
-            ch = "-"   # 4-QAM
+            ch = "-"
         else:
-            ch = "."   # unusable
+            ch = "."
         bar = ch * bar_w
         log(f"  {freq:>8.0f}  {bar:<{width}}  {snr:.1f}")
 
@@ -324,9 +249,7 @@ def main():
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     log(f"[{CLIENT_ID}] specprobe_listen | input_device={in_dev}")
 
-    # Wait for manifest to appear (player writes it before signalling ready).
-    # Poll directly rather than waiting for the coord signal first — this avoids
-    # a deadlock when both roles run on the same client.
+    # Wait for manifest to appear
     manifest_path = RUN_DIR / "specprobe_manifest.json"
     log("  waiting for specprobe_manifest.json...")
     deadline = time.time() + 40
@@ -347,7 +270,6 @@ def main():
     n_freqs     = len(manifest["sequence"])
     total_secs  = n_freqs * (manifest["silence_dur"] + manifest["tone_dur"]
                              + manifest["silence_dur"])
-    # Extra headroom: alignment search + tail
     record_secs = total_secs + ALIGN_SEARCH_SECS + TAIL_SECS + 2.0
 
     log(f"  {n_freqs} freqs, {total_secs:.1f}s probe, recording up to {record_secs:.1f}s")
@@ -388,6 +310,10 @@ def main():
     if peak < 0.001:
         log("  WARNING: recording is very quiet - check mic input level")
 
+    # ── WAV capture ──────────────────────────────────────────────────────────
+    wav_path = RUN_DIR / f"{CLIENT_ID}_input.wav"
+    save_wav(recording, fs, wav_path)
+
     # Analyse
     log("\n  === Frequency Analysis ===")
     log(f"  {'Freq':>8}  {'Sig':>6}  {'Noise':>6}  {'SNR':>6}  "
@@ -416,18 +342,15 @@ def main():
         log(f"  {freq:>8.0f}  {r['sig_db']:>+6.1f}  {r['noise_db']:>+6.1f}  "
             f"{snr:>6.1f}  {thd:>+6.1f}  {echo:>+6.1f}  {verdict}")
 
-    # ASCII chart
     ascii_snr_chart(freq_results)
 
-    # Recommendations
     subcarriers, skipped = recommend_subcarriers(freq_results)
     total_bps = sum(s["bits_per_symbol"] for s in subcarriers)
 
     log(f"\n  === Summary ===")
     log(f"  Usable subcarriers : {len(subcarriers)} / {n_freqs}")
     log(f"  Skipped            : {len(skipped)}")
-    log(f"  Bits per symbol    : {total_bps} "
-        f"(theoretical max throughput)")
+    log(f"  Bits per symbol    : {total_bps} (theoretical max throughput)")
 
     qam_counts = {}
     for s in subcarriers:
@@ -440,12 +363,12 @@ def main():
         for s in skipped:
             log(f"    {s['freq']:>7.0f}Hz  {s['reason']}")
 
-    # Save
     report = {
         "run_id": RUN_ID, "client_id": CLIENT_ID, "fs": fs,
         "freq_results": freq_results,
         "subcarriers": subcarriers, "skipped": skipped,
         "total_bits_per_symbol": total_bps,
+        "wav_capture": str(wav_path),
         "thresholds": {
             "snr_64qam": SNR_64QAM, "snr_16qam": SNR_16QAM,
             "snr_4qam": SNR_4QAM, "max_thd_db": MAX_THD_DB,
@@ -462,6 +385,7 @@ def main():
         "subcarriers_skipped": len(skipped),
         "total_bits_per_symbol": total_bps,
         "subcarriers": subcarriers,
+        "wav_capture": str(wav_path),
     }
     (RUN_DIR / f"result_{CLIENT_ID}.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result), flush=True)

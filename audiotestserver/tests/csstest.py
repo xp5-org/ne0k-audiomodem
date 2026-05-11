@@ -29,7 +29,8 @@ try:
         generate_chirp, ChirpCorrelator, PeakAGC,
         SoftPreambleDetector, get_bytes_from_bits, check_crc,
         _make_rs_codec, rs_decode_frame, deinterleave_bits,
-        BARKER_13, CRC_BYTES,
+        viterbi_k7, diff_decode_bits, if_slope_confidence,
+        BARKER_13, CRC_BYTES, _CONV_TAIL,
     )
 except ImportError as e:
     sys.exit(f"ERROR: cannot import css_decoder.py -- {e}")
@@ -128,6 +129,10 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
     base_bits     = int(conf_j.get("base_bits",
                                    (1 + chunk_size + crc_bytes_n + rs_parity) * 8))
     frame_symbols = int(conf_j.get("frame_symbols", base_bits))
+    preamble_per_frame = bool(conf_j.get("preamble_per_frame", False))
+    diff_enc  = bool(conf_j.get("diff_encode", False))
+    conv_code = conf_j.get("conv_code", None)
+    pll_weight = float(cfg.get("pll_weight", 0.30))
 
     up_ref   = generate_chirp(f_min, f_max, dur, fs)
     down_ref = generate_chirp(f_max, f_min, dur, fs)
@@ -153,6 +158,7 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
     ring           = np.zeros(buf_size, dtype=np.float32)
     bit_stream     = []
     sync_found     = False
+    timing_settled = False
     frames_decoded = 0
     frames_errored = 0
     consec_errors  = 0
@@ -178,7 +184,7 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
         ring[-n_read:] = agc.apply(chunk)
         sym_count += 1
 
-        bit, confidence, found_peak, snr_db = correlator.symbol_decision(ring, peak_est)
+        bit, confidence, found_peak, snr_db, winner_pk = correlator.symbol_decision(ring, peak_est)
         peak_est   = found_peak
         timing_err = found_peak - expected_peak
 
@@ -204,6 +210,11 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
         event = ""
 
         if not sync_found:
+            tim_flush_thr = sps // 8
+            if abs(timing_err) <= tim_flush_thr:
+                timing_settled = True
+            if not timing_settled:
+                syndet.reset()
             acquired, score = syndet.push(confidence)
             if acquired:
                 event = f"*** SYNC_ACQUIRED score={score:.3f} peak_est={peak_est}"
@@ -224,17 +235,49 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
                 print_header()
 
         else:
-            bit_stream.append(bit)
+            # PLL blend (same logic as css_decoder.py)
+            final_conf = confidence
+            if pll_weight > 0:
+                seg_start = max(0, peak_est - sps + 1)
+                seg_end   = min(len(ring), peak_est + 1)
+                pll_conf, pll_r2 = if_slope_confidence(
+                    ring[seg_start:seg_end], f_min, f_max, sps, fs)
+                if pll_r2 > 0.10:
+                    w = pll_weight * pll_r2
+                    final_conf = (1 - w) * confidence + w * pll_conf
+            final_bit = 1 if final_conf > 0 else 0
+            bit_stream.append((final_bit, final_conf))
             event = ""
 
             if len(bit_stream) >= frame_symbols:
-                frame_bits = bit_stream[:frame_symbols]
-                bit_stream = bit_stream[frame_symbols:]
+                frame_items = bit_stream[:frame_symbols]
+                bit_stream  = bit_stream[frame_symbols:]
 
+                frame_bits  = [b for b, _ in frame_items]
+                frame_confs = [c for _, c in frame_items]
+
+                # Step 1: de-interleave coded bits+confs together
                 if interleave_rows > 1:
-                    frame_bits = deinterleave_bits(frame_bits, interleave_rows, base_bits)
+                    n_coded = len(frame_bits)
+                    cols    = n_coded // interleave_rows
+                    idxs    = (np.arange(n_coded)
+                                 .reshape(cols, interleave_rows)
+                                 .T.flatten().tolist())
+                    frame_bits  = [frame_bits[i]  for i in idxs]
+                    frame_confs = [frame_confs[i] for i in idxs]
 
-                raw_bytes  = get_bytes_from_bits(frame_bits)
+                # Step 2: Viterbi
+                if conv_code == "k7r12":
+                    soft_pairs = [(frame_confs[i], frame_confs[i + 1])
+                                  for i in range(0, len(frame_confs) - 1, 2)]
+                    frame_bits  = viterbi_k7(soft_pairs)
+                    frame_confs = [1.0] * len(frame_bits)
+
+                # Step 3: differential decode
+                if diff_enc:
+                    frame_bits = diff_decode_bits(frame_bits, ref_bit=sync_word[-1])
+
+                raw_bytes  = get_bytes_from_bits(frame_bits[:base_bits])
 
                 rs_errors = 0
                 if rs_codec is not None:
@@ -248,6 +291,7 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
                         if consec_errors >= 3:
                             print(f"\n  >> RESYNC\n")
                             sync_found = False; bit_stream = []; consec_errors = 0
+                            timing_settled = False
                             syndet.reset(); print_header()
                         n_read = next_n_read
                         continue
@@ -258,6 +302,12 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
                         msg   = data.decode("utf-8", errors="strict")
                         event = f"FRAME seq={seq_num} rs={rs_errors} text={msg!r}"
                         frames_decoded += 1; consec_errors = 0
+                        if preamble_per_frame:
+                            sync_found = False; bit_stream = []; consec_errors = 0
+                            timing_settled = False
+                            syndet.reset()
+                            print(f"\n  >> RE-ARM for next preamble\n")
+                            print_header()
                     except UnicodeDecodeError:
                         event = f"FRAME_UTF8_ERR seq={seq_num}"
                         frames_errored += 1; consec_errors += 1
@@ -279,6 +329,7 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
                     if consec_errors >= 3:
                         print(f"\n  >> RESYNC after {consec_errors} failures\n")
                         sync_found = False; bit_stream = []; consec_errors = 0
+                        timing_settled = False
                         syndet.reset(); print_header()
 
             sym_row(sym_count, bit, confidence, snr_db, timing_err,

@@ -239,7 +239,8 @@ class Demodulator:
             self._write_stats()
         return self._reassemble()
 
-    def listen_live(self, device=None, timeout: float = 30.0, mic_gain_db: float = 0.0) -> str:
+    def listen_live(self, device=None, timeout: float = 30.0, mic_gain_db: float = 0.0,
+                wav_out: "str | None" = None) -> str:
         """
         Record from microphone and decode in real time.
 
@@ -301,6 +302,9 @@ class Demodulator:
         # still rejected.  Floor at 1e-4 to avoid false triggers on pure noise.
         _live_power_gate = max(self.POWER_GATE / _mic_gain_linear, 1e-4)
 
+        # Raw capture buffer for optional WAV dump (list.append is GIL-safe).
+        _wav_capture: list = [] if wav_out else None
+
         def _audio_callback(indata, frames, time_info, status):
             raw = indata[:, 0].copy()                       # float32, [-1, 1]
             if _mic_gain_linear != 1.0:
@@ -309,6 +313,8 @@ class Demodulator:
             with buf_lock:
                 nonlocal buf
                 buf = np.concatenate([buf, raw])
+            if _wav_capture is not None:
+                _wav_capture.append(indata[:, 0].copy())  # pre-gain, pre-AGC
 
         # ------------------------------------------------------------------
         # Display thread — redraws the mic-level bar every 100 ms.
@@ -457,6 +463,22 @@ class Demodulator:
         proc.join(timeout=2.0)
         display.join(timeout=0.5)
         print(f"Decoded {len(self.received)}/{self.total_frames or '?'} frames")
+        # Save raw mic input to WAV if requested.
+        if wav_out and _wav_capture:
+            import wave as _wave_mod
+            try:
+                _audio = np.concatenate(_wav_capture).astype(np.float32)
+                _pcm   = (np.clip(_audio, -1.0, 1.0) * 32767).astype(np.int16)
+                with _wave_mod.open(str(wav_out), "wb") as _wf:
+                    _wf.setnchannels(1)
+                    _wf.setsampwidth(2)
+                    _wf.setframerate(self.sample_rate)
+                    _wf.writeframes(_pcm.tobytes())
+                print(f"WAV capture -> {wav_out}  "
+                      f"({len(_audio)/self.sample_rate:.1f}s @ {self.sample_rate}Hz)", flush=True)
+            except Exception as _e:
+                print(f"WAV capture failed: {_e}", flush=True)
+
         return self._reassemble()
 
     def demod_to_symbols(self, audio: np.ndarray, timing_offset: int = 0) -> np.ndarray:
@@ -934,6 +956,8 @@ if __name__ == "__main__":
                              "Try 20–40 if signal is very quiet (e.g. -45 dB on meter).")
     parser.add_argument("--stats-out", default=None,
                         help="Write per-frame stats JSON to this path.")
+    parser.add_argument("--wav-out", default=None,
+                        help="Save raw mic input to this WAV file (live mode only).")
     args = parser.parse_args()
 
     demod = Demodulator(config_path=args.config)
@@ -945,7 +969,8 @@ if __name__ == "__main__":
     if args.mode == "wav":
         text = demod.process_wav(args.file)
     else:
-        text = demod.listen_live(device=args.device, timeout=args.timeout, mic_gain_db=args.mic_gain_db)
+        text = demod.listen_live(device=args.device, timeout=args.timeout,
+                                    mic_gain_db=args.mic_gain_db, wav_out=args.wav_out)
     if args.stats_out and args.mode != "wav":
         demod._write_stats()
 

@@ -1,5 +1,5 @@
 """
-tests/qam_play.py  -  role: play  (pair with qam_decode.py once available)
+tests/qam_play.py  -  role: play  (pair with qam_decode.py)
 
 Framework wrapper for qam_writer.Modulator.
 Encodes the message to a WAV, writes qam_config.json to the run dir,
@@ -15,68 +15,23 @@ Params (from server UI JSON field):
     "carrier_freq": 12000,
     "symbol_rate":  6000
 }
-
-carrier_freq and symbol_rate should be chosen based on specprobe results.
-Default 12000/6000 works well for typical laptop speakers/mics in a quiet room.
 """
 
 import json
-import os
+import subprocess
 import sys
-import time
 from pathlib import Path
 
-CLIENT_ID  = os.environ.get("AUDIOTOOL_CLIENT_ID", "unknown")
-OUTPUT_DEV = os.environ.get("AUDIOTOOL_OUTPUT_DEVICE", "")
-RUN_DIR    = Path(os.environ.get("AUDIOTOOL_RUN_DIR", "."))
-SERVER_URL = os.environ.get("AUDIOTOOL_SERVER_URL", "http://127.0.0.1:8000")
-PARAMS     = json.loads(os.environ.get("AUDIOTOOL_PARAMS", "{}"))
-RUN_ID     = os.environ.get("AUDIOTOOL_RUN_ID", "unknown")
-TESTS_DIR  = Path(__file__).parent
+from testlib import (
+    CLIENT_ID, OUTPUT_DEV, RUN_DIR, PARAMS, RUN_ID, SERVER_URL,
+    log, to_int_dev, coord_signal, coord_wait_any,
+)
 
-
-def log(msg):
-    print(msg, flush=True)
-
-
-def to_int_dev(val):
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return None
-
-
-def coord_signal(signal):
-    import urllib.request
-    url  = f"{SERVER_URL}/api/coord/{RUN_ID}/{signal}"
-    body = json.dumps({"client_id": CLIENT_ID}).encode()
-    req  = urllib.request.Request(url, data=body,
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        log(f"  [coord] {signal} failed: {e}")
-
-
-def coord_wait_any(signal, timeout=30, poll=0.3):
-    import urllib.request
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            url = f"{SERVER_URL}/api/coord/{RUN_ID}/{signal}"
-            with urllib.request.urlopen(url, timeout=5) as r:
-                clients = json.loads(r.read()).get("clients", [])
-            if clients:
-                return clients
-        except Exception:
-            pass
-        time.sleep(poll)
-    return []
+TESTS_DIR = Path(__file__).parent
 
 
 def main():
-    import subprocess
+    import subprocess as _subprocess
 
     out_dev = to_int_dev(OUTPUT_DEV)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,7 +40,6 @@ def main():
     wav_path    = RUN_DIR / "qam_output.wav"
     config_path = RUN_DIR / "qam_config.json"
 
-    # Build encode config from params
     encode_cfg = {
         "input_str":    PARAMS.get("input_str"),
         "output":       str(wav_path),
@@ -97,13 +51,11 @@ def main():
         "carrier_freq": PARAMS.get("carrier_freq", 1400),
         "symbol_rate":  PARAMS.get("symbol_rate",  40),
     }
-    # Remove None so writer uses its own default message
     encode_cfg = {k: v for k, v in encode_cfg.items() if v is not None}
 
     cfg_file = RUN_DIR / "qam_encode_config.json"
     cfg_file.write_text(json.dumps(encode_cfg, indent=2))
 
-    # Run qam_writer.py as a subprocess (same pattern as css_play -> css_encoder)
     writer_script = TESTS_DIR / "qam_writer.py"
     log("  encoding QAM audio...")
     proc = subprocess.Popen(
@@ -133,7 +85,6 @@ def main():
     log(f"  encoded: {enc_result.get('total_frames','?')} frames, "
         f"{enc_result.get('duration_s','?')}s")
 
-    # Signal ready (config + wav are now on disk)
     coord_signal("qam_ready")
     log("  signalled qam_ready - waiting for decoder(s) to arm...")
     armed = coord_wait_any("qam_armed", timeout=30)
@@ -142,7 +93,6 @@ def main():
     else:
         log("  no decoders armed in 30s - playing anyway")
 
-    # Play
     result = {
         "client_id": CLIENT_ID, "role": "play", "run_id": RUN_ID,
         **enc_result,

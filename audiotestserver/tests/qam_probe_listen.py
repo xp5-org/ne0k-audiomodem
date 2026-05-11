@@ -5,12 +5,20 @@ Listens for each probe step, decodes it using qam_reader.py live mode,
 and records per-step performance metrics. At the end ranks settings by:
   1. Most frames decoded (primary)
   2. Lowest RS error count (secondary)
-  3. Highest ECC headroom (tertiary - how far from ECC failure)
+  3. Highest ECC headroom (tertiary)
+
+WAV capture
+-----------
+Each step's raw mic input is saved to:
+  <RUN_DIR>/<CLIENT_ID>_input_step<NNN>.wav
+These can be replayed with qam_reader.py for offline re-decoding or later
+constellation analysis without needing to re-run the full probe sweep.
 
 Outputs:
-  probe_results.json          - all per-step metrics
-  probe_best.json             - top-ranked settings ready to paste into qam params
-  result_<client>.json        - framework result
+  <CLIENT_ID>_input_step<NNN>.wav  - per-step raw mic recordings (NEW)
+  probe_results.json               - all per-step metrics
+  probe_best.json                  - top-ranked settings
+  result_<client>.json             - framework result
 
 Params:
 {
@@ -22,70 +30,25 @@ Params:
 """
 
 import json
-import os
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-CLIENT_ID  = os.environ.get("AUDIOTOOL_CLIENT_ID", "unknown")
-INPUT_DEV  = os.environ.get("AUDIOTOOL_INPUT_DEVICE", "")
-RUN_DIR    = Path(os.environ.get("AUDIOTOOL_RUN_DIR", "."))
-SERVER_URL = os.environ.get("AUDIOTOOL_SERVER_URL", "http://127.0.0.1:8000")
-PARAMS     = json.loads(os.environ.get("AUDIOTOOL_PARAMS", "{}"))
-RUN_ID     = os.environ.get("AUDIOTOOL_RUN_ID", "unknown")
-TESTS_DIR  = Path(__file__).parent
+from analysis import make_qam_constellation_png, make_qam_probe_heatmap_png
+from testlib import (
+    CLIENT_ID, INPUT_DEV, RUN_DIR, PARAMS, RUN_ID, SERVER_URL,
+    log, to_int_dev, coord_signal, coord_check, coord_wait, coord_wait_any,
+)
 
-TIMEOUT_PER_STEP   = float(PARAMS.get("timeout_per_step",   30))
-STEP_DEADLINE_PAD  = float(PARAMS.get("step_deadline_pad",  30))  # extra secs beyond duration_s
-MIC_GAIN_DB        = float(PARAMS.get("mic_gain_db",         0))
-ZC_THRESH          = float(PARAMS.get("zc_threshold",     0.45))
-TAIL_SECS          = float(PARAMS.get("tail_secs",           3))
+TESTS_DIR = Path(__file__).parent
 
-
-def log(msg):
-    print(msg, flush=True)
-
-
-def to_int_dev(val):
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return None
-
-
-def coord_signal(signal):
-    import urllib.request
-    url  = f"{SERVER_URL}/api/coord/{RUN_ID}/{signal}"
-    body = json.dumps({"client_id": CLIENT_ID}).encode()
-    req  = urllib.request.Request(url, data=body,
-                                  headers={"Content-Type": "application/json"},
-                                  method="POST")
-    try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as e:
-        log(f"  [coord] {signal} failed: {e}")
-
-
-def coord_check(signal):
-    import urllib.request
-    try:
-        url = f"{SERVER_URL}/api/coord/{RUN_ID}/{signal}"
-        with urllib.request.urlopen(url, timeout=5) as r:
-            return json.loads(r.read()).get("clients", [])
-    except Exception:
-        return []
-
-
-def coord_wait(signal, timeout=60, poll=0.3):
-    """Block until signal appears in coord or timeout expires. Returns True if found."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if coord_check(signal):
-            return True
-        time.sleep(poll)
-    return False
+TIMEOUT_PER_STEP  = float(PARAMS.get("timeout_per_step",   30))
+STEP_DEADLINE_PAD = float(PARAMS.get("step_deadline_pad",  30))
+MIC_GAIN_DB       = float(PARAMS.get("mic_gain_db",         0))
+ZC_THRESH         = float(PARAMS.get("zc_threshold",     0.45))
+TAIL_SECS         = float(PARAMS.get("tail_secs",           3))
 
 
 def coord_wait_manifest(timeout=60):
@@ -99,7 +62,6 @@ def coord_wait_manifest(timeout=60):
 
 
 def _kill_proc(proc: subprocess.Popen, label: str = ""):
-    """Terminate a subprocess, escalating to SIGKILL if needed. Never blocks."""
     if proc.poll() is not None:
         return
     try:
@@ -123,11 +85,8 @@ def decode_step(step: dict, in_dev) -> dict:
     """
     Decode one probe step using qam_reader.py live mode.
 
-    Deadline is based on the step's known audio duration (from the manifest),
-    not a fixed timeout — so long steps at low baud rates get the time they need.
-
-    After decoding finishes (for any reason), we wait for probe_step_{i}_played
-    before returning, so the listener stays in sync with the player.
+    The raw mic input for this step is saved to
+    <RUN_DIR>/<CLIENT_ID>_input_step<NNN>.wav via --wav-out.
     """
     i           = step["step"]
     cf          = step["carrier_freq"]
@@ -135,18 +94,15 @@ def decode_step(step: dict, in_dev) -> dict:
     n_frames    = step.get("frames", "?")
     config_path = RUN_DIR / Path(step["config"]).name
     stats_path  = RUN_DIR / f"probe_{i:03d}_stats.json"
+    wav_path    = RUN_DIR / f"{CLIENT_ID}_input_step{i:03d}.wav"
     label       = f"reader step {i+1} cf={cf} sr={sr}"
 
-    # ── Deadline: audio duration + generous pad ────────────────────────────────
-    # The old code used TIMEOUT_PER_STEP + 15 (fixed 45s), which is far too short
-    # for slow symbol rates where a step can be 90+ seconds of audio.
     step_duration_s = step.get("duration_s", TIMEOUT_PER_STEP)
     step_deadline   = time.time() + step_duration_s + STEP_DEADLINE_PAD
+    reader_timeout  = step_duration_s + STEP_DEADLINE_PAD
+
     log(f"  step {i+1}: deadline = audio {step_duration_s:.1f}s + pad {STEP_DEADLINE_PAD:.0f}s "
         f"= {step_duration_s + STEP_DEADLINE_PAD:.0f}s total")
-
-    # Pass the step duration as the reader timeout so it doesn't exit early
-    reader_timeout = step_duration_s + STEP_DEADLINE_PAD
 
     args = [
         sys.executable, str(TESTS_DIR / "qam_reader.py"),
@@ -155,6 +111,7 @@ def decode_step(step: dict, in_dev) -> dict:
         "--timeout",   str(reader_timeout),
         "--stats-out", str(stats_path),
         "--threshold", str(ZC_THRESH),
+        "--wav-out",   str(wav_path),       # per-step raw mic capture
     ]
     if in_dev is not None:
         args += ["--device", str(in_dev)]
@@ -184,14 +141,12 @@ def decode_step(step: dict, in_dev) -> dict:
     reader_thread = threading.Thread(target=_read, daemon=True)
     reader_thread.start()
 
-    # Wait for reader to open mic then signal player
     if not reader_ready.wait(timeout=5):
         log(f"  step {i+1}: reader slow to start - signalling anyway")
     coord_signal(f"probe_step_{i}_listen_ready")
     log(f"  step {i+1}: cf={cf}Hz sr={sr}baud - mic open, awaiting transmission "
         f"(~{step_duration_s:.0f}s audio)")
 
-    # ── Wait for played + tail, or deadline ───────────────────────────────────
     played_time = None
     while time.time() < step_deadline:
         if proc.poll() is not None:
@@ -208,30 +163,28 @@ def decode_step(step: dict, in_dev) -> dict:
         log(f"  step {i+1}: hard deadline reached "
             f"(played_received={played_time is not None}) — forcing stop")
 
-    # ── Always kill the reader before advancing ────────────────────────────────
     _kill_proc(proc, label)
     reader_thread.join(timeout=3)
     proc.wait()
 
-    # ── Sync barrier: wait for played signal before moving to next step ────────
-    # This keeps the listener in lockstep with the player even if we exited the
-    # decode loop early (e.g. reader crashed, hard deadline, all frames received).
-    # Without this the listener races ahead, signals step N+1 listen_ready before
-    # the player has finished step N, and the two fall permanently out of sync.
+    # Sync barrier: wait for played signal before moving to next step
     if played_time is None:
         log(f"  step {i+1}: waiting for played signal before advancing...")
-        # Use remaining step budget + a small extra window
         remaining = max(10.0, step_deadline - time.time() + STEP_DEADLINE_PAD)
         if coord_wait(f"probe_step_{i}_played", timeout=remaining):
             log(f"  step {i+1}: played signal received (post-decode)")
         else:
-            log(f"  step {i+1}: WARNING: played signal never received — "
-                f"player may have failed or timed out on this step")
+            log(f"  step {i+1}: WARNING: played signal never received")
 
-    # ── Summarise ─────────────────────────────────────────────────────────────
+    # Log WAV outcome
+    if wav_path.exists():
+        size_kb = wav_path.stat().st_size // 1024
+        log(f"  step {i+1}: WAV capture: {wav_path.name}  ({size_kb} KB)")
+
+    # Summarise
     n_decoded    = len(frame_stats)
-    total_errs   = sum(f["err_count"] for f in frame_stats)
-    avg_headroom = (sum(f["ecc_headroom_pct"] for f in frame_stats) / n_decoded
+    total_errs   = sum(f["err_count"]            for f in frame_stats)
+    avg_headroom = (sum(f["ecc_headroom_pct"]    for f in frame_stats) / n_decoded
                     if n_decoded else 0)
     avg_snr      = (sum(f.get("snr_evm_db",    0) for f in frame_stats) / n_decoded
                     if n_decoded else 0)
@@ -252,22 +205,40 @@ def decode_step(step: dict, in_dev) -> dict:
         status = "ok"
 
     result = {
-        "step":             i,
-        "carrier_freq":     cf,
-        "symbol_rate":      sr,
-        "symbol_rate_req":  step.get("symbol_rate_requested", sr),
-        "status":           status,
-        "frames_decoded":   n_decoded,
-        "frames_expected":  n_frames,
-        "total_rs_errors":  total_errs,
+        "step":                 i,
+        "carrier_freq":         cf,
+        "symbol_rate":          sr,
+        "symbol_rate_req":      step.get("symbol_rate_requested", sr),
+        "status":               status,
+        "frames_decoded":       n_decoded,
+        "frames_expected":      n_frames,
+        "total_rs_errors":      total_errs,
         "avg_ecc_headroom_pct": round(avg_headroom, 1),
         "avg_snr_evm_db":       round(avg_snr, 1),
         "avg_agc_gain_db":      round(avg_agc, 1),
         "avg_input_rms_db":     round(avg_input, 1),
         "avg_zc_quality":       round(avg_zc, 3),
-        "net_bps":          net_bps,
-        "coded_bps":        coded_bps,
+        "net_bps":              net_bps,
+        "coded_bps":            coded_bps,
+        "wav_capture":          str(wav_path) if wav_path.exists() else None,
     }
+
+    # Per-step constellation PNG (built after result dict so we can update it)
+    png_path = RUN_DIR / f"probe_{i:03d}_constellation.png"
+    if stats_path.exists():
+        cfg_path = RUN_DIR / Path(step["config"]).name
+        try:
+            step_cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        except Exception:
+            step_cfg = {}
+        step_cfg["carrier_freq"] = cf
+        step_cfg["symbol_rate"]  = sr
+        step_cfg["total_frames"] = n_frames
+        if make_qam_constellation_png(
+            stats_path, png_path, step_cfg,
+            title=f"QAM Probe Step {i+1} — cf={cf}Hz sr={sr}baud"
+        ):
+            result["constellation_png"] = str(png_path)
 
     indicator = "OK " if status == "ok" else ("---" if status == "partial" else "FAIL")
     log(f"  [{indicator}] cf={cf}Hz sr={sr}baud  "
@@ -353,6 +324,12 @@ def main():
         time.sleep(0.5)
 
     ranked = rank_results(step_results)
+
+    # Probe sweep heatmap
+    heatmap_path = RUN_DIR / "probe_heatmap.png"
+    if make_qam_probe_heatmap_png(step_results, heatmap_path):
+        log(f"  probe heatmap -> {heatmap_path.name}")
+
     print_report(ranked, len(steps))
 
     report = {
@@ -386,6 +363,8 @@ def main():
         "best":          best_params,
         "ranked":        ranked,
     }
+    heatmap_str = str(heatmap_path) if heatmap_path.exists() else None
+    final["probe_heatmap"] = heatmap_str
     (RUN_DIR / f"result_{CLIENT_ID}.json").write_text(json.dumps(final, indent=2))
     print(json.dumps(final), flush=True)
 
@@ -399,4 +378,3 @@ def _save_error(reason):
 
 if __name__ == "__main__":
     main()
-    

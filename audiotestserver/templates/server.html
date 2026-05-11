@@ -363,20 +363,34 @@ socket.on('test_result_update', data => {
 });
 
 // ── Client table (server only) ────────────────────────────────────────────────
+function _clientSig(info) {
+  // Exclude fast-changing fields (stats, last_seen) from change detection
+  // so polling never triggers a checkbox-wiping re-render unless a client
+  // actually connects, disconnects, or changes its device selection.
+  if (!info) return '';
+  const { stats: _s, last_seen: _l, ...rest } = info;
+  return JSON.stringify(rest);
+}
+
 function loadClients() {
   if (NODE_ROLE !== 'server') return;
   fetch('/api/clients').then(r => r.json()).then(d => {
     const incoming = d.clients || {};
-    let changed = false;
+    let structuralChange = false;
     for (const [id, info] of Object.entries(incoming)) {
-      if (JSON.stringify(clients[id]) !== JSON.stringify(info)) {
-        clients[id] = info; changed = true;
+      if (_clientSig(clients[id]) !== _clientSig(info)) {
+        structuralChange = true;
       }
+      // Always merge so stats/last_seen stay current for the row renderer
+      clients[id] = info;
     }
     for (const id of Object.keys(clients)) {
-      if (!incoming[id]) { delete clients[id]; changed = true; }
+      if (!incoming[id]) { delete clients[id]; structuralChange = true; }
     }
-    if (changed) { renderClientTable(); updateTargetCheckboxes(); }
+    // Only rebuild the checkbox lists when clients join/leave/change devices.
+    // Suppress if the only diff is stats or last_seen — that's handled by
+    // the client_stats socket event which calls updateClientRow() surgically.
+    if (structuralChange) { renderClientTable(); updateTargetCheckboxes(); }
   });
 }
 
@@ -488,8 +502,9 @@ function refreshTests() {
       sel.innerHTML = '<option value="">No test scripts found</option>'; return;
     }
     sel.innerHTML = _allTests.map(t => {
-      const label = t.roles.length
-        ? `${t.name}  [${t.roles.map(r => r.role).join(' | ')}]`
+      const roles = t.roles || [];
+      const label = roles.length
+        ? `${t.name}  [${roles.map(r => r.role).join(' | ')}]`
         : t.name;
       return `<option value="${escAttr(t.name)}">${escHtml(label)}</option>`;
     }).join('');
@@ -583,14 +598,22 @@ function renderRolesTable(roles) {
       <span class="note" style="margin-left:6px">(roles run concurrently)</span>`;
   } else banner.innerHTML = '';
 
+  // Preserve existing role assignments across re-renders
+  const prevAssigned = {};  // { roleName: Set<clientId> }
+  document.querySelectorAll('.role-cb:checked').forEach(cb => {
+    (prevAssigned[cb.dataset.role] ??= new Set()).add(cb.value);
+  });
+
   const tbody = document.getElementById('roles-tbody');
   tbody.innerHTML = roles.map(r => {
-    const cbs = clientIds.map(id =>
-      `<label style="margin-right:8px">
+    const prev = prevAssigned[r.role] || new Set();
+    const cbs = clientIds.map(id => {
+      const checked = prev.size ? prev.has(id) : false;
+      return `<label style="margin-right:8px">
          <input type="checkbox" class="role-cb"
-                data-role="${escAttr(r.role)}" value="${id}"> ${id}
-       </label>`
-    ).join('');
+                data-role="${escAttr(r.role)}" value="${id}"${checked ? ' checked' : ''}> ${id}
+       </label>`;
+    }).join('');
     return `<tr>
       <td style="border:1px solid #aaa;padding:4px 8px;vertical-align:top">
         <b>${escHtml(r.role)}</b><br>
@@ -619,9 +642,49 @@ function updateRolesNote() {
 
 function updateTargetCheckboxes() {
   const wrap = document.getElementById('target-checkboxes'); if (!wrap) return;
-  wrap.innerHTML = Object.keys(clients).map(id =>
-    `<label><input type="checkbox" class="client-cb" value="${id}" checked> ${id}</label>`
-  ).join('');
+  // Snapshot which clients are currently checked before rebuilding
+  const prevChecked = new Set(
+    [...wrap.querySelectorAll('.client-cb:checked')].map(c => c.value)
+  );
+  const allIds = Object.keys(clients);
+  wrap.innerHTML = allIds.map(id => {
+    // Keep checked if it was checked before, or if this is a brand-new client
+    const isNew     = !wrap.querySelector(`.client-cb[value="${id}"]`);
+    const checked   = isNew || prevChecked.has(id);
+    return `<label><input type="checkbox" class="client-cb" value="${id}"${checked ? ' checked' : ''}> ${id}</label>`;
+  }).join('');
+
+  // Also preserve role-checkbox state when the roles table is visible
+  _refreshRolesClients();
+}
+
+function _refreshRolesClients() {
+  // If the roles table is showing, add checkboxes for any new clients
+  // without wiping existing assignments.
+  const tbody = document.getElementById('roles-tbody'); if (!tbody) return;
+  if (document.getElementById('roles-section').style.display === 'none') return;
+  const allIds = Object.keys(clients);
+  tbody.querySelectorAll('tr').forEach(row => {
+    const roleAttr = row.querySelector('.role-cb')?.dataset.role;
+    if (!roleAttr) return;
+    const cell = row.cells[1]; if (!cell) return;
+    const existingIds = new Set([...cell.querySelectorAll('.role-cb')].map(c => c.value));
+    // Add checkboxes for newly connected clients
+    for (const id of allIds) {
+      if (existingIds.has(id)) continue;
+      const lbl = document.createElement('label');
+      lbl.style.marginRight = '8px';
+      lbl.innerHTML = `<input type="checkbox" class="role-cb"
+                              data-role="${escAttr(roleAttr)}" value="${id}"> ${escHtml(id)}`;
+      lbl.querySelector('input').addEventListener('change', updateRolesNote);
+      cell.appendChild(lbl);
+    }
+    // Remove checkboxes for clients that have disconnected
+    cell.querySelectorAll('.role-cb').forEach(cb => {
+      if (!allIds.includes(cb.value)) cb.closest('label')?.remove();
+    });
+  });
+  updateRolesNote();
 }
 
 function checkAllClients()   { document.querySelectorAll('.client-cb').forEach(c => c.checked=true);  }
@@ -716,6 +779,12 @@ function _buildParams() {
   const out = {};
   for (const r of _paramRows) {
     const k = r.key.trim(); if (!k) continue;
+    // Skip params whose value is blank — the script will use its own default.
+    // This prevents e.g. variable-reference defaults like "auto_timeout" being
+    // forwarded to scripts that expect a numeric value.
+    if (r.type === 'string'  && String(r.value ?? '') === '') continue;
+    if (r.type === 'number'  && String(r.value ?? '') === '') continue;
+    if (r.type === 'json'    && String(r.value ?? '').trim() === '') continue;
     if (r.type === 'number')  { out[k] = Number(r.value); continue; }
     if (r.type === 'boolean') { out[k] = (r.value === true || r.value === 'true'); continue; }
     if (r.type === 'json') {
