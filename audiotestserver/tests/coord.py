@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 XP5-ORG
+
 """
 tests/coord.py - coordination helper for test scripts.
 Usage:

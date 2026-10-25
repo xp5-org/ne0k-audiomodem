@@ -1,0 +1,5 @@
+# Project is bind-mounted at runtime; the image only needs requirements.txt
+# and docker/. Keep the build context small.
+*
+!requirements.txt
+!docker/

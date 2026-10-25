@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 XP5-ORG
+
 """
 tests/analysis.py  –  Post-run visualisation helpers.
 
@@ -432,11 +435,15 @@ def make_css_spectrograph_png(
         f_min      = float((info or {}).get("f_min",       200))
         f_max      = float((info or {}).get("f_max",      8000))
         symbol_dur = float((info or {}).get("symbol_dur",  0.25))
+        gap_frac   = float((info or {}).get("symbol_gap_frac", 0.0))
+        # Symbols are spaced by the full period (chirp + inter-symbol gap),
+        # not the bare chirp duration.
+        symbol_period = symbol_dur * (1.0 + gap_frac)
         diag       = (result or {}).get("diagnostics",       {})
         frames     = (result or {}).get("frames",             [])
 
         sync_at_sym = diag.get("sync_at_symbol")
-        sync_time   = (sync_at_sym * symbol_dur) if sync_at_sym is not None else None
+        sync_time   = (sync_at_sym * symbol_period) if sync_at_sym is not None else None
 
         # ── Dynamic range: clip to [median - 3 dB, p99] ──────────────────
         valid = Sxx_db[np.isfinite(Sxx_db)]
@@ -457,7 +464,12 @@ def make_css_spectrograph_png(
                      f"frames={n_frames}  status={status}")
 
         # ── Plot ──────────────────────────────────────────────────────────
-        fig, ax = plt.subplots(figsize=(13, 5))
+        # Width scales with capture length so individual chirps stay
+        # resolvable; both DPI and width are capped to keep the PNG a
+        # viewable size (~40 px/audio-second at dpi=100, max 14000 px wide).
+        _dpi  = 100
+        _w_px = min(14000, max(1300, int(duration * 40)))
+        fig, ax = plt.subplots(figsize=(_w_px / _dpi, 6.0))
         fig.suptitle(title, fontsize=9)
 
         im = ax.pcolormesh(
@@ -481,15 +493,17 @@ def make_css_spectrograph_png(
             ax.axvline(sync_time, color="orange", lw=1.5, ls="-.",
                        alpha=0.9, label=f"sync @ {sync_time:.2f}s", zorder=4)
 
-        # Frame boundary ticks (as short vertical lines at the top)
-        if frames and symbol_dur:
+        # Frame boundary ticks. Frames repeat every (training + preamble +
+        # payload) symbols; spaced by that symbol count × the symbol period.
+        if frames and sync_time is not None:
+            _frame_syms = (int((info or {}).get("training_symbols", 0))
+                           + len((info or {}).get("preamble", []) or [])
+                           + int((info or {}).get("frame_symbols", 0)))
             for frame_info in frames:
-                # frames list has seq numbers; estimate time from sync + offset
-                if sync_time is not None:
-                    seq = frame_info.get("seq", 0)
-                    frame_t = sync_time + seq * symbol_dur * 8  # approx
-                    ax.axvline(frame_t, color="yellow", lw=0.6, alpha=0.4,
-                               ymax=0.05, zorder=4)
+                seq = frame_info.get("seq", 0)
+                frame_t = sync_time + seq * max(1, _frame_syms) * symbol_period
+                ax.axvline(frame_t, color="yellow", lw=0.6, alpha=0.4,
+                           ymax=0.05, zorder=4)
 
         ax.set_xlabel("Time (s)", fontsize=9)
         ax.set_ylabel("Frequency (Hz)", fontsize=9)
@@ -507,7 +521,7 @@ def make_css_spectrograph_png(
         legend.get_frame().set_facecolor("#222222")
 
         plt.tight_layout()
-        plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
+        plt.savefig(str(output_path), dpi=_dpi, bbox_inches="tight")
         plt.close(fig)
         _log(f"  analysis: CSS spectrograph PNG -> {Path(output_path).name}")
         return True

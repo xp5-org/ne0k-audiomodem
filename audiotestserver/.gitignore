@@ -1,0 +1,25 @@
+# SSH private key for LLM container access — never commit
+ssh/id_ed25519
+ssh/*_key
+ssh/*.pem
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime artifacts
+results/
+config/clients.json
+
+# Built C cores.  Per-host build products, not source: the arch-suffixed names
+# exist precisely because BASE_DIR is a shared mount and each node needs its
+# own.  Rebuild with `make -C tests/c`, `tests/CSS/c`, `tests/OFDM/c both`.
+tests/**/*.so
+tests/**/*.dylib
+
+# Regression fixtures: recorded audio is local-disk only (see
+# tests/regression/README.md).  cases.json IS tracked — a fresh clone keeps the
+# case list and reports SKIP for the WAVs it doesn't have.
+tests/regression/fixtures/**/*.wav
+tests/regression/fixtures/**/*.json
+!tests/regression/cases.json

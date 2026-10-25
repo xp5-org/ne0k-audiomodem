@@ -33,10 +33,26 @@
   .badge-client { border-color: #06c; color: #06c; }
   /* masks the Run Test section in client mode */
   .masked { opacity: 0.38; pointer-events: none; user-select: none; }
-  /* params builder table — no inner cell borders */
-  #params-table { width: auto; }
-  #params-table td { padding: 3px 5px; border: none; }
+  /* params builder table — flat spreadsheet: gridlines come from the table,
+     not from a border on every input, so it reads as one sheet not a stack
+     of boxed fields */
+  #params-table { width: auto; border: 1px solid #ccc; }
+  #params-table td { padding: 0; border: 1px solid #ddd; }
   #params-table th { padding: 3px 5px; }
+  #params-table input, #params-table select {
+    border: none; border-radius: 0; padding: 3px 5px; width: 100%;
+    background: transparent;
+  }
+  #params-table input:focus, #params-table select:focus {
+    outline: 1px solid #06c; outline-offset: -1px; background: #f2f7ff;
+  }
+  #params-table td:last-child { border: none; text-align: center; }
+  #params-table tr:hover td { background: #f8f8f8; }
+  /* section divider between param groups, e.g. CSS PHY vs OFDM PHY settings */
+  #params-table .param-group-row td { padding: 6px 5px 2px; border: none; border-top: 1px solid #ccc;
+                         font-size: 11px; font-weight: bold; letter-spacing: 0.03em;
+                         color: #555; text-transform: uppercase; }
+  #params-table .param-group-row:first-child td { border-top: none; }
   #params-preview { font-size: 11px; background: #f0f0f0; padding: 2px 6px;
                     border: 1px solid #ccc; display: inline-block;
                     max-width: 520px; word-break: break-all; }
@@ -47,6 +63,44 @@
   .param-conflict td:first-child { background: #fff8e1; }
   .conflict-badge { font-size: 10px; color: #b85c00; border: 1px solid #b85c00;
                     padding: 0 4px; margin-left: 4px; cursor: help; }
+  /* ── tabs ─────────────────────────────────────────────────────────────── */
+  #tabbar { display: flex; gap: 4px; margin: 10px 0 14px;
+            border-bottom: 1px solid #999; }
+  .tab-btn { font-family: monospace; font-size: 12px; padding: 5px 14px;
+             border: 1px solid #999; border-bottom: none; background: #eee;
+             cursor: pointer; margin-bottom: -1px; }
+  .tab-btn.active { background: white; font-weight: bold; }
+  .tab-btn .tab-count { color: #666; font-weight: normal; }
+  /* ── reports ──────────────────────────────────────────────────────────── */
+  #reports-table td, #reports-table th { padding: 3px 6px; vertical-align: top; }
+  #reports-table tr.rpt-row:hover { background: #f4f4f4; cursor: pointer; }
+  #reports-table tr.rpt-open { background: #eef4ff; }
+  .st-ok    { color: green; font-weight: bold; }
+  .st-fail  { color: #c00; font-weight: bold; }
+  /* measurement good, a secondary stage did not verify — a result, not a break */
+  .st-partial { color: #b85c00; font-weight: bold; }
+  .st-error { color: #c000c0; font-weight: bold; }
+  .st-unknown { color: #888; }
+  .vd { font-size: 10px; padding: 1px 5px; border: 1px solid; white-space: nowrap; }
+  .vd-unreviewed    { border-color: #999; color: #666; }
+  .vd-valid         { border-color: green; color: green; }
+  .vd-expected_fail { border-color: #b85c00; color: #b85c00; }
+  .vd-bug           { border-color: #c00; color: #c00; }
+  .vd-junk          { border-color: #999; color: #999; text-decoration: line-through; }
+  .chip { display: inline-block; font-size: 10px; padding: 1px 5px; margin: 1px 2px 1px 0;
+          border: 1px solid #06c; color: #06c; background: #f2f7ff; white-space: nowrap; }
+  .chip-pick { cursor: pointer; border-color: #aaa; color: #555; background: white; }
+  .chip-pick:hover { border-color: #06c; color: #06c; background: #f2f7ff; }
+  .chip-x { cursor: pointer; margin-left: 4px; color: #999; font-weight: bold; }
+  .chip-x:hover { color: #c00; }
+  .reg-yes { font-size: 10px; border: 1px solid green; color: green; padding: 1px 5px; }
+  #report-detail { border: 1px solid #999; padding: 10px; margin-bottom: 14px;
+                   background: #fbfbfb; }
+  #report-detail pre { font-size: 11px; background: #f4f4f4; border: 1px solid #ddd;
+                       padding: 6px; max-height: 320px; overflow: auto;
+                       white-space: pre-wrap; }
+  .rpt-toolbar { gap: 10px; }
+  .rpt-note-txt { font-size: 11px; color: #444; font-style: italic; }
 </style>
 </head>
 <body>
@@ -55,6 +109,17 @@
   <span class="badge badge-{{ role }}">{{ role }}</span>
 </h1>
 <div class="note" id="server-info">Loading…</div>
+
+{% if role == 'server' %}
+<div id="tabbar">
+  <div class="tab-btn active" id="tab-btn-dashboard" onclick="showTab('dashboard')">Dashboard</div>
+  <div class="tab-btn" id="tab-btn-reports" onclick="showTab('reports')">
+    Reports <span class="tab-count" id="tab-reports-count"></span>
+  </div>
+</div>
+{% endif %}
+
+<div id="panel-dashboard">
 
 <!-- ═══════════════════════════════════════════════════════════
      SERVER-ONLY: connected clients + client detail
@@ -65,11 +130,12 @@
   <thead>
     <tr>
       <th>Client ID</th><th>IP</th><th>Status</th><th>CPU</th><th>MEM</th>
+      <th title="Live test processes this node is holding (python pids carrying AUDIOTOOL_RUN_ID)">Procs</th>
       <th>Input Device</th><th>Output Device</th><th>Last Seen</th><th>Actions</th>
     </tr>
   </thead>
   <tbody id="client-tbody">
-    <tr><td colspan="9">No clients connected.</td></tr>
+    <tr><td colspan="10">No clients connected.</td></tr>
   </tbody>
 </table>
 
@@ -131,6 +197,7 @@
     </select>
     <button onclick="refreshTests()">&#x21BA;</button>
   </div>
+  <div class="note" id="test-desc" style="margin-bottom:6px"></div>
 
   <!-- standalone: simple client checkboxes -->
   <div id="standalone-section">
@@ -158,8 +225,73 @@
     <div class="note" id="roles-note">Assign clients to roles.</div>
   </div>
 
+  <!-- simulation tests (meshrun): local controls — the sim runs entirely on
+       this server host, so client/role assignment is hidden -->
+  <div id="mesh-sim-controls" style="display:none">
+    <div class="note" style="margin-bottom:6px">
+      Runs locally on <b>this server host</b> &mdash; no clients, no audio.
+      <b>MAC</b> tier is a fast protocol sim (seconds, single core); <b>DSP</b>
+      tier decodes real audio per node across many cores &mdash; run it on a
+      big host. Renders a piano-roll of the event flow.
+    </div>
+    <div class="row" style="flex-wrap:wrap;gap:12px">
+      <label>Mode:
+        <select id="mesh-mode" onchange="onMeshMode()">
+          <option value="single">Single run</option>
+          <option value="suite">Test suite (all scenarios)</option>
+          <option value="daemon">Daemon (run until stopped)</option>
+        </select>
+      </label>
+      <label id="mesh-tier-wrap">Tier:
+        <select id="mesh-tier" onchange="onMeshTier()">
+          <option value="mac">MAC (fast)</option>
+          <option value="dsp">DSP (real audio, multi-core)</option>
+        </select>
+      </label>
+      <label id="mesh-nodes-wrap">Nodes: <input id="mesh-nodes" type="number" min="1" max="15" value="15" style="width:56px"></label>
+      <label id="mesh-run-wrap">Run&nbsp;seconds: <input id="mesh-run" type="number" min="10" value="600" style="width:72px"></label>
+      <label id="mesh-jobs-wrap" style="display:none">Jobs: <input id="mesh-jobs" type="number" min="1" value="15" style="width:56px"></label>
+      <span id="mesh-hint" class="note"></span>
+    </div>
+  </div>
+
+  <!-- offline regression suites (css_regress.py / ofdm_regress.py) — run
+       right here on the server host, no clients/roles/params involved -->
+  <div id="regression-run-panel" style="display:none">
+    <div class="note" style="margin-bottom:6px">
+      Replays existing captured WAV runs and synthetic cases through the
+      decoder offline on this server host — no audio hardware, no client
+      nodes involved.
+    </div>
+    <div class="row">
+      <label>Only: <input type="text" id="dash-reg-only" style="width:110px"
+                          placeholder="name filter"></label>
+      <label id="dash-reg-labels-wrap">Labels: <select id="dash-reg-labels" multiple size="1"
+                             style="min-width:110px;vertical-align:middle"></select></label>
+      <label id="dash-reg-slow-wrap"><input type="checkbox" id="dash-reg-slow"> slow (3.0s case)</label>
+      <label><input type="checkbox" id="dash-reg-verbose"> log on fail</label>
+      <button id="dash-reg-stop-btn" onclick="stopRegression(_dashRegSuite)"
+              style="color:red" disabled>&#x25A0; Stop</button>
+    </div>
+    <div class="row">
+      <span id="dash-reg-status" class="note">idle</span>
+      <span id="dash-reg-summary" style="font-weight:bold"></span>
+    </div>
+    <div id="dash-reg-results" style="display:none">
+      <table id="dash-reg-table">
+        <thead><tr><th style="width:70px">Result</th><th>Case</th>
+                   <th style="width:70px">Time</th><th>Detail</th></tr></thead>
+        <tbody id="dash-reg-tbody"></tbody>
+      </table>
+      <details id="dash-reg-log-wrap">
+        <summary class="note">suite output</summary>
+        <pre id="dash-reg-log"></pre>
+      </details>
+    </div>
+  </div>
+
   <!-- ── Params builder ──────────────────────────────────────── -->
-  <div style="margin-top:10px">
+  <div id="params-builder" style="margin-top:10px">
     <div style="margin-bottom:4px"><b>Test Parameters</b></div>
 
     <table id="params-table">
@@ -198,23 +330,18 @@
   <!-- ── /Params builder ─────────────────────────────────────── -->
 
   <div class="row" style="margin-top:10px">
-    <button onclick="runTest()">&#x25B6; Run Test</button>
+    <button id="run-test-btn" onclick="runTest()">&#x25B6; Run Test</button>
     <button onclick="stopAll()"
             style="margin-left:16px;color:red;font-weight:bold">&#x25A0; Stop All</button>
+    <button onclick="reapAll()" title="Kill leftover test processes on every node"
+            style="margin-left:8px">&#x1F9F9; Reap</button>
     <span id="run-status" class="note"></span>
+    <span id="mesh-status" class="note"></span>
+    <a id="mesh-roll-link" href="#" target="_blank"
+       style="display:none;margin-left:12px;font-weight:bold">&#x1F3B9; View piano roll</a>
   </div>
+  <div id="mesh-suite-results" style="margin-top:8px;display:none;font-size:12px"></div>
 </div>
-
-<!-- ═══════════════════════════════════════════════════════════
-     SERVER-ONLY: results
-     ═══════════════════════════════════════════════════════════ -->
-{% if role == 'server' %}
-<h2>Results</h2>
-<div class="row">
-  <button onclick="loadResults()">&#x21BA; Refresh</button>
-</div>
-<div id="results-area" class="note">Click refresh to load.</div>
-{% endif %}
 
 <!-- ═══════════════════════════════════════════════════════════
      BOTH ROLES: log
@@ -224,7 +351,170 @@
   <button onclick="clearLog()">Clear</button>
   <button onclick="loadLog()">&#x21BA; Refresh</button>
 </div>
+<div class="row" id="log-filters" style="font-size:11px;gap:12px;"></div>
 <div id="log-box"></div>
+
+</div><!-- /panel-dashboard -->
+
+<!-- ═══════════════════════════════════════════════════════════
+     SERVER-ONLY TAB: Reports — review, annotate, delete runs and
+     promote good ones into the regression suite
+     ═══════════════════════════════════════════════════════════ -->
+{% if role == 'server' %}
+<div id="panel-reports" style="display:none">
+
+  <h2>Test Reports</h2>
+
+  <div class="row rpt-toolbar">
+    <button onclick="loadReports()">&#x21BA; Refresh</button>
+    <label>Verdict:
+      <select id="rpt-f-verdict" onchange="renderReports()">
+        <option value="">all</option>
+        <option value="unreviewed">unreviewed</option>
+        <option value="valid">valid</option>
+        <option value="expected_fail">expected fail</option>
+        <option value="bug">bug</option>
+        <option value="junk">junk</option>
+      </select>
+    </label>
+    <label>Status:
+      <select id="rpt-f-status" onchange="renderReports()">
+        <option value="">all</option>
+        <option value="ok">ok</option>
+        <option value="fail">fail</option>
+        <option value="error">error</option>
+        <option value="unknown">unknown</option>
+      </select>
+    </label>
+    <label>Label:
+      <select id="rpt-f-label" onchange="renderReports()">
+        <option value="">all</option>
+      </select>
+    </label>
+    <label>In suite:
+      <select id="rpt-f-reg" onchange="renderReports()">
+        <option value="">all</option>
+        <option value="yes">in regression</option>
+        <option value="no">not in regression</option>
+      </select>
+    </label>
+    <input type="text" id="rpt-f-text" placeholder="search run / test / note"
+           style="width:180px" oninput="renderReports()">
+  </div>
+
+  <div class="row">
+    <button onclick="rptSelectAll(true)">Select all</button>
+    <button onclick="rptSelectAll(false)">Select none</button>
+    <button onclick="rptDeleteSelected()" style="color:red">&#x2715; Delete selected</button>
+    <button onclick="rptBulkVerdict('junk')">Mark junk</button>
+    <button onclick="rptBulkVerdict('expected_fail')">Mark expected fail</button>
+    <button onclick="toggleLabelManager()">&#x1F3F7; Labels…</button>
+    <span class="note" id="rpt-count"></span>
+    <span class="note" id="rpt-msg"></span>
+  </div>
+
+  <div id="label-manager" style="display:none;margin-bottom:8px"></div>
+
+  <div id="report-detail" style="display:none"></div>
+
+  <table id="reports-table">
+    <thead>
+      <tr>
+        <th style="width:20px"></th>
+        <th>Run</th>
+        <th>Test</th>
+        <th>Status</th>
+        <th>Expected payload</th>
+        <th>Decoded payload</th>
+        <th>SNR</th>
+        <th>Verdict</th>
+        <th>Labels</th>
+        <th>Suite</th>
+        <th>Size</th>
+        <th style="width:120px">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="reports-tbody">
+      <tr><td colspan="12" class="note">Loading…</td></tr>
+    </tbody>
+  </table>
+
+  <h3>CSS regression suite</h3>
+  <div class="note" style="margin-bottom:6px">
+    Replays the built-in synthetic cases, the recorded fixtures and every
+    promoted run through the decoder <b>offline on this server host</b> — no
+    audio hardware and no client nodes involved. Full suite takes ~2–4 min.
+  </div>
+
+  <div class="row">
+    <button id="reg-css-run-btn" onclick="runRegression('css')">&#x25B6; Run regression suite</button>
+    <button id="reg-css-stop-btn" onclick="stopRegression('css')" style="color:red" disabled>
+      &#x25A0; Stop</button>
+    <label>Only: <input type="text" id="reg-css-only" style="width:110px"
+                        placeholder="name filter"></label>
+    <label>Labels: <select id="reg-css-labels" multiple size="1"
+                           style="min-width:110px;vertical-align:middle"></select></label>
+    <label><input type="checkbox" id="reg-css-slow"> slow (3.0s case)</label>
+    <label><input type="checkbox" id="reg-css-verbose"> log on fail</label>
+  </div>
+  <div class="row">
+    <span id="reg-css-status" class="note">idle</span>
+    <span id="reg-css-summary" style="font-weight:bold"></span>
+  </div>
+
+  <div id="reg-css-results" style="display:none">
+    <table id="reg-css-table">
+      <thead><tr><th style="width:70px">Result</th><th>Case</th>
+                 <th style="width:70px">Time</th><th>Detail</th></tr></thead>
+      <tbody id="reg-css-tbody"></tbody>
+    </table>
+    <details id="reg-css-log-wrap">
+      <summary class="note">suite output</summary>
+      <pre id="reg-css-log"></pre>
+    </details>
+  </div>
+
+  <h3>Cases <span class="note">(tests/regression/cases.json)</span></h3>
+  <div class="note" style="margin-bottom:6px">
+    Promoted runs are copied into <code>tests/regression/fixtures/runs/</code>.
+    Equivalent CLI: <code>python tests/regression/css_regress.py --label distance</code>.
+  </div>
+  <div id="regression-area" class="note">Loading…</div>
+
+  <h3>OFDM regression suite</h3>
+  <div class="note" style="margin-bottom:6px">
+    Runs the OFDM config/modulator/sync/probe/acquisition and handshake
+    collision regression scripts <b>offline on this server host</b> — no
+    audio hardware and no client nodes involved.
+  </div>
+
+  <div class="row">
+    <button id="reg-ofdm-run-btn" onclick="runRegression('ofdm')">&#x25B6; Run regression suite</button>
+    <button id="reg-ofdm-stop-btn" onclick="stopRegression('ofdm')" style="color:red" disabled>
+      &#x25A0; Stop</button>
+    <label>Only: <input type="text" id="reg-ofdm-only" style="width:110px"
+                        placeholder="name filter"></label>
+    <label><input type="checkbox" id="reg-ofdm-verbose"> log on fail</label>
+  </div>
+  <div class="row">
+    <span id="reg-ofdm-status" class="note">idle</span>
+    <span id="reg-ofdm-summary" style="font-weight:bold"></span>
+  </div>
+
+  <div id="reg-ofdm-results" style="display:none">
+    <table id="reg-ofdm-table">
+      <thead><tr><th style="width:70px">Result</th><th>Case</th>
+                 <th style="width:70px">Time</th><th>Detail</th></tr></thead>
+      <tbody id="reg-ofdm-tbody"></tbody>
+    </table>
+    <details id="reg-ofdm-log-wrap">
+      <summary class="note">suite output</summary>
+      <pre id="reg-ofdm-log"></pre>
+    </details>
+  </div>
+
+</div><!-- /panel-reports -->
+{% endif %}
 
 
 <script>
@@ -235,6 +525,12 @@ const NODE_ID   = "{{ node_id }}";
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
 const socket = io();
 let clients = {};
+
+// Declared here (not where it's populated, further down) because onMeshMode()
+// self-invokes at parse time, below, and calls updateRunButton() -> this was
+// a `let` TDZ ReferenceError when declared after that self-invoking call —
+// which aborted the whole script before window.onload was even assigned.
+let _allTests = [];
 
 socket.on('connect', () => { if (NODE_ROLE === 'server') loadClients(); });
 
@@ -249,6 +545,8 @@ window.onload = () => {
     loadClients();
     refreshTests();
     setInterval(loadClients, 8000);
+    loadReports();                                   // fills the tab counter
+    showTab(localStorage.getItem('activeTab') || 'dashboard');
   }
 };
 
@@ -360,6 +658,157 @@ socket.on('test_result_update', data => {
   const s = data.status === 'ok' ? 'OK' : 'ERROR';
   logLine(`[result] ${data.client_id} \u2192 ${s} (rc=${data.returncode})`);
   document.getElementById('run-status').textContent = `${data.client_id}: ${s}`;
+
+  // A finished run means a new (or updated) report \u2014 refresh the Reports tab.
+  // Delayed so the node's result_*.json is on disk before we re-read the dir.
+  if (NODE_ROLE === 'server') setTimeout(loadReports, 1500);
+
+  // Mesh sim run: surface suite results / daemon summary / piano-roll artifact.
+  const d = data.data || {};
+  if (d.mode !== undefined || d.tier !== undefined || d.roll_file) {
+    const st = document.getElementById('mesh-status');
+    const link = document.getElementById('mesh-roll-link');
+    const suite = document.getElementById('mesh-suite-results');
+    document.getElementById('run-test-btn').disabled = false;
+    if (data.status !== 'ok') {
+      st.textContent = `error: ${d.error || ('rc=' + (data.returncode ?? '?'))}`;
+    } else if (d.mode === 'suite') {
+      st.textContent = `suite: ${d.passed}/${d.total} scenarios passed`;
+      suite.style.display = 'block';
+      suite.innerHTML = (d.scenarios || []).map(s =>
+        `<span style="margin-right:12px;color:${s.pass ? '#2a7' : '#c33'}">`
+        + `${s.pass ? '\u2714' : '\u2717'} ${s.name}</span>`).join('');
+    } else {
+      st.textContent = `${d.mode || 'run'} done \u2014 ${d.events || 0} events`
+        + (d.n_nodes ? `, discovery ${d.full_discovery ?? '?'}/${d.n_nodes}` : '');
+    }
+    if (d.roll_file && data.run_id) {
+      link.href = `/api/results/${data.run_id}/artifact/${d.roll_file}`;
+      link.style.display = 'inline';
+    }
+  }
+});
+
+// \u2500\u2500 Mesh test consolidation \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Known tests get a group (dropdown optgroup) + a description shown under the
+// selector.  group "sim" = local simulation on this server host (no clients);
+// group "ota" = over-the-air on real clients.  Everything else is "other".
+const TEST_INFO = {
+  meshmodem: {
+    group: 'ota',
+    desc: 'OVER-THE-AIR mesh node test on real clients (speaker + mic). '
+        + 'CSS is the control plane; phy_mode picks the data PHY: css_only, '
+        + 'css_then_ofdm (OFDM upgrade with CSS fallback), or ofdm_only. '
+        + 'OFDM channel-negotiation params (snr_margin_db, max_bits_per_bin, '
+        + 'link_rate_policy, \u2026) are in the parameter table below.',
+  },
+  meshrun: {
+    group: 'sim',
+    desc: 'LOCAL mesh SIMULATION on this server host \u2014 no clients, no '
+        + 'audio hardware. MAC tier simulates the protocol; DSP tier decodes '
+        + 'real audio per node. Renders a piano-roll of the event flow.',
+  },
+  ofdmhs: {
+    group: 'ota',
+    desc: 'Two-host OFDM V.22 handshake over the air: fully in-band '
+        + 'bandwidth (BAT) negotiation, no coord. Assign the node role to '
+        + 'BOTH hosts; node 1 (id_map) is the initiator.',
+  },
+  ofdm2way: {
+    group: 'ota',
+    desc: 'Two-way OFDM channel measurement over the air (both directions '
+        + 'probed SEQUENTIALLY over the full band \u2014 still half-duplex; no '
+        + 'in-band negotiation, use ofdmhs/meshmodem for that).',
+  },
+  ofdm_fdd: {
+    group: 'ota',
+    desc: 'FEASIBILITY probe for frequency-division duplex: the band is split '
+        + 'into a downlink and an uplink sub-band around a guard gap '
+        + '(dl_frac / guard_hz, with a min_baud floor on the narrow side), and '
+        + 'each direction is measured TWICE \u2014 once alone, once with both '
+        + 'speakers live at the same time. The reported penalty_db is how much '
+        + 'SNR own-transmission costs the far signal; a large penalty means '
+        + 'simultaneous duplex is not viable on this hardware. Also reports '
+        + '\u201ccomb\u201d, the regular notch spacing of room reflections. '
+        + 'Assign the node role to BOTH hosts; node 1 (id_map) is the downlink.',
+  },
+  css_regression: {
+    group: 'regression',
+    label: 'CSS Regression',
+    desc: 'OFFLINE: replays synthetic encodes, recorded WAV fixtures and '
+        + 'every promoted run through the CSS decoder on this server host '
+        + '— no audio hardware, no clients.',
+  },
+  ofdm_regression: {
+    group: 'regression',
+    label: 'OFDM Regression',
+    desc: 'OFFLINE: runs the OFDM config/modulator/sync/probe/acquisition '
+        + 'and handshake collision regression scripts on this server host '
+        + '— no audio hardware, no clients.',
+  },
+};
+// sim-control keys are driven by the dedicated widgets below, so they are
+// filtered OUT of the generic params table to avoid two sources of truth
+const SIM_KEYS = ['mode', 'tier', 'nodes', 'run_s', 'jobs'];
+
+function _isSimTest(name) { return (TEST_INFO[name] || {}).group === 'sim'; }
+function _regressionSuite(test) { return test && test.synthetic === 'regression' ? test.suite : null; }
+
+function updateRunButton() {
+  const btn = document.getElementById('run-test-btn');
+  const name = document.getElementById('test-select').value;
+  const test = _allTests.find(t => t.name === name);
+  const suite = _regressionSuite(test);
+  if (suite) {
+    btn.innerHTML = '\u25b6 Run Regression Suite (local)';
+  } else if (_isSimTest(name)) {
+    const mode = document.getElementById('mesh-mode').value;
+    btn.innerHTML = mode === 'suite'  ? '\u25b6 Run Sim Suite (local)'
+                  : mode === 'daemon' ? '\u25b6 Start Sim Daemon (local)'
+                  : '\u25b6 Run Simulation (local)';
+  } else if (name === 'meshmodem') {
+    btn.innerHTML = '\u25b6 Run Mesh Test (over-the-air)';
+  } else {
+    btn.innerHTML = '\u25b6 Run Test' + (name ? ` (${escHtml(name)})` : '');
+  }
+}
+
+function onMeshMode() {
+  const mode = document.getElementById('mesh-mode').value;
+  const show = (id, on) => document.getElementById(id).style.display = on ? '' : 'none';
+  show('mesh-tier-wrap',  mode === 'single');
+  show('mesh-nodes-wrap', mode !== 'suite');
+  show('mesh-run-wrap',   mode === 'single');
+  onMeshTier();
+  const hint = document.getElementById('mesh-hint');
+  if (mode === 'suite')       hint.textContent = 'runs the full scenario battery';
+  else if (mode === 'daemon') hint.textContent = 'press Stop All to end';
+  else                        hint.textContent = '';
+  updateRunButton();
+}
+
+function onMeshTier() {
+  const mode = document.getElementById('mesh-mode').value;
+  const dsp = document.getElementById('mesh-tier').value === 'dsp';
+  // jobs only apply to a DSP single run
+  document.getElementById('mesh-jobs-wrap').style.display =
+    (dsp && mode === 'single') ? '' : 'none';
+  const run = document.getElementById('mesh-run');
+  if (!run.dataset.touched) run.value = dsp ? 200 : 600;
+}
+
+function _simParams() {
+  return {
+    mode:  document.getElementById('mesh-mode').value,
+    tier:  document.getElementById('mesh-tier').value,
+    nodes: parseInt(document.getElementById('mesh-nodes').value, 10),
+    run_s: parseFloat(document.getElementById('mesh-run').value),
+    jobs:  parseInt(document.getElementById('mesh-jobs').value, 10),
+  };
+}
+onMeshMode();   // set initial field visibility
+document.getElementById('mesh-run')?.addEventListener('input', e => {
+  e.target.dataset.touched = '1';
 });
 
 // ── Client table (server only) ────────────────────────────────────────────────
@@ -368,7 +817,10 @@ function _clientSig(info) {
   // so polling never triggers a checkbox-wiping re-render unless a client
   // actually connects, disconnects, or changes its device selection.
   if (!info) return '';
-  const { stats: _s, last_seen: _l, ...rest } = info;
+  // procs/last_stop tick on their own timer like stats does — excluding them
+  // keeps a routine process report from rebuilding the table and wiping the
+  // operator's target checkboxes mid-setup.
+  const { stats: _s, last_seen: _l, procs: _p, last_stop: _ls, ...rest } = info;
   return JSON.stringify(rest);
 }
 
@@ -399,7 +851,7 @@ function renderClientTable() {
   const ids = Object.keys(clients);
   tbody.innerHTML = ids.length
     ? ids.map(clientRow).join('')
-    : '<tr><td colspan="9">No clients connected.</td></tr>';
+    : '<tr><td colspan="10">No clients connected.</td></tr>';
 }
 
 function devName(devices, id) {
@@ -418,12 +870,14 @@ function clientRow(id) {
     <td class="status-${st}">${st}</td>
     <td>${s.cpu_pct != null ? s.cpu_pct+'%' : '\u2014'}</td>
     <td>${s.mem_pct != null ? s.mem_pct+'%' : '\u2014'}</td>
+    <td>${procCell(id)}</td>
     <td>${devName(devs.inputs,  c.selected_input)}</td>
     <td>${devName(devs.outputs, c.selected_output)}</td>
     <td>${ts}</td>
     <td>
       <button onclick="showClientDetail('${id}')">Devices</button>
       <button onclick="sendDevicePrompt('${id}')">Set Device</button>
+      <button onclick="showClientProcs('${id}')">Procs</button>
     </td>
   </tr>`;
 }
@@ -431,6 +885,78 @@ function clientRow(id) {
 function updateClientRow(id) {
   const el = document.getElementById(`crow-${id}`);
   if (el) el.outerHTML = clientRow(id);
+}
+
+// ── Leftover-process visibility ───────────────────────────────────────────────
+// A node reports its own python pids (anything carrying AUDIOTOOL_RUN_ID) on a
+// timer.  Idle-with-processes is the state worth seeing: it means a test ended
+// but something it spawned is still running — historically still playing audio.
+function procCell(id) {
+  const c = clients[id] || {}, p = c.procs || {};
+  const n = p.n_procs || 0;
+  const stale = !p.ts || (Date.now()/1000 - p.ts) > 90;
+  if (!p.ts) return '<span title="node has not reported yet">\u2014</span>';
+  if (!n)    return `<span style="color:#888" title="no test processes${stale?' (stale report)':''}">0</span>`;
+  const idle  = (c.status || 'idle') !== 'running';
+  const runs  = Object.keys(p.runs || {}).join(', ');
+  const title = `${n} process(es), ${p.rss_mb||0} MB, run(s): ${runs}` +
+                (idle ? ' — node is idle, these are LEFTOVERS' : '') +
+                (stale ? ' (report is stale)' : '');
+  const color = idle ? '#c00' : '#a60';
+  return `<b style="color:${color}" title="${escHtml(title)}">${n}${idle?' \u26a0':''}</b>`;
+}
+
+socket.on('client_procs', data => {
+  if (!clients[data.client_id]) return;
+  clients[data.client_id].procs = data.procs || {};
+  updateClientRow(data.client_id);
+  if (_procsPanelFor === data.client_id) showClientProcs(data.client_id);
+});
+
+socket.on('client_stop_report', data => {
+  const left = (data.remaining || []).length;
+  logLine(`[stop] ${data.client_id}: reaped ${data.killed||0}` +
+          (left ? ` \u2014 ${left} STILL ALIVE (${(data.remaining||[])
+            .map(r => r.pid).join(', ')})` : ''));
+});
+
+let _procsPanelFor = null;
+
+function showClientProcs(id) {
+  const area = document.getElementById('client-detail-area'); if (!area) return;
+  _procsPanelFor = id;
+  const c = clients[id] || {}, p = c.procs || {};
+  const rows = (p.procs || []).map(r => `<tr>
+      <td>${r.pid}</td><td>${escHtml(r.role||'\u2014')}</td>
+      <td>${escHtml(r.run_id||'\u2014')}</td>
+      <td>${r.rss_mb}</td><td>${r.age_s}s</td>
+      <td>${r.tracked ? 'tracked' : '<b style="color:#c00">escaped</b>'}</td>
+      <td style="font-family:monospace;font-size:11px">${escHtml(r.cmd||'')}</td>
+    </tr>`).join('');
+  const age = p.ts ? `${(Date.now()/1000 - p.ts).toFixed(0)}s ago` : 'never';
+  area.innerHTML =
+    `<h3>Test processes on ${id}</h3>
+     <div class="note" style="margin-bottom:8px">
+       ${p.n_procs||0} process(es), ${p.rss_mb||0} MB &nbsp;|&nbsp;
+       registry: <code>${escHtml(p.reg_dir||'?')}</code> &nbsp;|&nbsp;
+       reported ${age}
+       <button onclick="refreshProcs()">Refresh all</button>
+       <button onclick="stopAll()">Stop &amp; reap all</button>
+     </div>
+     <table><thead><tr><th>PID</th><th>Role</th><th>Run</th><th>RSS MB</th>
+       <th>Age</th><th>Group</th><th>Command</th></tr></thead>
+     <tbody>${rows || '<tr><td colspan="7">Nothing running.</td></tr>'}</tbody></table>`;
+}
+
+function refreshProcs() {
+  fetch('/api/procs/all?refresh=1').then(r => r.json()).then(d => {
+    Object.entries(d.nodes || {}).forEach(([nid, rep]) => {
+      if (clients[nid]) clients[nid].procs = rep;
+    });
+    renderClientTable();
+    if (_procsPanelFor) showClientProcs(_procsPanelFor);
+    logLine(`[procs] ${d.total} test process(es) across ${Object.keys(d.nodes||{}).length} node(s)`);
+  }).catch(e => logLine(`[procs] error: ${e}`));
 }
 
 // ── Client detail (server only) ───────────────────────────────────────────────
@@ -491,7 +1017,6 @@ function sendDevicePrompt(id) {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-let _allTests = [];
 
 function refreshTests() {
   if (NODE_ROLE !== 'server') return;
@@ -501,29 +1026,71 @@ function refreshTests() {
     if (!_allTests.length) {
       sel.innerHTML = '<option value="">No test scripts found</option>'; return;
     }
-    sel.innerHTML = _allTests.map(t => {
+    const opt = t => {
       const roles = t.roles || [];
       const label = roles.length
         ? `${t.name}  [${roles.map(r => r.role).join(' | ')}]`
-        : t.name;
+        : (TEST_INFO[t.name] || {}).label || t.name;
       return `<option value="${escAttr(t.name)}">${escHtml(label)}</option>`;
-    }).join('');
+    };
+    const groups = { ota: [], sim: [], regression: [], other: [] };
+    for (const t of _allTests)
+      groups[(TEST_INFO[t.name] || {}).group || 'other'].push(t);
+    const og = (label, list) => list.length
+      ? `<optgroup label="${escAttr(label)}">${list.map(opt).join('')}</optgroup>`
+      : '';
+    sel.innerHTML =
+      og('Mesh / OFDM — over the air (real clients)', groups.ota) +
+      og('Mesh — local simulation (this host)',       groups.sim) +
+      og('Regression — offline (this host)',          groups.regression) +
+      og('Other tests',                               groups.other);
     onTestSelect();
   });
 }
+
+let _dashRegSuite = null;
 
 function onTestSelect() {
   const name = document.getElementById('test-select').value;
   const test = _allTests.find(t => t.name === name);
   if (!test) return;
-  const hasRoles = test.roles && test.roles.length > 0;
-  document.getElementById('standalone-section').style.display = hasRoles ? 'none' : '';
-  document.getElementById('roles-section').style.display      = hasRoles ? ''     : 'none';
-  if (hasRoles) { renderRolesTable(test.roles); updateRolesNote(); }
-  else updateTargetCheckboxes();
+  const isSim  = _isSimTest(name);
+  const suite  = _regressionSuite(test);
 
-  // Load param defaults from schema — preserve values user has already typed
-  _loadParamsFromSchema(test.params_schema || []);
+  document.getElementById('test-desc').textContent =
+    (TEST_INFO[name] || {}).desc || '';
+  document.getElementById('mesh-sim-controls').style.display = isSim ? '' : 'none';
+  if (!isSim) {           // drop leftover sim output when switching away
+    document.getElementById('mesh-status').textContent = '';
+    document.getElementById('mesh-roll-link').style.display = 'none';
+    document.getElementById('mesh-suite-results').style.display = 'none';
+  }
+
+  // offline regression suites run right here — no clients/roles/params
+  document.getElementById('regression-run-panel').style.display = suite ? '' : 'none';
+  document.getElementById('params-builder').style.display = suite ? 'none' : '';
+  document.getElementById('dash-reg-labels-wrap').style.display = suite === 'css' ? '' : 'none';
+  document.getElementById('dash-reg-slow-wrap').style.display   = suite === 'css' ? '' : 'none';
+  if (suite) {
+    _dashRegSuite = suite;
+    pollDashRegression(suite);   // picks up a suite already running server-side
+  }
+
+  // sim/regression tests run on this server host — no client/role assignment
+  const hasRoles = !isSim && !suite && test.roles && test.roles.length > 0;
+  document.getElementById('standalone-section').style.display =
+    (isSim || suite || hasRoles) ? 'none' : '';
+  document.getElementById('roles-section').style.display = hasRoles ? '' : 'none';
+  if (hasRoles) { renderRolesTable(test.roles); updateRolesNote(); }
+  else if (!isSim && !suite) updateTargetCheckboxes();
+
+  // Load param defaults from schema — preserve values user has already typed.
+  // For sim tests the dedicated widgets own the sim keys, so keep those out
+  // of the generic table.
+  let schema = test.params_schema || [];
+  if (isSim) schema = schema.filter(p => !SIM_KEYS.includes(p.key));
+  if (!suite) _loadParamsFromSchema(schema);
+  updateRunButton();
 }
 
 function _loadParamsFromSchema(schema) {
@@ -551,6 +1118,8 @@ function _loadParamsFromSchema(schema) {
       conflict: p.conflict || false,
       sources:  p.sources  || [],
       conflict_defaults: p.conflict_defaults || null,
+      choices:  (p.choices && p.choices.length) ? p.choices : null,
+      group:    p.group || null,
     });
 
     if (p.conflict) conflicts.push(p);
@@ -712,7 +1281,33 @@ function _renderParams() {
       'No params \u2014 click \u201c+ Add param\u201d to add.</td></tr>';
     _previewParams(); return;
   }
-  tbody.innerHTML = _paramRows.map(r => {
+  // Params carry an optional "group" tag (see _parse_test_params in app.py,
+  // annotated via "# group: name" next to a PARAMS.get(...) call), so e.g. a
+  // modem test exposing both a CSS and an OFDM PHY shows each block under its
+  // own heading instead of interleaved.
+  //
+  // Rows are collected into contiguous blocks rather than rendered in raw
+  // schema order: the schema follows DECLARATION order in the script, and a
+  // group's params are often not declared together (one knob at the top of the
+  // file, the rest further down), which would otherwise emit the same heading
+  // twice with another group's block between them. Ungrouped params stay first
+  // and keep their order, so manually added rows appear where they always did.
+  const blocks = new Map([[null, []]]);
+  for (const r of _paramRows) {
+    const g = r.group || null;
+    if (!blocks.has(g)) blocks.set(g, []);
+    blocks.get(g).push(r);
+  }
+  let lastGroup;
+  const rowsHtml = [];
+  for (const r of [].concat(...blocks.values())) {
+    if (r.group !== lastGroup) {
+      if (r.group) {
+        rowsHtml.push(`
+        <tr class="param-group-row"><td colspan="4">${escHtml(r.group)}</td></tr>`);
+      }
+      lastGroup = r.group;
+    }
     const conflictBadge = r.conflict
       ? `<span class="conflict-badge" title="Defaults differ: ${escAttr(
           r.conflict_defaults
@@ -723,38 +1318,48 @@ function _renderParams() {
     const sourceTip = r.sources && r.sources.length
       ? ` title="from: ${escAttr(r.sources.join(', '))}"`
       : '';
-    return `
+    rowsHtml.push(`
     <tr class="${r.conflict ? 'param-conflict' : ''}">
-      <td><input type="text" value="${escAttr(r.key)}" style="width:130px"
+      <td><input type="text" value="${escAttr(r.key)}"
                  oninput="updateParamField(${r.id},'key',this.value)"
                  placeholder="param name"${sourceTip}>${conflictBadge}</td>
-      <td><select style="width:82px"
-                  onchange="updateParamField(${r.id},'type',this.value)">
+      <td><select onchange="updateParamField(${r.id},'type',this.value)">
             ${['string','number','boolean','json'].map(t =>
               `<option value="${t}"${r.type===t?' selected':''}>${t}</option>`
             ).join('')}
           </select></td>
       <td>${_valueInput(r)}</td>
       <td><button onclick="removeParam(${r.id})" title="Remove">\u2715</button></td>
-    </tr>`;
-  }).join('');
+    </tr>`);
+  }
+  tbody.innerHTML = rowsHtml.join('');
   _previewParams();
 }
 
 function _valueInput(r) {
   if (r.type === 'boolean') {
     const t = (r.value === true || r.value === 'true');
-    return `<select style="width:78px"
-                    onchange="updateParamField(${r.id},'value',this.value==='true')">
+    return `<select onchange="updateParamField(${r.id},'value',this.value==='true')">
               <option value="true"${t?' selected':''}>true</option>
               <option value="false"${!t?' selected':''}>false</option>
+            </select>`;
+  }
+  if (r.choices && r.choices.length) {
+    // Preset-option param → dropdown. Include the current value as an extra
+    // option if it isn't one of the declared choices (e.g. a custom override).
+    const cur = String(r.value ?? '');
+    const opts = r.choices.map(c => String(c));
+    if (cur !== '' && !opts.includes(cur)) opts.unshift(cur);
+    return `<select onchange="updateParamField(${r.id},'value',this.value)">
+              ${opts.map(o =>
+                `<option value="${escAttr(o)}"${o===cur?' selected':''}>${escHtml(o)}</option>`
+              ).join('')}
             </select>`;
   }
   const v = r.type === 'json'
     ? (typeof r.value === 'string' ? r.value : JSON.stringify(r.value))
     : String(r.value ?? '');
   return `<input type="${r.type==='number'?'number':'text'}" value="${escAttr(v)}"
-                 style="width:198px"
                  oninput="updateParamField(${r.id},'value',this.value)"
                  placeholder="${r.type==='json'?'{}':'value'}">`;
 }
@@ -844,10 +1449,28 @@ function runTest() {
   const test = _allTests.find(t => t.name === testName);
   if (!test) return;
 
+  const suite = _regressionSuite(test);
+  if (suite) { runDashRegression(suite); return; }
+
   const params = _buildParams();
 
   let body;
-  if (test.roles && test.roles.length) {
+  if (_isSimTest(testName)) {
+    // local simulation: dispatch to THIS server node via the roles map
+    // (meshrun_node.py registers as test "meshrun", role "node"); the sim
+    // widgets override any same-named keys typed into the params table
+    const sim = _simParams();
+    body = { test: testName, roles: { node: [NODE_ID] },
+             params: { ...params, ...sim } };
+    document.getElementById('mesh-roll-link').style.display = 'none';
+    document.getElementById('mesh-suite-results').style.display = 'none';
+    document.getElementById('run-test-btn').disabled = true;
+    document.getElementById('mesh-status').textContent =
+      sim.mode === 'daemon' ? 'daemon running… press Stop All to end'
+      : (sim.mode === 'suite' ? 'running scenario suite…'
+                              : 'running… (DSP can take a while)');
+    logLine(`[sim] test=${testName} ${sim.mode}/${sim.tier} on ${NODE_ID} (local)`);
+  } else if (test.roles && test.roles.length) {
     const rolesMap = {};
     document.querySelectorAll('.role-cb:checked').forEach(cb => {
       if (!rolesMap[cb.dataset.role]) rolesMap[cb.dataset.role] = [];
@@ -872,56 +1495,1606 @@ function runTest() {
   }).then(r => r.json()).then(d => {
     document.getElementById('run-status').textContent =
       d.ok ? `run_id: ${d.run_id}` : `error: ${d.error}`;
+    if (!d.ok) document.getElementById('run-test-btn').disabled = false;
     if (d.unreachable?.length)
       logLine(`[warn] unreachable: ${d.unreachable.join(',')}`);
+  }).catch(e => {
+    document.getElementById('run-status').textContent = `error: ${e}`;
+    document.getElementById('run-test-btn').disabled = false;
   });
 }
 
 function stopAll() {
-  if (!confirm('Send stop signal to all clients?')) return;
+  if (!confirm('Stop the run on every node and kill its processes?')) return;
+  const el = document.getElementById('run-status');
+  el.textContent = 'Stopping\u2026 (waiting for every node to confirm)';
   fetch('/api/stop/all', { method: 'POST' }).then(r => r.json()).then(d => {
-    const msg = d.ok
-      ? `Stopped: ${(d.stopped||[]).join(', ') || 'none running'}`
-      : `error: ${d.error}`;
-    document.getElementById('run-status').textContent = msg;
+    if (d.error) { el.textContent = `error: ${d.error}`; return; }
+    // The server now waits for each node to confirm what it actually reaped,
+    // so this line is a result rather than an acknowledgement that a signal
+    // was sent.  Anything listed under "still alive" is a real leftover.
+    const killedHere = d.server?.killed || 0;
+    const parts = [`run ${d.run_id || '*'}`, `server reaped ${killedHere}`];
+    Object.entries(d.nodes || {}).forEach(([nid, r]) => {
+      if (!r.reported) parts.push(`${nid}: NO CONFIRMATION`);
+      else parts.push(`${nid}: reaped ${r.killed}` +
+        ((r.remaining||[]).length ? ` / ${r.remaining.length} STILL ALIVE` : ''));
+    });
+    if ((d.escalated||[]).length) parts.push(`escalated: ${d.escalated.join(', ')}`);
+    const msg = (d.ok ? '\u2713 stopped clean' : '\u26a0 leftovers') +
+                ` \u2014 ${parts.join('; ')} (${d.elapsed_s}s)`;
+    el.textContent = msg;
     logLine(`[stop] ${msg}`);
-  });
+    setTimeout(refreshProcs, 1500);
+  }).catch(e => { el.textContent = `error: ${e}`; logLine(`[stop] error: ${e}`); });
+}
+
+// Kill leftover test processes (this node + every connected client).  Also
+// stops anything currently running — the two are indistinguishable from here.
+function reapAll() {
+  if (!confirm('Kill leftover test processes on all nodes?\n' +
+               'Anything still running will be stopped.')) return;
+  fetch('/api/procs/reap?all=1', { method: 'POST' })
+    .then(r => r.json()).then(d => {
+      const msg = d.ok
+        ? `Reaped ${d.killed} process(es) here` +
+          (d.asked?.length ? `; asked ${d.asked.join(', ')}` : '')
+        : `error: ${d.error}`;
+      document.getElementById('run-status').textContent = msg;
+      logLine(`[reap] ${msg}`);
+    }).catch(e => logLine(`[reap] error: ${e}`));
 }
 
 // ── Results (server only) ─────────────────────────────────────────────────────
-function loadResults() {
-  fetch('/api/results').then(r => r.json()).then(d => {
-    const area = document.getElementById('results-area'); if (!area) return;
-    const runs = d.results || [];
-    if (!runs.length) { area.textContent = 'No results yet.'; return; }
-    area.innerHTML = runs.map(r => {
-      const files = (r.files||[]).join(', ');
-      return `<div style="margin-bottom:10px;border:1px solid #ccc;padding:8px">
-        <b>${r.run_id}</b><br>
-        <span class="note">files: ${escHtml(files)}</span><br>
-        ${r.summary && Object.keys(r.summary).length
-          ? `<pre style="font-size:11px;margin:4px 0">${escHtml(JSON.stringify(r.summary,null,2))}</pre>`
-          : ''}
-      </div>`;
-    }).join('');
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function showTab(name) {
+  const tabs = ['dashboard', 'reports'];
+  tabs.forEach(t => {
+    const panel = document.getElementById('panel-' + t);
+    const btn   = document.getElementById('tab-btn-' + t);
+    if (panel) panel.style.display = (t === name) ? '' : 'none';
+    if (btn) btn.classList.toggle('active', t === name);
+  });
+  localStorage.setItem('activeTab', name);
+  if (name === 'reports' && !reportsLoaded) loadReports();
+}
+
+// ── Reports tab ───────────────────────────────────────────────────────────────
+// Reviewing runs: annotate (verdict + condition labels + note), delete the
+// junk, and promote the keepers into the offline regression suite.
+let reportsData  = [];      // enriched run summaries from /api/results
+let regCases     = [];      // tests/regression/cases.json
+let knownLabels  = [];
+let reportsLoaded = false;
+let openRunId    = null;
+let rptDetailDirty = false;   // open detail has unsaved annotation edits
+const rptSelected = new Set();
+
+const VERDICT_LABEL = {
+  unreviewed: 'unreviewed', valid: 'valid',
+  expected_fail: 'expected fail', bug: 'bug', junk: 'junk',
+};
+
+// escHtml leaves quotes alone, so attribute values need escAttr on top of it
+// (labels and notes are free-form user text).
+function escA(s) { return escAttr(escHtml(s)); }
+
+function fmtBytes(n) {
+  if (!n) return '0';
+  const u = ['B','KB','MB','GB'];
+  let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + u[i];
+}
+
+function rptMsg(txt, isErr) {
+  const el = document.getElementById('rpt-msg'); if (!el) return;
+  el.textContent = txt || '';
+  el.style.color = isErr ? 'red' : '#555';
+  if (txt) setTimeout(() => { if (el.textContent === txt) el.textContent = ''; }, 6000);
+}
+
+function loadReports() {
+  reportsLoaded = true;
+  Promise.all([
+    fetch('/api/results').then(r => r.json()),
+    fetch('/api/report_meta').then(r => r.json()),
+    fetch('/api/regression/cases').then(r => r.json()),
+  ]).then(([res, meta, reg]) => {
+    reportsData = res.results || [];
+    knownLabels = meta.labels || [];
+    regCases    = reg.cases || [];
+    // drop selections for runs that no longer exist
+    [...rptSelected].forEach(id => {
+      if (!reportsData.some(r => r.run_id === id)) rptSelected.delete(id);
+    });
+    const sel = document.getElementById('rpt-f-label');
+    if (sel) {
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">all</option>' +
+        knownLabels.map(l => `<option value="${escA(l)}">${escHtml(l)}</option>`).join('');
+      sel.value = cur;
+    }
+    renderReports();
+    renderRegression();
+    const lm = document.getElementById('label-manager');
+    if (lm && lm.style.display !== 'none') renderLabelManager();
+    pollRegression('css');     // picks up a suite already running server-side
+    pollRegression('ofdm');
+    // Re-render the open detail, unless it holds edits the user hasn't saved
+    // (a background refresh fires whenever a test run finishes).
+    if (openRunId && !rptDetailDirty) openReport(openRunId, true);
+  }).catch(e => rptMsg('load failed: ' + e, true));
+}
+
+function reportFilters() {
+  const g = id => (document.getElementById(id) || {}).value || '';
+  return {
+    verdict: g('rpt-f-verdict'), status: g('rpt-f-status'),
+    label:   g('rpt-f-label'),   reg:    g('rpt-f-reg'),
+    text:    g('rpt-f-text').toLowerCase(),
+  };
+}
+
+function filteredReports() {
+  const f = reportFilters();
+  return reportsData.filter(r => {
+    const a = r.annotation || {};
+    if (f.verdict && (a.verdict || 'unreviewed') !== f.verdict) return false;
+    if (f.status && r.status !== f.status) return false;
+    if (f.label && !(a.labels || []).includes(f.label)) return false;
+    if (f.reg === 'yes' && !a.case_name) return false;
+    if (f.reg === 'no'  &&  a.case_name) return false;
+    if (f.text) {
+      const hay = [r.run_id, r.test, a.note, (a.labels || []).join(' '),
+                   (r.decodes || []).map(d => d.decoded_text).join(' ')]
+                  .join(' ').toLowerCase();
+      if (!hay.includes(f.text)) return false;
+    }
+    return true;
   });
 }
 
+function renderReports() {
+  const tb = document.getElementById('reports-tbody'); if (!tb) return;
+  const rows = filteredReports();
+  const cnt = document.getElementById('tab-reports-count');
+  if (cnt) {
+    const unrev = reportsData.filter(r => (r.annotation||{}).verdict === 'unreviewed').length;
+    cnt.textContent = `(${reportsData.length}${unrev ? ', ' + unrev + ' new' : ''})`;
+  }
+  document.getElementById('rpt-count').textContent =
+    `${rows.length} of ${reportsData.length} run(s) · ${rptSelected.size} selected`;
+
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="12" class="note">No runs match.</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r => {
+    const a  = r.annotation || {};
+    const d  = (r.decodes || [])[0] || {};
+    const txt = (r.decodes || []).map(x => x.decoded_text).filter(Boolean)[0] || '';
+    // The reviewed expectation wins over the sent message: once a run is
+    // annotated, its 'expect' is what the regression suite asserts.
+    const want = (a.expect != null && a.expect !== '') ? a.expect : (r.message || '');
+    const match = want && txt === want;
+    const snr = d.avg_snr_db != null ? d.avg_snr_db.toFixed(1) + 'dB' : '';
+    const labels = (a.labels || []).map(l => `<span class="chip">${escHtml(l)}</span>`).join('');
+    const vd = a.verdict || 'unreviewed';
+    return `<tr class="rpt-row ${openRunId === r.run_id ? 'rpt-open' : ''}"
+                onclick="openReport('${r.run_id}')">
+      <td onclick="event.stopPropagation()">
+        <input type="checkbox" ${rptSelected.has(r.run_id) ? 'checked' : ''}
+               onchange="rptToggleSelect('${r.run_id}', this.checked)"></td>
+      <td><b>${escHtml(r.run_id)}</b></td>
+      <td>${escHtml(r.test || '')}<br>
+          <span class="note">${r.symbol_dur != null ? r.symbol_dur + 's sym' : ''}</span>
+          ${r.ranging ? `<br><span class="note">dist <b>${r.ranging.distance_m.toFixed(2)} m</b></span>`
+            : (r.ranging_ready ? '<br><span class="note">ranging: not analyzed</span>' : '')}
+          ${r.ofdm ? `<br><span class="note">${fmtBps(r.ofdm.avg_link_bps)}${
+              r.ofdm.avg_evm_pct != null ? ' · EVM ' + r.ofdm.avg_evm_pct + '%' : ''
+            }</span>` : ''}</td>
+      <td class="st-${r.status}">${r.status}</td>
+      <td>${want ? `<code>${escHtml(want)}</code>` : '<span class="note">—</span>'}</td>
+      <td>${txt ? `<code>${escHtml(txt)}</code>` : '<span class="note">—</span>'}
+          ${want && txt ? (match ? ' <span class="st-ok">&#x2713;</span>'
+                                 : ' <span class="st-fail">&#x2717;</span>') : ''}
+          ${d.failure_reason ? `<br><span class="note">${escHtml(d.failure_reason)}</span>` : ''}</td>
+      <td>${snr}</td>
+      <td><span class="vd vd-${vd}">${VERDICT_LABEL[vd] || vd}</span></td>
+      <td>${labels}${a.note ? `<br><span class="rpt-note-txt">${escHtml(a.note.slice(0,60))}</span>` : ''}</td>
+      <td>${a.case_name ? '<span class="reg-yes">in suite</span>'
+                        : (r.replayable ? '<span class="note">—</span>'
+                                        : `<span class="note" title="${escA(r.replay_note||'')}">n/a</span>`)}</td>
+      <td class="note">${fmtBytes(r.size_bytes)}</td>
+      <td onclick="event.stopPropagation()">
+        <button onclick="openReport('${r.run_id}')">View</button>
+        <button onclick="rptDelete('${r.run_id}')" style="color:red">&#x2715;</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function rptToggleSelect(runId, on) {
+  if (on) rptSelected.add(runId); else rptSelected.delete(runId);
+  document.getElementById('rpt-count').textContent =
+    `${filteredReports().length} of ${reportsData.length} run(s) · ${rptSelected.size} selected`;
+}
+
+function rptSelectAll(on) {
+  filteredReports().forEach(r => on ? rptSelected.add(r.run_id) : rptSelected.delete(r.run_id));
+  renderReports();
+}
+
+// ── Detail / annotation editor ────────────────────────────────────────────────
+function openReport(runId, keepOpen) {
+  if (openRunId === runId && !keepOpen) {   // toggle closed
+    if (rptDetailDirty && !confirm('Discard unsaved annotation edits?')) return;
+    openRunId = null;
+    rptDetailDirty = false;
+    document.getElementById('report-detail').style.display = 'none';
+    renderReports();
+    return;
+  }
+  openRunId = runId;
+  const box = document.getElementById('report-detail');
+  box.style.display = '';
+  box.innerHTML = '<span class="note">Loading…</span>';
+  fetch('/api/results/' + encodeURIComponent(runId)).then(r => r.json()).then(rep => {
+    if (rep.error) { box.innerHTML = `<span style="color:red">${escHtml(rep.error)}</span>`; return; }
+    box.innerHTML = renderDetail(rep);
+    annRenderLabels();
+    rptDetailDirty = false;
+    const dirty = () => { rptDetailDirty = true; };
+    box.addEventListener('input', dirty);
+    box.addEventListener('change', dirty);
+    renderReports();
+  });
+}
+
+function renderDetail(rep) {
+  const a = rep.annotation || {};
+  const art = f => `/api/results/${encodeURIComponent(rep.run_id)}/artifact/${encodeURIComponent(f)}`;
+  annLabels = [...new Set(a.labels || [])];   // applied labels, editor state
+
+  const decodeRows = (rep.decodes || []).map(d => `<tr>
+      <td>${escHtml(d.client_id || '')}</td>
+      <td class="st-${d.status || 'unknown'}">${escHtml(d.status || '')}</td>
+      <td><code>${escHtml(d.decoded_text || '')}</code></td>
+      <td>${escHtml(d.failure_reason || '')}</td>
+      <td>${d.frames_decoded ?? ''}/${(d.frames_decoded ?? 0) + (d.frames_errored ?? 0)}</td>
+      <td>${d.avg_snr_db != null ? d.avg_snr_db + 'dB' : ''}</td>
+      <td>${d.sync_acquired ? 'yes' : 'no'}${d.sync_score != null ? ' (' + d.sync_score + ')' : ''}</td>
+      <td>${d.peak_rms != null ? d.peak_rms : ''}${d.silence ? ' <b>SILENT</b>' : ''}</td>
+    </tr>`).join('');
+
+  const wavs = (rep.files || []).filter(f => f.endsWith('.wav'));
+  const pngs = rep.spectrographs || [];
+
+  const logs = (rep.logs || []).map(l => `
+    <details style="margin-top:4px">
+      <summary class="note">stdout — ${escHtml(l.client_id || l.file)}</summary>
+      <pre>${escHtml(l.output)}</pre>
+    </details>`).join('');
+
+  return `
+  <div class="row" style="justify-content:space-between">
+    <div><b>${escHtml(rep.run_id)}</b>
+      <span class="note">${escHtml(rep.test || '')} ·
+        started ${escHtml(rep.started_at || '?')} ·
+        ${fmtBytes(rep.size_bytes)}</span>
+      <span class="st-${rep.status}">${rep.status}</span></div>
+    <button onclick="openReport('${rep.run_id}')">&#x2715; Close</button>
+  </div>
+
+  <div class="note" style="margin-bottom:6px">
+    sent: <code>${escHtml(rep.message || '—')}</code> ·
+    symbol_dur ${rep.symbol_dur ?? '?'}s · amplitude ${rep.amplitude ?? '?'} ·
+    roles ${escHtml(JSON.stringify(rep.roles_map || {}))}
+  </div>
+
+  ${renderOfdmBlock(rep)}
+
+  ${renderTrackBlock(rep)}
+
+  ${renderConstellationBlock(rep)}
+
+  ${renderRangingBlock(rep)}
+
+  ${decodeRows ? `<table style="margin-bottom:8px"><thead><tr>
+      <th>Node</th><th>Status</th><th>Decoded</th><th>Failure</th><th>Frames</th>
+      <th>Avg SNR</th><th>Sync</th><th>Peak RMS</th></tr></thead>
+      <tbody>${decodeRows}</tbody></table>`
+    : renderDeliveryBlock(rep)
+    || '<div class="note">No decode sidecar in this run.</div>'}
+
+  <!-- annotation editor -->
+  <div style="border-top:1px solid #ddd;padding-top:8px">
+    <div class="row">
+      <label>Verdict:
+        <select id="ann-verdict">
+          ${['unreviewed','valid','expected_fail','bug','junk'].map(v =>
+            `<option value="${v}" ${(a.verdict||'unreviewed') === v ? 'selected' : ''}>
+               ${VERDICT_LABEL[v]}</option>`).join('')}
+        </select>
+      </label>
+      <label>Expected text:
+        <input type="text" id="ann-expect" style="width:150px"
+               value="${escA(a.expect != null ? a.expect : (rep.suggested_expect || ''))}">
+      </label>
+      <span class="note">used as the regression assertion</span>
+    </div>
+    <div style="margin:6px 0">
+      <div id="ann-labels"></div>
+      <div class="row" style="margin-top:4px">
+        <input type="text" id="ann-new-label" placeholder="new label" style="width:130px"
+               onkeydown="if (event.key === 'Enter') { event.preventDefault(); annAddLabel(); }">
+        <button onclick="annAddLabel()">+ Add label</button>
+      </div>
+    </div>
+    <div class="row">
+      <textarea id="ann-note" rows="2" style="width:420px"
+                placeholder="notes — conditions, what this run proves">${escHtml(a.note || '')}</textarea>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button onclick="annSave('${rep.run_id}')">&#x1F4BE; Save annotation</button>
+      ${a.case_name
+        ? `<button onclick="annUnpromote('${rep.run_id}')">&#x2212; Remove from regression suite</button>
+           <span class="note">case <code>${escHtml(a.case_name)}</code></span>`
+        : (rep.replayable
+            ? `<button onclick="annPromote('${rep.run_id}')">&#x2795; Add to regression suite</button>`
+            : `<button disabled title="${escA(rep.replay_note || '')}">&#x2795; Add to regression suite</button>
+               <span class="note">not replayable: ${escHtml(rep.replay_note || '')}</span>`)}
+      <button onclick="rptDelete('${rep.run_id}')" style="color:red;margin-left:20px">
+        &#x2715; Delete run</button>
+    </div>
+  </div>
+
+  <!-- artifacts -->
+  <div style="border-top:1px solid #ddd;margin-top:8px;padding-top:6px">
+    ${pngs.map(p => `<div><a href="${art(p)}" target="_blank">${escHtml(p)}</a><br>
+        <img src="${art(p)}" style="max-width:100%;border:1px solid #ccc"></div>`).join('')}
+    ${wavs.map(w => `<div class="row"><span class="note">${escHtml(w)}</span>
+        <audio controls preload="none" src="${art(w)}" style="height:24px"></audio>
+        <a href="${art(w)}" download>download</a></div>`).join('')}
+    <details style="margin-top:4px">
+      <summary class="note">all files (${(rep.files || []).length})</summary>
+      <div class="note">${(rep.files || []).map(f =>
+        `<a href="${art(f)}" target="_blank">${escHtml(f)}</a>`).join(' · ')}</div>
+    </details>
+    ${logs}
+  </div>`;
+}
+
+// ── Label editing ─────────────────────────────────────────────────────────────
+// Nothing is applied by default: a run carries only the labels the user adds.
+// annLabels is the applied set for the open editor; the "existing" row offers
+// labels already used elsewhere as a one-click add.  Handlers index into the
+// arrays rather than embedding label text in markup, so labels containing
+// quotes or backslashes can't break out of an attribute.
+let annLabels = [];      // applied on the run being edited
+let annAvail  = [];      // known labels not currently applied
+
+function annRenderLabels() {
+  const box = document.getElementById('ann-labels');
+  if (!box) return;
+  annAvail = knownLabels.filter(l => !annLabels.includes(l));
+
+  const applied = annLabels.length
+    ? annLabels.map((l, i) =>
+        `<span class="chip">${escHtml(l)}<span class="chip-x" title="remove label"
+           onclick="annRemoveLabel(${i})">&#x2715;</span></span>`).join('')
+    : '<span class="note">none — add one below</span>';
+
+  const avail = annAvail.length
+    ? `<div class="note" style="margin-top:4px">add existing: ` +
+      annAvail.map((l, i) =>
+        `<span class="chip chip-pick" title="apply this label"
+               onclick="annApplyLabel(${i})">+ ${escHtml(l)}</span>`).join('') + `</div>`
+    : '';
+
+  box.innerHTML = `<div class="note" style="margin-bottom:2px">Labels:</div>
+                   <div>${applied}</div>${avail}`;
+}
+
+function annRemoveLabel(i) {
+  annLabels.splice(i, 1);
+  rptDetailDirty = true;
+  annRenderLabels();
+}
+
+function annApplyLabel(i) {
+  const l = annAvail[i];
+  if (l && !annLabels.includes(l)) annLabels.push(l);
+  rptDetailDirty = true;
+  annRenderLabels();
+}
+
+// ── Two-way ranging ───────────────────────────────────────────────────────────
+// css_ranging only records each node's capture — distance is recovered by the
+// post-hoc analyzer, so the run dir has no distance until it is run.
+// ── OFDM block: BAT chart (audio freq vs SNR) + run-average link rate / EVM ──
+//
+// Bar per subcarrier: height = measured SNR, colour = bits the allocator gave
+// it. That pairing is the point — it shows at a glance WHY the table looks the
+// way it does (a dead top octave, a notch from room multipath), which a bare
+// carrier-index plot hides.
+const BAT_COLORS = {0:'#c9ced6', 1:'#6da8e0', 2:'#2f7fd0', 4:'#1f9d55', 6:'#8e44ad'};
+const BAT_NAMES  = {0:'off', 1:'BPSK', 2:'QPSK', 4:'16-QAM', 6:'64-QAM'};
+
+function fmtBps(b) {
+  if (b == null) return '—';
+  return b >= 1000 ? (b / 1000).toFixed(2) + ' kbps' : Math.round(b) + ' bps';
+}
+
+function renderBatChart(spec) {
+  const f = spec.freq_hz || [], s = spec.snr_db || [], bits = spec.bits || [];
+  if (!f.length) return '';
+  const W = 620, H = 150, PL = 42, PB = 28, PT = 6;
+  const plotW = W - PL - 8, plotH = H - PB - PT;
+  // Clamp the SNR floor at 0 dB: negative excursions on dead carriers would
+  // otherwise squash the whole useful range into the top third.
+  const lo = 0, hi = Math.max(6, Math.ceil(Math.max(...s) / 6) * 6);
+  const x = i => PL + (i + 0.5) * (plotW / f.length);
+  const y = v => PT + plotH * (1 - (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo));
+  const bw = Math.max(1, plotW / f.length - 0.5);
+
+  const bars = f.map((fr, i) => {
+    const b = bits[i], v = s[i] ?? 0;
+    const col = b === -1 ? '#f0c419' : (BAT_COLORS[b] ?? '#c9ced6');
+    const yy = y(v);
+    return `<rect x="${(x(i) - bw / 2).toFixed(1)}" y="${yy.toFixed(1)}"
+      width="${bw.toFixed(1)}" height="${(PT + plotH - yy).toFixed(1)}"
+      fill="${col}"><title>${fr} Hz · ${v} dB · ${
+        b === -1 ? 'pilot' : (BAT_NAMES[b] ?? b + 'b')}</title></rect>`;
+  }).join('');
+
+  // y gridlines every 6 dB, x labels every ~1 kHz
+  let grid = '';
+  for (let v = lo; v <= hi; v += 6) {
+    grid += `<line x1="${PL}" x2="${W - 8}" y1="${y(v)}" y2="${y(v)}"
+              stroke="#e3e6ea" stroke-width="1"/>
+             <text x="${PL - 5}" y="${y(v) + 3}" text-anchor="end"
+              font-size="9" fill="#666">${v}</text>`;
+  }
+  let xlab = '';
+  const step = Math.max(1000, Math.ceil((f[f.length - 1] - f[0]) / 6 / 1000) * 1000);
+  for (let hz = Math.ceil(f[0] / step) * step; hz <= f[f.length - 1]; hz += step) {
+    let i = 0; while (i < f.length - 1 && f[i] < hz) i++;
+    xlab += `<line x1="${x(i)}" x2="${x(i)}" y1="${PT + plotH}" y2="${PT + plotH + 3}"
+              stroke="#999"/>
+             <text x="${x(i)}" y="${PT + plotH + 13}" text-anchor="middle"
+              font-size="9" fill="#666">${(hz / 1000)}k</text>`;
+  }
+
+  const active = bits.filter(b => b > 0).length;
+  return `
+  <div style="margin-top:6px">
+    <div class="note"><b>${escHtml(spec.label || '')}</b> ·
+      ${f.length} subcarriers · ${active} active ·
+      ${f[0]}–${f[f.length - 1]} Hz</div>
+    <svg width="${W}" height="${H}" style="background:#fff;border:1px solid #ddd">
+      ${grid}${bars}${xlab}
+      <text x="10" y="${PT + plotH / 2}" font-size="9" fill="#666"
+            transform="rotate(-90 10 ${PT + plotH / 2})" text-anchor="middle">SNR dB</text>
+    </svg>
+  </div>`;
+}
+
+// ── Payload delivery (mesh runs) ─────────────────────────────────────────────
+//
+// A mesh run produces no decode sidecar, so the report used to fall through to
+// "No decode sidecar in this run" even when the message had been carried end to
+// end and acknowledged — which reads as if only the handshake ever ran. The
+// node records hold the truth: `data_delivered` on the receiver, `data_ack` on
+// the sender.
+function renderDeliveryBlock(rep) {
+  const rows = rep.delivery || [];
+  if (!rows.length) return '';
+  const body = rows.map(r => {
+    const texts = Object.entries(r.received || {});
+    const what = texts.length
+      ? texts.map(([src, t]) =>
+          `<div>from <b>${escHtml(src)}</b>: <code>${escHtml(t)}</code></div>`).join('')
+      : '<span class="note">—</span>';
+    const role = r.sends_to != null
+      ? `sender &rarr; ${escHtml(String(r.sends_to))}`
+      : (r.expects || []).length ? 'receiver' : '<span class="note">idle</span>';
+    // Blank, not "no", when this node sent nothing — see _mesh_delivery.
+    const acks = Object.entries(r.acked || {})
+      .map(([p, v]) => `${escHtml(p)}:${v ? 'yes' : 'no'}`).join(' ')
+      || '<span class="note">n/a</span>';
+    let verdict = r.ok
+      ? '<b style="color:#2a6">delivered</b>'
+      : '<b style="color:#d64545">not delivered</b>';
+    if (r.missing && r.missing.length)
+      verdict += `<div class="note">nothing from ${escHtml(r.missing.join(', '))}</div>`;
+    if (r.mismatched && r.mismatched.length)
+      verdict += `<div class="note">payload differs from what was sent</div>`;
+    return `<tr>
+        <td>${escHtml(r.client_id)}</td>
+        <td>${role}</td>
+        <td>${what}</td>
+        <td>${acks}</td>
+        <td>${verdict}</td>
+      </tr>`;
+  }).join('');
+  return `<table style="margin-bottom:8px"><thead><tr>
+      <th>Node</th><th>Role</th><th>Payload received</th>
+      <th title="Did the sender get its DATA acknowledged">ACKed</th>
+      <th>Delivery</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function renderOfdmBlock(rep) {
+  const o = rep.ofdm;
+  if (!o) return '';
+  const legend = [1, 2, 4, 6, 0].map(b =>
+    `<span style="margin-right:8px"><span style="display:inline-block;width:9px;
+      height:9px;background:${BAT_COLORS[b]}"></span> ${BAT_NAMES[b]}</span>`).join('') +
+    `<span><span style="display:inline-block;width:9px;height:9px;
+      background:#f0c419"></span> pilot</span>`;
+
+  // `status` is the test script's exit, so it reads "ok" even for a node whose
+  // handshake failed and dropped to a fallback PHY. Show the PHY that was
+  // actually used next to it, and say so in words when there is no BAT chart
+  // to look at -- otherwise the only evidence is a chart that isn't there.
+  const rows = (o.nodes || []).map(n => `<tr>
+      <td>${escHtml(n.client_id || '')}${
+        n.phy_used && n.phy_used !== 'ofdm'
+          ? `<div style="color:#a00;font-size:11px">PHY: ${escHtml(n.phy_used)}</div>`
+          : ''}${
+        n.hs_note ? `<div style="color:#a00;font-size:11px">${escHtml(n.hs_note)}</div>`
+                  : ''}</td>
+      <td>${escHtml(n.role || '')}</td>
+      <td class="st-${n.status || 'unknown'}">${escHtml(n.status || '')}</td>
+      <td>${n.band_hz ? n.band_hz[0] + '–' + n.band_hz[1] + ' Hz' : '—'}</td>
+      <td>${n.n_active != null ? n.n_active : '—'}${
+            n.n_carriers != null ? ' / ' + n.n_carriers : ''}</td>
+      <td>${(n.link_bps || []).map(fmtBps).join(', ') || '—'}</td>
+      <td>${n.evm_pct != null ? n.evm_pct + '%' : '—'}</td>
+      <td>${n.bat_evm_pct != null ? n.bat_evm_pct + '%' : '—'}</td>
+      <td>${n.isi_ceiling_db != null ? n.isi_ceiling_db + ' dB' : '—'}</td>
+    </tr>`).join('');
+
+  // Reverberation ceiling vs what the probe claimed.  These two numbers next to
+  // each other are the point: a periodic probe absorbs late reflections into H
+  // and grades a live room as clean, so a link can be negotiated at 25 dB and
+  // delivered at 6.  Only runs recorded after the ISI measurement have it.
+  // Why frames are missing, from the PREAMBLE count -- never from err_counts.
+  // A frame that fails ECC returns no stat at all (ofdm_modem._decode_frame
+  // returns None), so "no RS errors recorded" does NOT mean "never heard"; it
+  // usually means the opposite, that the frames arrived and were too noisy to
+  // decode. frames_acquired counts SC preambles independently, which is the
+  // only thing that actually separates the two.
+  const fmtWhyMissing = (x) => {
+    const acq = x.frames_acquired, sent = x.frames_expected, got = x.frames_decoded;
+    if (acq == null || acq < 0 || sent == null) return '';
+    if (acq >= sent) return ` — arrived but failed ECC (too noisy, not missing)`;
+    if (acq > (got || 0)) return ` — ${acq} preamble(s) for ${sent} sent: part noise, part lost sync`;
+    return ` — never acquired (${acq} preamble(s) for ${sent} sent)`;
+  };
+
+  // Payload exchange. Every other number on this page is CAPACITY inferred
+  // from a probe; this is bytes that actually arrived, checked by checksum.
+  // A link can grade well and still deliver nothing, and that gap is the
+  // whole point of showing them next to each other.
+  const xfer = o.data_xfer || [];
+  const xferBlock = !xfer.length ? '' : `
+    <div style="margin:6px 0">
+      <b>Payload exchange</b>
+      <span class="note">— real bytes over the measured link, verified by
+        checksum (not a probe estimate)</span>
+      <table style="margin:4px 0"><thead><tr>
+        <th>Node</th><th>Sent</th><th>Received</th><th>Size</th>
+        <th>Frames</th><th>EVM</th><th>Result</th>
+        </tr></thead><tbody>
+      ${xfer.map(x => {
+        const sent = x.expected_sum16 || (x.rx_skipped_by_peer ? '—' : '?');
+        const got  = x.rx_sum16 || '—';
+        const kb   = x.expected_bytes != null
+                   ? (x.expected_bytes / 1024).toFixed(1) + ' KB' : '—';
+        const res  = x.ok ? '<span class="st-ok">MATCH</span>'
+                   : x.rx_skipped_by_peer
+                     ? `<span class="st-partial">peer sent nothing (${escHtml(x.rx_skipped_by_peer)})</span>`
+                   : `<span class="st-fail">MISMATCH</span>`;
+        return `<tr>
+          <td>${escHtml(x.node || '')} <span class="note">rx ${escHtml(x.rx_dir || '')}</span>${
+            x.tx_skipped ? `<div class="note" style="color:#b85c00">tx ${escHtml(x.tx_dir||'')} skipped: empty BAT</div>` : ''}</td>
+          <td><code style="font-size:11px">${escHtml(sent)}</code></td>
+          <td><code style="font-size:11px">${escHtml(got)}</code></td>
+          <td>${kb}</td>
+          <td>${x.frames_decoded != null ? x.frames_decoded : '—'}${
+              x.frames_expected != null ? ' / ' + x.frames_expected : ''}${
+              x.missing_frames && x.missing_frames.length
+                ? `<div class="note" style="color:#b85c00">missing seq ${
+                    x.missing_frames.join(',')}${fmtWhyMissing(x)}</div>`
+                : ''}</td>
+          <td>${x.evm_pct != null ? x.evm_pct + '%' : '—'}</td>
+          <td>${res}</td></tr>`;
+      }).join('')}
+      </tbody></table>
+    </div>`;
+
+  const isiLine = o.isi_ceiling_db == null ? '' : `
+    <div style="margin:4px 0">
+      reverberation ceiling <b>${o.isi_ceiling_db} dB</b>
+      <span class="note">— energy arriving after the cyclic prefix caps SINR
+        here no matter the level, gain or distance${
+        o.isi_applied ? '; the allocator was told about it (isi_derate on)'
+                      : '; NOT applied to the allocation — set isi_derate=1'}
+      </span>
+      <div class="note">${o.isi.map(x =>
+        `${escHtml(x.label)}: ceiling ${x.ceiling_db} dB (beta ${x.ratio})${
+          x.snr_median_db != null ? `, probe graded ${x.snr_median_db} dB` : ''}`
+        ).join('<br>')}</div>
+    </div>`;
+
+  // Server-rendered PNG, one per direction, at least 1200px wide so every
+  // carrier gets its own column -- click through for the full-size image.
+  // renderBatChart (inline SVG) stays as the fallback for runs whose charts
+  // predate the PNG, or if PIL is unavailable on the server.
+  const bart = f => `/api/results/${encodeURIComponent(rep.run_id)}/artifact/${encodeURIComponent(f)}`;
+  const charts = (o.spectra || []).map(s => s.png
+    ? `<div style="margin-top:6px">
+         <a href="${bart(s.png)}" target="_blank" title="open full size"
+           ><img src="${bart(s.png)}" style="max-width:100%;border:1px solid #ddd"
+             ></a>
+       </div>`
+    : renderBatChart(s)).join('');
+
+  // A node with no spectrum draws no chart, and a chart that is simply absent
+  // is invisible next to the ones that rendered. Name it.
+  const noSpec = (o.nodes || []).filter(n => n.hs_note);
+  const missingSpec = !noSpec.length ? '' : `
+    <div style="border-left:3px solid #a00;background:#fff4f4;padding:4px 8px;margin:6px 0">
+      ${noSpec.map(n => `<div><b>${escHtml(n.client_id)}</b> has no BAT chart —
+        ${escHtml(n.hs_note)}</div>`).join('')}
+      <div class="note">A node that never completed its handshake has no probe
+        spectrum to plot, so the missing chart is the symptom, not a reporting
+        gap.</div>
+    </div>`;
+
+  return `
+  <div style="border:1px solid #999;background:#f6fbf6;padding:8px;margin-bottom:8px">
+    <b>OFDM link</b>
+    <div style="font-size:15px;margin:4px 0">
+      avg link rate <b>${fmtBps(o.avg_link_bps)}</b>
+      ${o.n_links > 1 ? `<span class="note">(${o.n_links} directions,
+         ${fmtBps(o.min_link_bps)}–${fmtBps(o.max_link_bps)})</span>` : ''}
+      &nbsp;·&nbsp; avg EVM
+      <b>${o.avg_evm_pct != null ? o.avg_evm_pct + '%' : '—'}</b>
+      ${o.avg_evm_pct_1pass != null ? `<span class="note" title="EVM before the
+         demod's second, data-aided channel estimate — the difference is
+         channel-ESTIMATE noise, not channel">(was ${o.avg_evm_pct_1pass}%
+         on the one-shot estimate)</span>` : ''}
+      ${o.n_evm_samples ? `<span class="note">(${o.n_evm_samples} data frames)</span>`
+                        : '<span class="note">(no data phase in this test)</span>'}
+      ${o.avg_bat_evm_pct != null ? `&nbsp;·&nbsp; BAT-exchange EVM
+        <b>${o.avg_bat_evm_pct}%</b> <span class="note">(${o.n_bat_evm_samples}
+        RobustLink frame${o.n_bat_evm_samples === 1 ? '' : 's'})</span>` : ''}
+    </div>
+    ${isiLine}
+    ${xferBlock}
+    <table style="margin:6px 0"><thead><tr>
+      <th>Node</th><th>Role</th><th>Status</th><th>Band</th>
+      <th>Active</th><th>Link rate</th><th>EVM</th>
+      <th title="RobustLink back-channel that carries the BAT">BAT EVM</th>
+      <th title="SINR ceiling from reverberation arriving after the cyclic
+        prefix; the probe cannot see this">ISI ceiling</th>
+      </tr></thead>
+      <tbody>${rows}</tbody></table>
+    ${missingSpec}
+    ${charts ? `<div class="note" style="margin-top:4px">
+        Bit allocation vs measured SNR — ${legend}</div>${charts}`
+      : `<div class="note">No per-carrier spectrum in this run (predates the
+           BAT chart, or the probe never validated).</div>`}
+  </div>`;
+}
+
+// ── Time tracks: S/N vs time, input level + clipping headroom vs time ────────
+//
+// The BAT chart above is frequency-domain and the EVM figure is a run average;
+// neither says WHEN the link was good.  A high-EVM run has two very different
+// causes that these charts separate at a glance: a low S/N trace (channel /
+// distance / volume too low) versus a level trace pinned at 0 dBFS (input gain
+// too hot, so dense constellations smear on ADC saturation while the robust
+// 5s probe still reports a healthy SNR).
+//
+// Derived server-side from the run's capture WAV, so runs recorded before these
+// charts existed get them too.
+
+const TRK_W = 620, TRK_PL = 44, TRK_PR = 10;
+
+// Peak level colouring shares one scale everywhere: red = clipping/at risk,
+// amber = hot but usable, green = comfortable, grey = below the useful floor.
+function trkLevelColor(dbfs) {
+  if (dbfs >= -1) return '#d64545';
+  if (dbfs >= -6) return '#e0a020';
+  if (dbfs >= -50) return '#1f9d55';
+  return '#9aa3ad';
+}
+function trkEvmColor(evm) {
+  if (evm == null) return '#6da8e0';
+  if (evm >= 40) return '#d64545';
+  if (evm >= 20) return '#e0a020';
+  return '#1f9d55';
+}
+
+// Decimate to at most `n` points, keeping the WORST sample of each bucket
+// (`pick` = Math.max for levels/SNR).  Averaging would hide exactly the
+// single-window clip spike these charts exist to surface.
+function trkThin(t, v, n, pick) {
+  if (t.length <= n) return [t, v];
+  const step = Math.ceil(t.length / n), to = [], vo = [];
+  for (let i = 0; i < t.length; i += step) {
+    let best = v[i], bt = t[i];
+    for (let j = i + 1; j < Math.min(i + step, t.length); j++) {
+      if (pick(v[j], best) === v[j] && v[j] !== best) { best = v[j]; bt = t[j]; }
+    }
+    to.push(bt); vo.push(best);
+  }
+  return [to, vo];
+}
+
+function trkAxes(x, y, t0, t1, lo, hi, dy, plotH, unit) {
+  let g = '';
+  for (let v = lo; v <= hi + 1e-9; v += dy) {
+    g += `<line x1="${TRK_PL}" x2="${TRK_W - TRK_PR}" y1="${y(v).toFixed(1)}"
+           y2="${y(v).toFixed(1)}" stroke="#e3e6ea"/>
+          <text x="${TRK_PL - 5}" y="${(y(v) + 3).toFixed(1)}" text-anchor="end"
+           font-size="9" fill="#666">${v}</text>`;
+  }
+  // ~6 time ticks on a round number of seconds
+  const span = Math.max(1, t1 - t0);
+  const raw = span / 6;
+  const step = [1, 2, 5, 10, 15, 30, 60, 120, 300].find(s => s >= raw) || 600;
+  for (let s = Math.ceil(t0 / step) * step; s <= t1; s += step) {
+    g += `<line x1="${x(s).toFixed(1)}" x2="${x(s).toFixed(1)}" y1="${plotH}"
+           y2="${plotH + 3}" stroke="#999"/>
+          <text x="${x(s).toFixed(1)}" y="${plotH + 13}" text-anchor="middle"
+           font-size="9" fill="#666">${s}s</text>`;
+  }
+  g += `<text x="${TRK_W - TRK_PR}" y="${plotH + 13}" text-anchor="end"
+         font-size="9" fill="#888">${unit}</text>`;
+  return g;
+}
+
+// Frame markers along the bottom of a chart: where the modem actually had a
+// packet on the air.  RX frames carry their EVM, so a bad frame can be read
+// straight off the level/SNR trace underneath it.
+function trkFrameMarks(frames, x, plotH) {
+  return (frames || []).map(f => {
+    const px = x(f.t);
+    // A node's clock starts a beat before/after its capture does, so a frame
+    // near either end can land just outside the plot: drop it rather than
+    // draw a tick on the axis label.
+    if (px < TRK_PL - 2 || px > TRK_W - TRK_PR + 2) return '';
+    const isRx = f.dir === 'rx';
+    const col = isRx ? trkEvmColor(f.evm_pct) : '#b9c0c8';
+    const yy = plotH - (isRx ? 9 : 4);
+    return `<rect x="${(px - 1.5).toFixed(1)}" y="${yy.toFixed(1)}"
+      width="3" height="${isRx ? 9 : 4}" fill="${col}"><title>t=${f.t}s ${
+      f.dir.toUpperCase()} ${f.type || ''}${
+      f.evm_pct != null ? ' · EVM ' + f.evm_pct + '%' : ''}${
+      f.peak != null ? ' · peak ' + f.peak : ''}</title></rect>`;
+  }).join('');
+}
+
+function renderSnrTrack(tr, node) {
+  const t = tr.t || [], s = tr.snr_db || [];
+  if (!t.length) return '';
+  const H = 140, plotH = H - 26, PT = 6;
+  const t1 = t[t.length - 1];
+  const hi = Math.max(12, Math.ceil(Math.max(...s) / 6) * 6);
+  const x = v => TRK_PL + (v / Math.max(t1, 1e-9)) * (TRK_W - TRK_PL - TRK_PR);
+  const y = v => PT + (plotH - PT) * (1 - Math.max(0, Math.min(hi, v)) / hi);
+  const [tt, ss] = trkThin(t, s, 900, Math.max);
+  const pts = tt.map((v, i) => `${x(v).toFixed(1)},${y(ss[i]).toFixed(1)}`).join(' ');
+
+  // What the negotiator thought the channel was worth, for comparison: the
+  // handshake probe is one 5s average, and a run whose trace spends most of
+  // its time well below that line was negotiated on a lucky moment.
+  const refs = (node.probe_snr || []).map(p => `
+    <line x1="${TRK_PL}" x2="${TRK_W - TRK_PR}" y1="${y(p.snr_db)}"
+      y2="${y(p.snr_db)}" stroke="#8e44ad" stroke-width="1"
+      stroke-dasharray="5,3"><title>${escHtml(p.label)} median ${p.snr_db} dB</title></line>
+    <text x="${TRK_W - TRK_PR - 2}" y="${y(p.snr_db) - 3}" text-anchor="end"
+      font-size="9" fill="#8e44ad">${escHtml(p.label)} ${p.snr_db} dB</text>`).join('');
+
+  return `<svg width="${TRK_W}" height="${H}" style="background:#fff;border:1px solid #ddd">
+    ${trkAxes(x, y, 0, t1, 0, hi, 6, plotH, 'dB')}
+    <polyline points="${pts}" fill="none" stroke="#2f7fd0" stroke-width="1.2"/>
+    ${refs}${trkFrameMarks(node.frames, x, plotH)}
+  </svg>`;
+}
+
+function renderLevelTrack(tr, node) {
+  const t = tr.t || [], pk = tr.peak_dbfs || [], rm = tr.rms_dbfs || [];
+  const cp = tr.clip_pct || [];
+  if (!t.length) return '';
+  const H = 160, plotH = H - 26, PT = 6;
+  const t1 = t[t.length - 1];
+  // -72 rather than a rounder -80 so the 12 dB gridlines land ON 0 dBFS: the
+  // clip line is the one gridline that has to be labelled.
+  const lo = -72, hi = 0;
+  const x = v => TRK_PL + (v / Math.max(t1, 1e-9)) * (TRK_W - TRK_PL - TRK_PR);
+  const y = v => PT + (plotH - PT) * (1 - (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo));
+  const [tp, pp] = trkThin(t, pk, 900, Math.max);
+  const [tr2, rr] = trkThin(t, rm, 900, Math.max);
+  const line = (ta, va, col, w) =>
+    `<polyline points="${ta.map((v, i) => `${x(v).toFixed(1)},${y(va[i]).toFixed(1)}`)
+      .join(' ')}" fill="none" stroke="${col}" stroke-width="${w}"/>`;
+
+  // The two bands that matter: 0 to -1 dBFS is where samples clip, -1 to -6 is
+  // hot enough that a louder frame will.
+  const bands = `
+    <rect x="${TRK_PL}" y="${y(0)}" width="${TRK_W - TRK_PL - TRK_PR}"
+      height="${(y(-1) - y(0)).toFixed(1)}" fill="#f7d7d7"/>
+    <rect x="${TRK_PL}" y="${y(-1)}" width="${TRK_W - TRK_PL - TRK_PR}"
+      height="${(y(-6) - y(-1)).toFixed(1)}" fill="#fbf0d5"/>`;
+
+  // Windows containing actually-clipped samples, split by CAUSE — the three
+  // look identical in a peak trace and need completely different responses:
+  //   own TX (grey)   the node hearing its own speaker; ignore
+  //   impulse (amber) a door/knock; costs the frames it lands on, not a setting
+  //   sustained (red) genuinely over-driven input; lower the gain
+  const imp = tr.clip_impulse || [];
+  const txw = node.tx_windows || [];
+  const ownFlag = tr.clip_own_tx || [];
+  const inOwnTx = (v, i) => (ownFlag.length ? !!ownFlag[i]
+    : txw.some(w => v >= w.t - 0.3 && v <= w.t + (w.dur_s || 0) + 0.3));
+  const clips = t.map((v, i) => {
+    if (!(cp[i] > 0)) return '';
+    const own = inOwnTx(v, i);
+    const col = own ? '#9aa3ad' : (imp[i] ? '#e0a020' : '#d64545');
+    const why = own ? 'own transmission — not an input-level problem'
+                    : (imp[i] ? 'impulse-shaped (ambient bang)'
+                              : 'sustained — input really is too hot');
+    return `<circle cx="${x(v).toFixed(1)}" cy="${y(pk[i]).toFixed(1)}"
+        r="${own ? 2 : 2.5}" fill="${col}"${own ? ' fill-opacity="0.6"' : ''}
+        ><title>t=${v}s · ${cp[i]}% of samples at full scale · peak ${
+        pk[i]} dBFS · crest ${(tr.crest_db || [])[i]} dB · ${why}</title></circle>`;
+  }).join('');
+
+  // Own-TX spans as a faint band, so self-coupling is visible as a cause.
+  const txBands = txw.map(w => {
+    const x0 = x(Math.max(0, w.t)), x1 = x(Math.min(t1, w.t + (w.dur_s || 0)));
+    if (!(x1 > x0)) return '';
+    return `<rect x="${x0.toFixed(1)}" y="${PT}" width="${(x1 - x0).toFixed(1)}"
+      height="${(plotH - PT).toFixed(1)}" fill="#9aa3ad" fill-opacity="0.13"
+      ><title>own TX: ${escHtml(w.what || '')} (${w.dur_s}s)</title></rect>`;
+  }).join('');
+
+  // Node-reported ambient floor, for cross-checking the derived trace against
+  // what the node's own carrier-sense calibration measured.
+  const amb = node.amb_rms > 0 ? 20 * Math.log10(node.amb_rms) : null;
+  const ambLine = amb != null && amb > lo ? `
+    <line x1="${TRK_PL}" x2="${TRK_W - TRK_PR}" y1="${y(amb)}" y2="${y(amb)}"
+      stroke="#9aa3ad" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="${TRK_PL + 3}" y="${y(amb) - 3}" font-size="9" fill="#888">
+      ambient ${amb.toFixed(1)} dBFS</text>` : '';
+
+  return `<svg width="${TRK_W}" height="${H}" style="background:#fff;border:1px solid #ddd">
+    ${bands}${txBands}${trkAxes(x, y, 0, t1, lo, hi, 12, plotH, 'dBFS')}
+    ${line(tr2, rr, '#1f9d55', 1)}${line(tp, pp, '#2f7fd0', 1.2)}
+    ${ambLine}${clips}${trkFrameMarks(node.frames, x, plotH)}
+  </svg>`;
+}
+
+function renderTrackBlock(rep) {
+  const tracks = rep.tracks || [];
+  const g = rep.tx_gain || {};
+  const txAmp = g.ofdm_amplitude != null ? g.ofdm_amplitude : g.amplitude;
+  const txNote = txAmp > 0
+    ? `TX amplitude ${txAmp} (${(20 * Math.log10(txAmp)).toFixed(1)} dBFS out)${
+        Object.keys(g.amp_map || {}).length
+          ? ' · per-node amp_map ' + escHtml(JSON.stringify(g.amp_map)) : ''}`
+    : 'TX amplitude not recorded';
+
+  if (!tracks.length) {
+    return `<div style="border:1px solid #999;background:#fbfbf6;padding:8px;
+      margin-bottom:8px"><b>Level &amp; S/N over time</b>
+      <div class="note">No capture WAV in this run, so no time tracks — the
+        charts are derived from the recorded audio. Tests that only upload
+        result JSON (e.g. ofdmhs) have nothing to analyse.</div>
+      <div class="note">${txNote}</div></div>`;
+  }
+
+  const body = tracks.map(n => {
+    const tr = n.track || {};
+    if (tr.error || !(tr.t || []).length) {
+      return `<div class="note" style="margin-top:6px"><b>${escHtml(n.client_id)}</b>
+        — capture not analysable: ${escHtml(tr.error || 'no windows')}</div>`;
+    }
+    const s = tr.summary || {};
+    const hot = s.headroom_db != null && s.headroom_db <= 1;
+    const warm = !hot && s.headroom_db != null && s.headroom_db <= 6;
+    const chip = (txt, bad) => `<span class="chip" style="background:${
+      bad === 2 ? '#f7d7d7' : bad === 1 ? '#fbf0d5' : '#eef1f4'}">${txt}</span>`;
+
+    return `
+    <div style="margin-top:10px;border-top:1px solid #e3e6ea;padding-top:6px">
+      <div><b>${escHtml(n.client_id)}</b>
+        <span class="note">${escHtml(n.role || '')} · ${escHtml(n.file)} ·
+          ${tr.seconds}s · in-band ${tr.band_hz[0]}–${tr.band_hz[1]} Hz</span></div>
+      <div style="margin:4px 0">
+        ${chip(`headroom ${s.headroom_db} dB`, hot ? 2 : warm ? 1 : 0)}
+        ${chip(`peak ${s.peak_dbfs_max} dBFS`, hot ? 2 : warm ? 1 : 0)}
+        ${s.clip_windows_sustained ? chip(`${s.clip_windows_sustained} `
+            + `over-driven window${s.clip_windows_sustained === 1 ? '' : 's'}`, 2)
+          : chip('input never over-driven', 0)}
+        ${s.clip_windows_impulse ? chip(`${s.clip_windows_impulse} impulse hit${
+            s.clip_windows_impulse === 1 ? '' : 's'}`, 1) : ''}
+        ${s.clip_windows_own_tx ? chip(`${s.clip_windows_own_tx} own-TX window${
+            s.clip_windows_own_tx === 1 ? '' : 's'}`, 0) : ''}
+        ${chip(`S/N median ${s.snr_median_db ?? '—'} dB`,
+               s.snr_median_db != null && s.snr_median_db < 12 ? 1 : 0)}
+        ${chip(`S/N 10th pct ${s.snr_p10_db ?? '—'} dB`, 0)}
+        ${chip(`floor ${s.noise_dbfs} dBFS`, 0)}
+        ${chip(`on air ${s.active_pct}%`, 0)}
+      </div>
+      <div class="note">In-band S/N vs time — dashed line is the handshake
+        probe's median SNR; ticks below are frames (tall = RX, coloured by EVM;
+        short grey = TX), placed at the node's log time, which trails the burst
+        itself by a second or two</div>
+      ${renderSnrTrack(tr, n)}
+      <div class="note" style="margin-top:4px">Input level vs time — blue peak,
+        green RMS; red band is clipping (0 to −1 dBFS), amber is hot
+        (−1 to −6). Dots mark windows with samples at full scale, by cause:
+        <b style="color:#d64545">red</b> = input over-driven,
+        <b style="color:#b07d18">amber</b> = ambient impulse,
+        <b style="color:#8b929a">grey</b> = this node's own transmission
+        (grey band)</div>
+      ${renderLevelTrack(tr, n)}
+    </div>`;
+  }).join('');
+
+  // The one-line read: which node was too hot, which was too quiet.
+  const worst = tracks
+    .filter(n => (n.track || {}).summary)
+    .map(n => ({ id: n.client_id, s: n.track.summary }));
+  const verdict = worst.map(w =>
+    `${escHtml(w.id)}: ${w.s.clip_windows_sustained
+        ? '<b style="color:#d64545">input over-driven</b>'
+      : w.s.headroom_db != null && w.s.headroom_db <= 6
+        ? '<b style="color:#b07d18">hot</b>'
+      : w.s.active_peak_dbfs != null && w.s.active_peak_dbfs < -45 ? 'very quiet'
+      : 'level ok'} (${w.s.headroom_db} dB headroom, S/N ${
+      w.s.snr_median_db ?? '—'} dB)`).join(' · ');
+
+  return `
+  <div style="border:1px solid #999;background:#fbfbf6;padding:8px;margin-bottom:8px">
+    <b>Level &amp; S/N over time</b>
+    <div class="note">${txNote} · input gain is set in the OS mixer and is not
+      recorded, so the measured level below is the only evidence of it</div>
+    <div style="margin-top:4px">${verdict}</div>
+    ${body}
+  </div>`;
+}
+
+// ── Constellation composites ─────────────────────────────────────────────────
+// An EVM figure says how bad a frame was; the constellation says WHY.  Radial
+// smear centred on the reference points is noise; a rotation is uncorrected
+// phase; points pulled toward the origin with the edges worst is compression or
+// clipping; a fuzzy ring is residual ISI.  Each phase is a different modem
+// (known-BPSK probe vs the negotiated data mix), so they get separate panels.
+function renderConstellationBlock(rep) {
+  const art = f => `/api/results/${encodeURIComponent(rep.run_id)}/artifact/${encodeURIComponent(f)}`;
+  const built = ((rep.constellation_timeline || {}).rows || []).length;
+  const hasCapture = (rep.files || []).some(f => f.endsWith('.wav'));
+  if (!built && !hasCapture) return '';
+  return `
+  <div style="border:1px solid #999;background:#f6f4fb;padding:8px;margin-bottom:8px">
+    <b>Constellation by phase</b>
+    <span class="note">— built from the capture by re-decoding the run's own
+      frames (~11s per node), so it works on runs recorded before this existed.
+      Own transmissions are muted first: a node hears its own speaker ~20dB
+      louder than any peer, which otherwise masks the received bursts.</span>
+    <div class="row" style="margin-top:6px">
+      <button onclick="analyzeConstellation('${rep.run_id}')">
+        &#x25C9; ${built ? 'Rebuild' : 'Build'} constellations</button>
+      <span id="con-status" class="note"></span>
+    </div>
+    ${renderConstellationTable(rep, art)
+      || '<div class="note" style="margin-top:4px">Not built yet.</div>'}
+  </div>`;
+}
+
+// Call flow as a real table: one row per moment, one column per node, each
+// cell its own image.  The panel sits under the node that RECEIVED it, so the
+// sender's column is empty on that row and a two-way exchange reads as a
+// zig-zag down the page.
+function renderConstellationTable(rep, art) {
+  const tl = rep.constellation_timeline;
+  if (!tl || !(tl.rows || []).length) return '';
+  const nodes = tl.nodes || [];
+  const px = tl.cell_px || 230;
+  const head = `<tr>` +
+    `<th style="text-align:left;padding:4px 8px">#</th>` +
+    `<th style="text-align:left;padding:4px 8px">event</th>` +
+    `<th style="text-align:left;padding:4px 8px">detail</th>` +
+    nodes.map(n => `<th style="padding:4px 8px">${escHtml(n)}</th>`).join('') +
+    `</tr>`;
+  let lastEv = null;
+  const body = tl.rows.map(r => {
+    const evm = r.evm_pct == null ? '' :
+      `<div>EVM <b>${r.evm_pct}%</b>` +
+      (r.evm_unweighted_pct == null ? '' :
+        ` <span class="note">(${r.evm_unweighted_pct}% unweighted)</span>`) +
+      `</div>`;
+    const isTx = r.side === 'tx';
+    // TX rows come from the SENDER's own log; RX rows from the receiver's.
+    // They are never paired into one row because the two captures start
+    // independently -- see render_timeline.
+    const from = isTx ? r.tx : (r.peer || '?');
+    const to   = isTx ? (r.peer || '?') : r.rx;
+    const dir = `${escHtml(String(from))} &rarr; ${escHtml(String(to))}`;
+    // An RS-failed acquisition is not a delivered frame. It is plotted so a
+    // failure is visible, but it must never read as link performance.
+    // Every row is a frame the receiving node logged. A re-decode that fails
+    // here means the offline pass could not reproduce the live decode, which
+    // is a discrepancy worth seeing -- not a stray burst.
+    const failed = r.decoded === false;
+    const badge = failed
+      ? `<div style="color:#a00;font-weight:bold">logged live, but RS failed on re-decode${
+           r.acq_coh == null ? '' : ` (acq coh ${r.acq_coh})`}</div>`
+      : '';
+    const live = r.log_evm == null ? ''
+      : `<div class="note">logged live at t=${r.log_t}s, EVM ${r.log_evm}%</div>`;
+    // Event id + event name repeat on EVERY row of a frame, so the rows that
+    // belong together are identifiable without noticing the shared timestamp.
+    const tint = failed ? ';background:#fff4f4'
+               : isTx ? ';background:#f7f7f2'
+               : (r.ev % 2 ? '' : ';background:#f4f6fa');
+    const idCol = `<td style="vertical-align:top;padding:6px 8px;
+        font-weight:bold;font-size:15px;color:#456${tint}">${r.ev}</td>`;
+    const evCol = `<td style="vertical-align:top;padding:6px 8px;min-width:170px${tint}">
+        <div><b>${escHtml(r.event || r.label)}</b>${
+          isTx ? ' <span class="note">(sent)</span>' : ''}</div>
+        <div style="color:#2a6">${dir}</div>
+        <div class="note">t = ${r.t}s${
+          isTx && r.dur_s != null ? ` · ${r.dur_s}s on air` : ''}</div>
+      </td>`;
+    const desc = isTx
+      ? `<td style="vertical-align:top;padding:6px 8px;min-width:180px${tint}">
+          <div class="note">from ${escHtml(String(r.tx))}'s transmit log</div>
+        </td>`
+      : `<td style="vertical-align:top;padding:6px 8px;min-width:180px${tint}">
+        ${r.mod ? `<div><b>${escHtml(r.mod)}</b></div>` : ''}
+        ${badge}
+        ${evm}
+        ${live}
+        <div class="note">${r.n} symbols</div>
+      </td>`;
+    const cells = nodes.map(n => {
+      if (isTx) {
+        // No plot exists for a send: the handshake control frames are
+        // RobustLink, and a mesh frame is only ever demapped at the receiver.
+        return `<td style="padding:4px;text-align:center;font-size:11px${tint}${
+          n === r.tx ? ';color:#666' : ';color:#ccc'}">${
+          n === r.tx ? '&#9679; transmitting' : ''}</td>`;
+      }
+      return n === r.rx
+        ? `<td style="padding:4px${tint}"><a href="${art(r.img)}" target="_blank"
+             ><img src="${art(r.img)}" width="${px}" height="${px}"
+               style="display:block;border:1px solid #ddd;background:#101418"
+               ></a></td>`
+        : `<td style="padding:4px;text-align:center;color:#aaa;font-size:11px${tint}"
+             >listening</td>`;
+    }).join('');
+    // Solid rule only where a NEW event starts; rows inside one event get a
+    // faint one, so a frame's rows read as a block.
+    const newEv = r.ev !== lastEv; lastEv = r.ev;
+    return `<tr style="border-top:${newEv ? '2px solid #999' : '1px solid #eee'}"
+      >${idCol}${evCol}${desc}${cells}</tr>`;
+  }).join('');
+  return `<div style="margin-top:8px">
+      <b>Call flow</b> <span class="note">— every event both nodes logged, in
+        order. <b>Sent</b> rows come from the transmitter's own log and carry no
+        plot: the handshake control frames (BAT_REPORT / BAT_ACK / GO) are
+        RobustLink, a different modem from the mesh DATA frames, and a frame is
+        only ever demapped at the receiver. <b>Received</b> rows are re-decoded
+        from that node's capture, and the constellation sits under the node that
+        received it; rows sharing an event <b>#</b> are one frame, split by the
+        modulations bit-loading spread across its carriers. A send and its
+        receive are listed separately because the two captures start
+        independently — pairing them would mean guessing a clock offset.</span>
+      <div style="overflow-x:auto"><table style="border-collapse:collapse;margin-top:4px">
+        ${head}${body}</table></div>
+    </div>`;
+}
+
+function analyzeConstellation(runId) {
+  const st = document.getElementById('con-status');
+  if (st) st.textContent = 'decoding frames from the capture… (~11s per node)';
+  fetch(`/api/results/${encodeURIComponent(runId)}/analyze_constellation`,
+        {method: 'POST'})
+    .then(r => r.json()).then(d => {
+      if (d.error) { if (st) st.textContent = d.error; return; }
+      const n = (d.built || []).length;
+      const notes = (d.notes || []).join(' | ');
+      const rows = ((d.constellation_timeline || {}).rows || []).length;
+      if (st) st.textContent = (n ? `built ${n} composite(s)` : 'nothing built')
+        + (rows ? `, ${rows} call-flow moments` : '')
+        + (notes ? ` — ${notes}` : '');
+      if (n) openReport(runId, true);
+    }).catch(e => { if (st) st.textContent = 'request failed: ' + e; });
+}
+
+function renderRangingBlock(rep) {
+  if (!rep.ranging_ready && !rep.ranging) return '';
+  const g = rep.ranging;
+  const ms = (smp) => g && g.fs ? (smp / g.fs * 1000).toFixed(2) + ' ms' : '';
+  return `
+  <div style="border:1px solid #999;background:#f4f8ff;padding:8px;margin-bottom:8px">
+    <b>Two-way ranging</b>
+    ${g ? `<div style="font-size:16px;margin:4px 0">
+             distance = <b>${g.distance_m.toFixed(3)} m</b></div>
+           <div class="note">
+             rtt ${ms(g.rtt)} · turnaround ${ms(g.turnaround)} ·
+             net flight ${ms(g.net)} (${g.net} smp @ ${g.fs} Hz)<br>
+             initiator req_tx=${g.req_tx} reply_rx=${g.reply_rx} ·
+             responder req_rx=${g.req_rx} reply_tx=${g.reply_tx}
+           </div>`
+       : `<div class="note" style="margin:4px 0">Captures recorded but not yet
+            analyzed — the ranging test only records audio; distance comes from
+            the post-hoc matched-filter pass.</div>`}
+    <div class="row" style="margin-top:6px">
+      <button onclick="analyzeRanging('${rep.run_id}')">
+        &#x1F4D0; ${g ? 'Re-analyze' : 'Analyze'} ranging</button>
+      <label>True distance (m, optional):
+        <input type="text" id="rng-true" style="width:60px"></label>
+      <span id="rng-status" class="note"></span>
+    </div>
+    <pre id="rng-output" style="display:none"></pre>
+  </div>`;
+}
+
+function analyzeRanging(runId) {
+  const stat = document.getElementById('rng-status');
+  const trueEl = document.getElementById('rng-true');
+  stat.textContent = 'analyzing… (matched-filtering both captures)';
+  fetch(`/api/results/${encodeURIComponent(runId)}/analyze_ranging`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({true_dist: trueEl ? trueEl.value : ''}),
+  }).then(r => r.json()).then(d => {
+    if (d.error) { stat.textContent = ''; return rptMsg(d.error, true); }
+    const out = document.getElementById('rng-output');
+    out.style.display = '';
+    out.textContent = d.output || '';
+    stat.textContent = d.ranging
+      ? `distance ${d.ranging.distance_m.toFixed(3)} m`
+      : `analyzer exit ${d.returncode}`;
+    if (!d.ok) rptMsg('ranging analysis reported a problem — see output', true);
+    loadReports();
+  }).catch(e => { stat.textContent = ''; rptMsg('analyze failed: ' + e, true); });
+}
+
+function annAddLabel() {
+  const inp = document.getElementById('ann-new-label');
+  const val = (inp.value || '').trim();
+  if (!val) return;
+  if (!annLabels.includes(val)) annLabels.push(val);
+  inp.value = '';
+  rptDetailDirty = true;
+  annRenderLabels();
+}
+
+function annPayload() {
+  return {
+    verdict: document.getElementById('ann-verdict').value,
+    labels:  [...annLabels],
+    note:    document.getElementById('ann-note').value,
+    expect:  document.getElementById('ann-expect').value,
+  };
+}
+
+// ── Label vocabulary cleanup ──────────────────────────────────────────────────
+function toggleLabelManager() {
+  const box = document.getElementById('label-manager');
+  const show = box.style.display === 'none';
+  box.style.display = show ? '' : 'none';
+  if (show) renderLabelManager();
+}
+
+function renderLabelManager() {
+  const box = document.getElementById('label-manager');
+  if (!box) return;
+  if (!knownLabels.length) {
+    box.innerHTML = '<span class="note">No labels in use yet.</span>';
+    return;
+  }
+  const counts = {};
+  reportsData.forEach(r => ((r.annotation || {}).labels || [])
+    .forEach(l => { counts[l] = (counts[l] || 0) + 1; }));
+  box.innerHTML = '<span class="note">In use (&#x2715; forgets the label on every run and case): </span>' +
+    knownLabels.map((l, i) =>
+      `<span class="chip">${escHtml(l)} <span class="note">${counts[l] || 0}</span>
+         <span class="chip-x" title="delete this label everywhere"
+               onclick="forgetLabel(${i})">&#x2715;</span></span>`).join('');
+}
+
+function forgetLabel(i) {
+  const label = knownLabels[i];
+  if (!label) return;
+  if (!confirm(`Delete the label "${label}" from every run and regression case?`)) return;
+  fetch('/api/labels/delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({label}),
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) return rptMsg(d.error || 'delete failed', true);
+    annLabels = annLabels.filter(l => l !== label);
+    rptMsg(`deleted label "${label}" from ${d.runs.length} run(s)`);
+    loadReports();
+  });
+}
+
+function annSave(runId) {
+  fetch(`/api/results/${encodeURIComponent(runId)}/annotation`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(annPayload()),
+  }).then(r => r.json()).then(d => {
+    if (d.error) return rptMsg(d.error, true);
+    rptDetailDirty = false;
+    rptMsg('saved ' + runId);
+    loadReports();
+  });
+}
+
+function annPromote(runId) {
+  const p = annPayload();
+  if (!p.expect) {
+    if (!confirm('Expected text is empty — the case will assert an empty decode. Continue?')) return;
+  }
+  fetch(`/api/results/${encodeURIComponent(runId)}/promote`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({expect: p.expect, labels: p.labels, note: p.note}),
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) return rptMsg(d.error || 'promote failed', true);
+    rptDetailDirty = false;
+    rptMsg(`added to regression suite as ${d.case.name}`);
+    loadReports();
+  });
+}
+
+function annUnpromote(runId) {
+  if (!confirm('Remove this run from the regression suite (deletes its copied fixture)?')) return;
+  fetch(`/api/results/${encodeURIComponent(runId)}/unpromote`, {method: 'POST'})
+    .then(r => r.json()).then(() => { rptDetailDirty = false;
+                                    rptMsg('removed from suite'); loadReports(); });
+}
+
+// ── Delete ────────────────────────────────────────────────────────────────────
+function rptDelete(runId) {
+  if (!confirm(`Delete run ${runId} and all its artifacts? This cannot be undone.`)) return;
+  fetch('/api/results/' + encodeURIComponent(runId), {method: 'DELETE'})
+    .then(r => r.json().then(d => ({ok: r.ok, d})))
+    .then(({ok, d}) => {
+      if (!ok) return rptMsg(d.error || 'delete failed', true);
+      if (openRunId === runId) {
+        openRunId = null;
+        rptDetailDirty = false;
+        document.getElementById('report-detail').style.display = 'none';
+      }
+      rptMsg('deleted ' + runId);
+      loadReports();
+    });
+}
+
+function rptDeleteSelected() {
+  const ids = [...rptSelected];
+  if (!ids.length) return rptMsg('nothing selected', true);
+  if (!confirm(`Delete ${ids.length} run(s) and all their artifacts? This cannot be undone.`)) return;
+  fetch('/api/results/delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({run_ids: ids}),
+  }).then(r => r.json()).then(d => {
+    rptSelected.clear();
+    const skipped = (d.skipped || []).length;
+    rptMsg(`deleted ${(d.deleted || []).length}` +
+           (skipped ? ` · skipped ${skipped} (in regression suite)` : ''), skipped > 0);
+    loadReports();
+  });
+}
+
+function rptBulkVerdict(verdict) {
+  const ids = [...rptSelected];
+  if (!ids.length) return rptMsg('nothing selected', true);
+  Promise.all(ids.map(id => fetch(`/api/results/${encodeURIComponent(id)}/annotation`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({verdict}),
+  }))).then(() => {
+    rptMsg(`marked ${ids.length} run(s) ${VERDICT_LABEL[verdict]}`);
+    loadReports();
+  });
+}
+
+// ── Running the regression suites (css, ofdm) ─────────────────────────────────
+// Each suite's script runs offline on the server host; we start it, then poll
+// its status until it exits, filling a per-case table from the parsed output.
+const regScript = {css: 'css_regress.py', ofdm: 'ofdm_regress.py'};
+const regPollTimer  = {css: null, ofdm: null};
+const regWasRunning = {css: false, ofdm: false};
+
+function runRegression(suite) {
+  const body = {
+    only:    document.getElementById(`reg-${suite}-only`).value,
+    verbose: document.getElementById(`reg-${suite}-verbose`).checked,
+  };
+  const labelsEl = document.getElementById(`reg-${suite}-labels`);
+  if (labelsEl) body.labels = [...labelsEl.selectedOptions].map(o => o.value);
+  const slowEl = document.getElementById(`reg-${suite}-slow`);
+  if (slowEl) body.slow = slowEl.checked;
+
+  document.getElementById(`reg-${suite}-run-btn`).disabled = true;
+  fetch(`/api/regression/${suite}/run`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  }).then(r => r.json().then(d => ({ok: r.ok, d}))).then(({ok, d}) => {
+    if (!ok) {
+      document.getElementById(`reg-${suite}-run-btn`).disabled = false;
+      return rptMsg(d.error || 'could not start suite', true);
+    }
+    document.getElementById(`reg-${suite}-summary`).textContent = '';
+    pollRegression(suite);
+  });
+}
+
+function stopRegression(suite) {
+  fetch(`/api/regression/${suite}/stop`, {method: 'POST'})
+    .then(r => r.json()).then(d => {
+      if (d.error) rptMsg(d.error, true); else rptMsg('stopping suite…');
+    });
+}
+
+function pollRegression(suite) {
+  fetch(`/api/regression/${suite}/status`).then(r => r.json())
+    .then(s => renderRegressionRun(suite, s))
+    .catch(() => {});
+}
+
+function renderRegressionRun(suite, s) {
+  const running = !!s.running;
+  document.getElementById(`reg-${suite}-run-btn`).disabled  = running;
+  document.getElementById(`reg-${suite}-stop-btn`).disabled = !running;
+
+  const argsTxt = (s.args || []).length ? ' ' + s.args.join(' ') : '';
+  const script = regScript[suite];
+  const stat = document.getElementById(`reg-${suite}-status`);
+  if (running) {
+    stat.textContent = `running ${script}${argsTxt} — ${s.cases.length} case(s) done,`
+                     + ` ${s.elapsed_s ?? 0}s elapsed`;
+  } else if (s.started_at) {
+    stat.textContent = `last run: ${script}${argsTxt} — exit ${s.returncode}`
+                     + ` in ${s.elapsed_s ?? '?'}s`;
+  } else {
+    stat.textContent = 'idle';
+  }
+
+  const sum = document.getElementById(`reg-${suite}-summary`);
+  if (s.summary) {
+    sum.textContent = s.summary;
+    sum.className = /ALL PASS/.test(s.summary) ? 'st-ok' : 'st-fail';
+  } else if (!running && s.returncode !== null && s.returncode !== 0) {
+    sum.textContent = 'suite did not complete';
+    sum.className = 'st-fail';
+  }
+
+  const wrap = document.getElementById(`reg-${suite}-results`);
+  if ((s.cases || []).length || (s.output || []).length) wrap.style.display = '';
+  document.getElementById(`reg-${suite}-tbody`).innerHTML = (s.cases || []).map(c => `<tr>
+      <td class="${c.status === 'PASS' ? 'st-ok' : c.status === 'FAIL' ? 'st-fail' : 'note'}">
+        ${c.status}</td>
+      <td><code>${escHtml(c.name)}</code></td>
+      <td class="note">${c.secs}s</td>
+      <td class="note">${escHtml(c.detail || '')}</td>
+    </tr>`).join('') || '<tr><td colspan="4" class="note">starting…</td></tr>';
+
+  const log = document.getElementById(`reg-${suite}-log`);
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+  log.textContent = (s.output || []).join('\n');
+  if (atBottom) log.scrollTop = log.scrollHeight;
+
+  clearTimeout(regPollTimer[suite]);
+  if (running) regPollTimer[suite] = setTimeout(() => pollRegression(suite), 1500);
+  else if (regWasRunning[suite]) loadReports();   // suite just finished
+  regWasRunning[suite] = running;
+}
+
+socket.on('regression_finished', d => {
+  logLine(`[regress:${d.suite}] finished rc=${d.returncode} — ${d.summary || d.cases + ' case(s)'}`);
+  pollRegression(d.suite);
+  if (d.suite === _dashRegSuite) pollDashRegression(d.suite);
+});
+
+// ── Running a regression suite from the "Run Test" dropdown ──────────────────
+// Same backend as the Reports-tab buttons above; this just drives it from the
+// regression-run-panel next to the normal test picker, so a regression suite
+// is a first-class entry in that dropdown rather than a Reports-tab detour.
+let dashRegPollTimer  = null;
+
+function runDashRegression(suite) {
+  const body = { only: document.getElementById('dash-reg-only').value,
+                 verbose: document.getElementById('dash-reg-verbose').checked };
+  if (suite === 'css') {
+    body.labels = [...document.getElementById('dash-reg-labels').selectedOptions].map(o => o.value);
+    body.slow   = document.getElementById('dash-reg-slow').checked;
+  }
+  document.getElementById('run-test-btn').disabled = true;
+  fetch(`/api/regression/${suite}/run`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  }).then(r => r.json().then(d => ({ok: r.ok, d}))).then(({ok, d}) => {
+    if (!ok) {
+      document.getElementById('run-test-btn').disabled = false;
+      return alert(d.error || 'could not start suite');
+    }
+    document.getElementById('dash-reg-summary').textContent = '';
+    pollDashRegression(suite);
+  });
+}
+
+function pollDashRegression(suite) {
+  fetch(`/api/regression/${suite}/status`).then(r => r.json())
+    .then(s => renderDashRegression(suite, s)).catch(() => {});
+}
+
+function renderDashRegression(suite, s) {
+  if (suite !== _dashRegSuite) return;   // user switched the dropdown mid-poll
+  const running = !!s.running;
+  document.getElementById('run-test-btn').disabled      = running;
+  document.getElementById('dash-reg-stop-btn').disabled = !running;
+
+  const argsTxt = (s.args || []).length ? ' ' + s.args.join(' ') : '';
+  const script = regScript[suite];
+  const stat = document.getElementById('dash-reg-status');
+  if (running) {
+    stat.textContent = `running ${script}${argsTxt} — ${s.cases.length} case(s) done,`
+                     + ` ${s.elapsed_s ?? 0}s elapsed`;
+  } else if (s.started_at) {
+    stat.textContent = `last run: ${script}${argsTxt} — exit ${s.returncode}`
+                     + ` in ${s.elapsed_s ?? '?'}s`;
+  } else {
+    stat.textContent = 'idle';
+  }
+
+  const sum = document.getElementById('dash-reg-summary');
+  if (s.summary) {
+    sum.textContent = s.summary;
+    sum.className = /ALL PASS/.test(s.summary) ? 'st-ok' : 'st-fail';
+  } else if (!running && s.returncode !== null && s.returncode !== 0) {
+    sum.textContent = 'suite did not complete';
+    sum.className = 'st-fail';
+  }
+
+  const wrap = document.getElementById('dash-reg-results');
+  if ((s.cases || []).length || (s.output || []).length) wrap.style.display = '';
+  document.getElementById('dash-reg-tbody').innerHTML = (s.cases || []).map(c => `<tr>
+      <td class="${c.status === 'PASS' ? 'st-ok' : c.status === 'FAIL' ? 'st-fail' : 'note'}">
+        ${c.status}</td>
+      <td><code>${escHtml(c.name)}</code></td>
+      <td class="note">${c.secs}s</td>
+      <td class="note">${escHtml(c.detail || '')}</td>
+    </tr>`).join('') || '<tr><td colspan="4" class="note">starting…</td></tr>';
+
+  const log = document.getElementById('dash-reg-log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+  log.textContent = (s.output || []).join('\n');
+  if (atBottom) log.scrollTop = log.scrollHeight;
+
+  clearTimeout(dashRegPollTimer);
+  if (running) dashRegPollTimer = setTimeout(() => pollDashRegression(suite), 1500);
+}
+
+// ── Regression suite listing ──────────────────────────────────────────────────
+function renderRegression() {
+  const area = document.getElementById('regression-area'); if (!area) return;
+
+  // --label only filters promoted cases, so offer exactly those labels
+  const caseLabels = [...new Set(regCases.flatMap(c => c.labels || []))].sort();
+  for (const id of ['reg-css-labels', 'dash-reg-labels']) {
+    const sel = document.getElementById(id);
+    if (!sel) continue;
+    const picked = new Set([...sel.selectedOptions].map(o => o.value));
+    sel.innerHTML = caseLabels.map(l =>
+      `<option value="${escA(l)}"${picked.has(l) ? ' selected' : ''}>${escHtml(l)}</option>`).join('');
+    sel.size = Math.min(Math.max(caseLabels.length, 1), 4);
+    sel.disabled = !caseLabels.length;
+  }
+
+  if (!regCases.length) {
+    area.textContent = 'No promoted cases yet — review a run and use "Add to regression suite".';
+    return;
+  }
+  area.innerHTML = `<table><thead><tr>
+      <th>Case</th><th>Run</th><th>Expect</th><th>Labels</th><th>Note</th><th>Added</th>
+    </tr></thead><tbody>` +
+    regCases.map(c => `<tr>
+      <td><code>${escHtml(c.name)}</code></td>
+      <td>${escHtml(c.run_id || '')}</td>
+      <td><code>${escHtml(c.expect || '')}</code></td>
+      <td>${(c.labels || []).map(l => `<span class="chip">${escHtml(l)}</span>`).join('')}</td>
+      <td class="rpt-note-txt">${escHtml(c.note || '')}</td>
+      <td class="note">${escHtml(c.added_at || '')}</td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
 // ── Log ───────────────────────────────────────────────────────────────────────
+// ── Log filtering ──────────────────────────────────────────────────────────
+// Each log line is classified into one category by substring match (first
+// match in this order wins; lines matching nothing fall into 'other').  The
+// spammy TX-chirp and impulse/overflow categories default OFF.  Choices persist
+// in localStorage.  S/N + mic-gain lines (MIC_SN, emitted by css_decoder) get
+// their own always-on 'signal' category.
+const LOG_CATS = [
+  { key:'signal',  label:'S/N & gain',   on:true,  match:['MIC_SN','S/N','SNR','avg_snr'] },
+  { key:'sync',    label:'Sync/frames',  on:true,  match:['SYNC','MF_PREAMBLE','MF_FRAME','FRAME','RETRO','RESYNC','WPK_GATE','SYM_TRACK','PLL_OUTLIER','ERASURES','RS_'] },
+  { key:'tx',      label:'TX chirps',    on:false, match:['CHIRP_TX','OUTPUT_XRUN','CHIRP_SCHEDULE'] },
+  { key:'impulse', label:'Impulse/ovf',  on:false, match:['IMPULSE_BLANK','INPUT_OVERFLOW'] },
+  { key:'iface',   label:'Audio iface',  on:true,  match:['AUDIO_IFACE','LISTENING','capture fs','OutputStream','InputStream'] },
+  { key:'error',   label:'Errors',       on:true,  match:['ERROR','WARNING','FAIL','Traceback','INTERRUPTED','SIGTERM'] },
+  { key:'status',  label:'Status',       on:true,  match:['[result]','[run]','[stop]','[join]','[leave]','[warn]','DONE','STATUS','STREAM','playback'] },
+  { key:'other',   label:'Other',        on:true,  match:[] },
+];
+let _logEntries = [];   // [{line, cat}]
+let _logFilter  = {};   // { catKey: bool }
+try { _logFilter = JSON.parse(localStorage.getItem('logFilter') || '{}'); } catch (e) { _logFilter = {}; }
+LOG_CATS.forEach(c => { if (_logFilter[c.key] === undefined) _logFilter[c.key] = c.on; });
+
+function classifyLog(msg) {
+  for (const c of LOG_CATS) {
+    if (c.match.length && c.match.some(tok => msg.indexOf(tok) !== -1)) return c.key;
+  }
+  return 'other';
+}
+function logVisible(cat) { return _logFilter[cat] !== false; }
+
+function buildLogFilters() {
+  const wrap = document.getElementById('log-filters');
+  if (!wrap) return;
+  const counts = {};
+  _logEntries.forEach(e => { counts[e.cat] = (counts[e.cat] || 0) + 1; });
+  wrap.innerHTML = LOG_CATS.map(c =>
+    `<label title="${c.match.join(', ') || 'everything else'}">`
+    + `<input type="checkbox" class="log-cat-cb" value="${c.key}"`
+    + `${logVisible(c.key) ? ' checked' : ''}> ${c.label}`
+    + `<span class="note"> (${counts[c.key] || 0})</span></label>`
+  ).join('');
+  wrap.querySelectorAll('.log-cat-cb').forEach(cb => {
+    cb.addEventListener('change', () => {
+      _logFilter[cb.value] = cb.checked;
+      try { localStorage.setItem('logFilter', JSON.stringify(_logFilter)); } catch (e) {}
+      renderLog();
+    });
+  });
+}
+function renderLog() {
+  const box = document.getElementById('log-box');
+  box.textContent = _logEntries.filter(e => logVisible(e.cat)).map(e => e.line).join('\n');
+  box.scrollTop = box.scrollHeight;
+  buildLogFilters();   // refresh per-category counts
+}
 function loadLog() {
   fetch('/api/logs').then(r => r.json()).then(d => {
-    const box = document.getElementById('log-box');
-    box.textContent = (d.logs||[])
-      .map(l => `[${l.ts}][${l.client}][${l.level}] ${l.msg}`).join('\n');
-    box.scrollTop = box.scrollHeight;
+    _logEntries = (d.logs || []).map(l => {
+      const line = `[${l.ts}][${l.client}][${l.level}] ${l.msg}`;
+      return { line, cat: classifyLog(line) };
+    });
+    renderLog();
   });
 }
 function logLine(msg) {
-  const box = document.getElementById('log-box');
-  box.textContent += (box.textContent ? '\n' : '') + msg;
-  box.scrollTop = box.scrollHeight;
+  const cat = classifyLog(msg);
+  _logEntries.push({ line: msg, cat });
+  if (_logEntries.length > 1000) _logEntries.shift();
+  if (logVisible(cat)) {
+    const box = document.getElementById('log-box');
+    box.textContent += (box.textContent ? '\n' : '') + msg;
+    box.scrollTop = box.scrollHeight;
+  }
+  buildLogFilters();   // keep counts live
 }
-function clearLog() { document.getElementById('log-box').textContent = ''; }
+function clearLog() { _logEntries = []; renderLog(); }
+buildLogFilters();
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
 function escHtml(s) {

@@ -1,0 +1,45 @@
+# Audio test node: one container per host, running app.py as the server role.
+#
+# Audio: the container reaches the HOST's PulseAudio server over TCP via
+# PULSE_SERVER. Set up the host once (see docker/README.md):
+#   macOS:  brew install pulseaudio && pulseaudio --load="module-native-protocol-tcp \
+#             auth-ip-acl=127.0.0.1;172.16.0.0/12 port=4713" --exit-idle-time=-1 --daemonize
+#   Linux:  pactl load-module module-native-protocol-tcp \
+#             auth-ip-acl=127.0.0.1;172.16.0.0/12 port=4713
+#
+# SSH: LLM shell access is exposed only on the server node (port 2222 -> 22).
+#   ssh -i ssh/id_ed25519 -p 2222 root@localhost
+#   # then, to reload after editing code on the host:
+#   curl -X POST http://127.0.0.1:8001/api/reload
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: audiotestserver:debian13
+    container_name: ats-server
+    hostname: ats-server
+    restart: unless-stopped
+    # host.docker.internal resolves to the host on Docker Desktop; on Linux this
+    # extra_hosts entry makes it resolve to the host gateway too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      PULSE_SERVER: "tcp:host.docker.internal:4713"
+      ROLE: server
+      NODE_ID: server
+      PORT: "8001"
+      # Every *.pub in ./ssh/authorized_pubkeys is installed to authorized_keys
+      # on every start/recreate.
+      SSH_KEY_DIR: /run/ssh-keys
+    volumes:
+      # Live code — edit on the host, POST /api/reload to apply.
+      - .:/audiotestserver
+      # All authorized pubkeys (LLM key + any client keys) -> installed via
+      # SSH_KEY_DIR on every start/recreate. Add new *.pub files here, no
+      # rebuild or manual `docker exec` needed.
+      - ./ssh/authorized_pubkeys:/run/ssh-keys:ro
+    ports:
+      - "8001:8001"   # web UI / API
+      - "2222:22"     # SSH for the LLM

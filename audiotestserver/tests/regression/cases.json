@@ -1,0 +1,112 @@
+{
+  "cases": [
+    {
+      "name": "run_20260727_063914_css",
+      "run_id": "20260727_063914_css",
+      "wav": "fixtures/runs/run_20260727_063914_css/input.wav",
+      "info": "fixtures/runs/run_20260727_063914_css/info.json",
+      "expect": "hello",
+      "labels": [
+        "0.75second",
+        "partial_symbol_obscure",
+        "strong_signal"
+      ],
+      "note": "this has one symbol tough to decode partially covered by impulse noise",
+      "test": "css",
+      "symbol_dur": 0.75,
+      "added_at": "2026-07-27T20:22:11"
+    },
+    {
+      "name": "run_20260727_064445_css",
+      "run_id": "20260727_064445_css",
+      "wav": "fixtures/runs/run_20260727_064445_css/input.wav",
+      "info": "fixtures/runs/run_20260727_064445_css/info.json",
+      "expect": "hello",
+      "labels": [
+        "0.75second",
+        "backgroundnoise_tvshow",
+        "partial_symbol_obscure"
+      ],
+      "note": "tv show playing, chirp is louder than tv. some partial symbol obscuring",
+      "test": "css",
+      "symbol_dur": 0.75,
+      "added_at": "2026-07-27T20:23:25"
+    },
+    {
+      "name": "run_20260727_180939_css",
+      "run_id": "20260727_180939_css",
+      "wav": "fixtures/runs/run_20260727_180939_css/input.wav",
+      "info": "fixtures/runs/run_20260727_180939_css/info.json",
+      "expect": "hello",
+      "labels": [
+        "0.5second",
+        "partial_symbol_obscure"
+      ],
+      "note": "",
+      "test": "css",
+      "symbol_dur": 0.5,
+      "added_at": "2026-07-27T20:24:02"
+    },
+    {
+      "name": "run_20260727_192459_css",
+      "run_id": "20260727_192459_css",
+      "wav": "fixtures/runs/run_20260727_192459_css/input.wav",
+      "info": "fixtures/runs/run_20260727_192459_css/info.json",
+      "expect": "hello",
+      "labels": [
+        "1.5second"
+      ],
+      "note": "",
+      "test": "css",
+      "symbol_dur": 1.5,
+      "added_at": "2026-07-27T20:27:45"
+    },
+    {
+      "name": "run_20260727_194609_css",
+      "run_id": "20260727_194609_css",
+      "wav": "fixtures/runs/run_20260727_194609_css/input.wav",
+      "info": "fixtures/runs/run_20260727_194609_css/info.json",
+      "expect": "hello",
+      "labels": [
+        "0.3second",
+        "parakeets"
+      ],
+      "note": "0.3s test with lots of fan noise and parakeets. distance appx 5ft",
+      "test": "css",
+      "symbol_dur": 0.3,
+      "added_at": "2026-07-27T20:25:32"
+    },
+    {
+      "name": "run_20260727_194808_css",
+      "run_id": "20260727_194808_css",
+      "wav": "fixtures/runs/run_20260727_194808_css/input.wav",
+      "info": "fixtures/runs/run_20260727_194808_css/info.json",
+      "expect": "hello",
+      "labels": [
+        "0.5second",
+        "impulse_noise",
+        "parakeets"
+      ],
+      "note": "",
+      "test": "css",
+      "symbol_dur": 0.5,
+      "added_at": "2026-07-27T20:26:09"
+    },
+    {
+      "name": "run_20260727_195019_css",
+      "run_id": "20260727_195019_css",
+      "wav": "fixtures/runs/run_20260727_195019_css/input.wav",
+      "info": "fixtures/runs/run_20260727_195019_css/info.json",
+      "expect": "hello",
+      "labels": [
+        "0.3second",
+        "impulse_noise",
+        "parakeets"
+      ],
+      "note": "",
+      "test": "css",
+      "symbol_dur": 0.3,
+      "added_at": "2026-07-27T20:26:37"
+    }
+  ]
+}

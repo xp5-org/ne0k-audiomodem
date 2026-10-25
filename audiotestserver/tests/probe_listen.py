@@ -1,25 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 XP5-ORG
+
 """
 tests/probe_listen.py  -  role: listen  (pair with probe_play.py)
 
-Records the probe sequence and analyses each frequency window.
+Records the probe sequence and analyses each frequency window: single FFT
+per window (not a per-frequency Goertzel loop), timing alignment against
+expected energy, ASCII SNR chart, per-frequency verdict with reason.
 
-Key improvements over v1:
-- Single FFT per window (not per-frequency Goertzel loop) - 60x faster
-- Timing alignment: detects the actual start of the probe sequence in the
-  recording by correlating against expected energy, corrects sample offsets
-- ASCII SNR chart printed to log for quick visual inspection
-- Clear per-frequency verdict with reason
-
-WAV capture
------------
-The full recording is saved to  <RUN_DIR>/<CLIENT_ID>_input.wav  immediately
-after recording completes, before analysis.  Use this WAV later to:
-  · regenerate the spectrograph with different parameters
-  · compare captures across runs
-  · feed into offline analysis scripts
+The full recording is saved to <RUN_DIR>/<CLIENT_ID>_input.wav before
+analysis, for regenerating the spectrograph, comparing captures across
+runs, or offline analysis.
 
 Outputs:
-  <CLIENT_ID>_input.wav      - raw mic recording (NEW)
+  <CLIENT_ID>_input.wav      - raw mic recording
   specprobe_report.json      - full per-frequency measurements
   result_<client>.json       - summary + recommended QAM subcarrier set
 """

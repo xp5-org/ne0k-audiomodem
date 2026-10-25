@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 XP5-ORG
+
 """
 tests/probe_play.py  -  role: play  (pair with probe_listen.py)
 
