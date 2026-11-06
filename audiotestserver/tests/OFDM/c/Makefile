@@ -57,8 +57,8 @@ endif
 LIB64 := libofdmacq.$(TAG)$(EXT)
 LIB32 := libofdmacq32.$(TAG)$(EXT)
 
-SRC := ofdm_acq.c ofdm_dem.c ofdm_fft.c ofdm_cfg.c ofdm_sym.c ofdm_mod.c ofdm_probe.c ofdm_sync.c ofdm_frame.c ../../c/rs255.c
-HDR := ofdm_acq.h ofdm_dem.h ofdm_fft.h ofdm_cfg.h ofdm_sym.h ofdm_mod.h ofdm_probe.h ofdm_sync.h ofdm_frame.h ../../c/rs255.h
+SRC := ofdm_acq.c ofdm_dem.c ofdm_fft.c ofdm_cfg.c ofdm_sym.c ofdm_mod.c ofdm_probe.c ofdm_sync.c ofdm_frame.c ofdm_fdd.c ofdm_dx.c ofdm_arq.c ofdm_rxf.c ofdm_rxs.c ../../c/rs255.c
+HDR := ofdm_acq.h ofdm_dem.h ofdm_fft.h ofdm_cfg.h ofdm_sym.h ofdm_mod.h ofdm_probe.h ofdm_sync.h ofdm_frame.h ofdm_fdd.h ofdm_dx.h ofdm_arq.h ofdm_rxf.h ofdm_rxs.h ../../c/rs255.h
 
 # ofdm_hs (HandshakeSM) is DSP-free and has no numpy oracle to grade against
 # -- it is not part of the .so, and is checked separately with its own host

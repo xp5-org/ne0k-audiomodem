@@ -122,6 +122,7 @@ int ofdm_sync_find(ofdm_sync *s, const double *rx, int n, int n_body_syms,
     int    SYM, L, md, d, cnt = 0, min_gap;
     int    last, in_region, region_d0, region_end;
     double P = 0.0, R1 = 0.0, R2 = 0.0, region_max = 0.0;
+    double last_sc = 0.0, last_rmax = 0.0;
     int    i;
 
     if (!s || !rx || !starts || max_starts < 1 || n_body_syms < 1) return -1;
@@ -178,7 +179,8 @@ int ofdm_sync_find(ofdm_sync *s, const double *rx, int n, int n_body_syms,
             }
             in_region = 0;
 
-            if (region_d0 - last >= min_gap) {
+            int inside = region_d0 - last < min_gap;
+            if (!inside || (cnt > 0 && region_max > last_rmax)) {
                 int    bi = ref_pos;
                 double sc = 1.0;
                 ofdm_sync_refine(s, rx, n, ref_pos, &bi, &sc);
@@ -188,9 +190,16 @@ int ofdm_sync_find(ofdm_sync *s, const double *rx, int n, int n_body_syms,
                  * startup click that consumed the min_gap slot would suppress
                  * the real first frame behind it. */
                 if (sc >= ncc_min) {
-                    if (cnt < max_starts) starts[cnt] = bi;
-                    cnt++;
-                    last = ref_pos;
+                    if (!inside) {
+                        if (cnt < max_starts) starts[cnt] = bi;
+                        cnt++;
+                        last = ref_pos; last_sc = sc; last_rmax = region_max;
+                    } else if (sc >= OFDM_SC_REPLACE_RATIO * last_sc) {
+                        /* Junk that passed ncc_min (the keyup tone) took this
+                         * slot just ahead of a real preamble: replace it. */
+                        if (cnt <= max_starts) starts[cnt - 1] = bi;
+                        last = ref_pos; last_sc = sc; last_rmax = region_max;
+                    }
                 }
             }
         }

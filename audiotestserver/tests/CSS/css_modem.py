@@ -46,14 +46,30 @@ TYPE_OFDM_HS_REQ  = 0x6   # "become OFDM handshake responder now" — the CSS
                           # control plane arranges the high-rate negotiation
                           # (V.8-style); the addressed peer ACKs, then both
                           # drop into the in-band OFDM handshake proper.
+# BLOCKOUT: an exclusive, scheduled quiet window for one peer-to-peer transfer.
+# Unlike OFDM_HS_REQ (unicast, bystanders only infer the hold from overhearing
+# someone else's REQ), both messages below are BROADCAST so every node gets
+# the window explicitly, including the duration -- a bystander that missed
+# the REQ (woke mid-window) still knows when to resume from BLOCKOUT_END, and
+# the REQ's own duration field is the fallback if END never arrives.
+TYPE_BLOCKOUT_REQ = 0x7   # "quiet down for <duration>: <peer_b> and I are
+                          # about to transfer" — broadcast; payload names the
+                          # OTHER participant (src is the announcer) and the
+                          # window length so every other node can hold off.
+TYPE_BLOCKOUT_END = 0x8   # "the window is over, resume" — broadcast by
+                          # whichever participant finished the transfer;
+                          # lets bystanders resume EARLY instead of waiting
+                          # out the full announced duration.
 
 TYPE_NAMES = {
-    TYPE_BEACON:      "BEACON",
-    TYPE_DATA:        "DATA",
-    TYPE_ACK:         "ACK",
-    TYPE_RANGE_REQ:   "RANGE_REQ",
-    TYPE_RANGE_REPLY: "RANGE_REPLY",
-    TYPE_OFDM_HS_REQ: "OFDM_HS_REQ",
+    TYPE_BEACON:       "BEACON",
+    TYPE_DATA:         "DATA",
+    TYPE_ACK:          "ACK",
+    TYPE_RANGE_REQ:    "RANGE_REQ",
+    TYPE_RANGE_REPLY:  "RANGE_REPLY",
+    TYPE_OFDM_HS_REQ:  "OFDM_HS_REQ",
+    TYPE_BLOCKOUT_REQ: "BLOCKOUT_REQ",
+    TYPE_BLOCKOUT_END: "BLOCKOUT_END",
 }
 
 # ── Field ranges ─────────────────────────────────────────────────────────────
@@ -138,6 +154,38 @@ def unpack_packet(raw: bytes) -> dict:
 def next_seq(seq: int) -> int:
     """Increment a 4-bit sequence number with wraparound."""
     return (int(seq) + 1) % SEQ_MODULO
+
+
+# ── Blockout payload helpers ─────────────────────────────────────────────────
+# TYPE_BLOCKOUT_REQ payload: [peer_b : 1 byte][duration : 2 bytes, big-endian
+# deciseconds].  peer_b gets a full byte (not packed into the header nibbles)
+# because the header's dst nibble is already spent on BROADCAST_ID -- the
+# announcer (src) and peer_b together name the exclusive pair.  Deciseconds
+# (0.1 s steps) cover 0..6553.5 s, comfortably past any one-way/two-way
+# transfer this mode is for, at a resolution nobody transferring audio-rate
+# payload will ever notice.
+BLOCKOUT_DURATION_SCALE = 0.1
+_BLOCKOUT_DUR_MAX = 0xFFFF
+
+
+def pack_blockout_req_payload(peer_b: int, duration_s: float) -> bytes:
+    """Encode a BLOCKOUT_REQ payload: the other participant + the window length."""
+    p = _check_nibble("peer_b", peer_b, ID_MIN, ID_MAX)
+    ds = int(round(float(duration_s) / BLOCKOUT_DURATION_SCALE))
+    if not (0 <= ds <= _BLOCKOUT_DUR_MAX):
+        raise ModemError(f"blockout duration {duration_s}s out of range "
+                         f"[0..{_BLOCKOUT_DUR_MAX * BLOCKOUT_DURATION_SCALE}]")
+    return bytes([p]) + ds.to_bytes(2, "big")
+
+
+def unpack_blockout_req_payload(payload: bytes) -> tuple[int, float]:
+    """Decode a BLOCKOUT_REQ payload.  Returns (peer_b, duration_s)."""
+    payload = bytes(payload)
+    if len(payload) < 3:
+        raise ModemError(f"blockout_req payload {len(payload)}B < 3B")
+    peer_b = payload[0]
+    ds = int.from_bytes(payload[1:3], "big")
+    return peer_b, ds * BLOCKOUT_DURATION_SCALE
 
 
 # ── Ranging payload helpers ──────────────────────────────────────────────────
@@ -230,6 +278,18 @@ def _selftest() -> int:
     # seq wrap
     check(next_seq(15) == 0, "seq wrap 15->0 failed")
     check(next_seq(0) == 1, "seq inc 0->1 failed")
+
+    # blockout payload round-trip, including the 0.1s rounding and both ends
+    for peer_b, dur in ((2, 0.0), (9, 90.0), (15, 6553.5)):
+        pb, got_dur = unpack_blockout_req_payload(
+            pack_blockout_req_payload(peer_b, dur))
+        check(pb == peer_b, f"blockout peer_b {pb}!={peer_b}")
+        check(abs(got_dur - dur) < 1e-9, f"blockout duration {got_dur}!={dur}")
+    try:
+        pack_blockout_req_payload(2, 6553.6)
+        check(False, "expected ModemError for an out-of-range duration")
+    except ModemError:
+        pass
 
     # range payload round-trip + distance math
     turn = 44100  # 1.0 s turnaround

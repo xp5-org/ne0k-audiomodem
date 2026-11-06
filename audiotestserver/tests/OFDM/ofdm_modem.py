@@ -281,6 +281,11 @@ _COH_MATCH    = 0.60  # per-symbol H match to count a symbol as "probe"
 # Rejecting junk-that-blocks is the job; rejecting junk-that-merely-fails is
 # what RS is for.
 SC_NCC_MIN    = 0.10
+# A later validated candidate inside an accepted one's min_gap replaces it only
+# when its NCC is at least this many times higher (see _find_sc_peaks' `score`).
+# The keyup tone scores about 0.12 against a real preamble's 0.9 and up.  At
+# 2x, a spurious peak needs twice a real frame's score to take its slot.
+SC_REPLACE_RATIO = 2.0
 # Candidates per block in _grid_coherence_scan.  Sets the working-set bound:
 # the scan holds (_COH_BLOCK + stride*(nsyms-1)) H rows, never the whole
 # capture, so memory is O(1) in capture length.  Purely a host tuning knob --
@@ -501,6 +506,7 @@ def _find_sc_peaks(
     min_gap_samples: int,   # minimum sample distance between consecutive frame starts
     threshold: float = 0.25,
     validate = None,        # optional (pos) -> bool; see below
+    score = None,           # optional (pos) -> float, the validator's NCC; see below
 ) -> list[int]:
     """Return refined frame-start sample indices from SC metric.
 
@@ -520,6 +526,20 @@ def _find_sc_peaks(
     needs sample timing, which coherence does not give) and so needs its own
     guard.  Default None keeps the previous behaviour exactly, for callers that
     only count peaks (ofdm_fdd_node's activity metric).
+
+    `score` handles junk that PASSES the validator.  ofdm_link.keyup() puts a
+    1 kHz tone in front of every burst.  Its SC metric is
+    cos^2(2*pi*1000*512/48000) = 0.25, which is the threshold exactly, so it
+    produces a rising edge about every millisecond for two seconds.  Its NCC
+    against the preamble is about 0.12, above SC_NCC_MIN.  The last tone edge
+    sat 50 ms ahead of the real preamble, was accepted, and its min_gap hid
+    the preamble.  That was every single-frame mesh DATA/ACK burst (group run
+    20261106_011344 _73f5).  So a later candidate inside an accepted
+    candidate's min_gap REPLACES it when its score is at least SC_REPLACE_RATIO
+    times higher.  Two real frames are never closer than min_gap, so this
+    cannot merge them.  The ratio keeps a real low-SNR start from losing its
+    slot to a merely higher-scoring spurious peak.  Mirrored in
+    ofdm_sync.c's ofdm_sync_find.
     """
     above = M > threshold
     if not np.any(above):
@@ -532,20 +552,30 @@ def _find_sc_peaks(
     refine_win  = symbol_samples
     peaks: list[int] = []
     last = -(min_gap * 2)
+    last_score = last_rmax = 0.0
     for d0 in edges:
-        if d0 - last < min_gap:
+        inside = d0 - last < min_gap
+        if inside and (score is None or not peaks):
             continue
         d1     = min(d0 + refine_win, len(M))
         region = M[d0:d1]
         if not len(region):
             continue
         r_max = float(np.max(region))
+        if inside and r_max <= last_rmax:
+            continue          # cheap pre-filter: a replacement must out-plateau the incumbent too
         hits  = np.where(region >= PLATEAU_F * r_max)[0]
         ref   = int(d0 + hits[0]) if len(hits) else d0
         if validate is not None and not validate(ref):
             continue          # deliberately does NOT set `last`
-        peaks.append(ref)
-        last = ref
+        s = float(score(ref)) if score is not None else 0.0
+        if inside:
+            if s < SC_REPLACE_RATIO * last_score:
+                continue
+            peaks[-1] = ref   # the incumbent was junk ahead of this preamble: replace it
+        else:
+            peaks.append(ref)
+        last, last_score, last_rmax = ref, s, r_max
     return peaks
 
 
@@ -1939,7 +1969,8 @@ class AdaptiveDemodulator:
             return m[1] >= SC_NCC_MIN
 
         peaks  = _find_sc_peaks(M, self.symbol_samples, data_min_gap, threshold,
-                                validate=_validate)
+                                validate=_validate,
+                                score=lambda pos: match[pos][1])
         stats:  list[dict]      = []
         chunks: dict[int, bytes] = {}
 

@@ -1,0 +1,8 @@
+numpy>=1.26.0
+scipy>=1.12.0          # WAV resampling, and the OFDM reference modem (tests/OFDM) imports it
+sounddevice>=0.4.6     # optional: system audio devices (needs libportaudio2); Pulse works without it
+reedsolo>=1.7         # OFDM Reed-Solomon (or build tests/c/librs255 and set RS_BACKEND=c)
+pytest>=8.0            # dev
+pytest-qt>=4.4   # dev; offscreen UI tests
+PySide6-Essentials>=6.6   # GUI only; the engine and CLI do not need it
+pyqtgraph>=0.13           # GUI only

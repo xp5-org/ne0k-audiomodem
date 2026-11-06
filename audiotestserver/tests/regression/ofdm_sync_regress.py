@@ -115,12 +115,22 @@ def main() -> int:
         payload = bytes((i * 37 + 11) & 0xFF for i in range(chunk * 3))
         sig = mod.encode_bytes(payload)
 
-        for snr in SNRS:
-            tag = f"{n_fft}/{fs}/b{bits}/{snr:.0f}dB"
+        # keyup=True prepends ofdm_link.keyup()'s 1 kHz lead tone.  Its SC
+        # metric sits on the 0.25 threshold and its NCC (~0.12) passes
+        # SC_NCC_MIN, so without the replace rule the last tone edge locks just
+        # ahead of frame 0 and hides it (mesh run 20261106_011344 _73f5).
+        for snr, keyup in [(s_, False) for s_ in SNRS] + [(s_, True) for s_ in SNRS]:
+            tag = f"{n_fft}/{fs}/b{bits}/{snr:.0f}dB" + ("/keyup" if keyup else "")
             rs = np.random.RandomState(int(snr) * 7 + n_fft)
             lead = 4000
-            rx = np.zeros(len(sig) + 2 * lead)
-            rx[lead:lead + len(sig)] = sig
+            if keyup:
+                ku = int(0.5 * fs)
+                tone = float(np.max(np.abs(sig))) * np.sin(2 * np.pi * 1000.0 * np.arange(ku) / fs)
+                sig_k = np.concatenate([tone, sig])
+            else:
+                sig_k = sig
+            rx = np.zeros(len(sig_k) + 2 * lead)
+            rx[lead:lead + len(sig_k)] = sig_k
             p = float(np.mean(sig ** 2))
             rx += rs.randn(len(rx)) * math.sqrt(p / 10 ** (snr / 10))
 
@@ -144,12 +154,17 @@ def main() -> int:
                 return m[1] >= M.SC_NCC_MIN
 
             peaks = M._find_sc_peaks(Mm, py["symbol_samples"], min_gap, 0.25,
-                                     validate=_validate)
+                                     validate=_validate,
+                                     score=lambda pos: match[pos][1])
             py_starts = [match[d][0] if d in match else
                          dem._refine_frame_start(rx, d) for d in peaks]
 
             if c_starts != py_starts:
                 print(f"  FAIL [{tag}] starts C={c_starts} py={py_starts}")
+                bad += 1
+            elif keyup and len(c_starts) != 3:
+                print(f"  FAIL [{tag}] keyup tone hid a frame: {len(c_starts)}/3 "
+                      f"starts {c_starts}")
                 bad += 1
             elif a.verbose:
                 print(f"  ok   [{tag}] {len(c_starts)} starts {c_starts}")

@@ -1,0 +1,15 @@
+# BuildKit picks this over the repo-root .dockerignore (which excludes
+# everything) for builds using docker/Dockerfile.  Allowlist: only what the
+# image copies.
+*
+!modemgui/requirements.txt
+!modemgui/docker/
+!modemgui/Makefile
+!modemgui/modemgui/
+!modemgui/tests/
+!tests/c/
+!tests/OFDM/c/
+!tests/CSS/c/
+**/__pycache__
+**/*.so
+**/*.dylib

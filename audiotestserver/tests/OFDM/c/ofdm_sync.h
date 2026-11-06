@@ -43,6 +43,12 @@ typedef struct ofdm_sync ofdm_sync;
  * populations overlap badly at low SNR -- rejecting junk that BLOCKS is the
  * job; rejecting junk that merely fails is what RS is for. */
 #define OFDM_SC_NCC_MIN 0.10
+/* A later validated candidate inside an accepted one's min_gap replaces it when
+ * its plateau is higher AND its NCC is at least this many times higher.  This
+ * mirrors SC_REPLACE_RATIO / _find_sc_peaks' `score` in ofdm_modem.py: the keyup
+ * tone (SC metric 0.25 = threshold, NCC ~0.12) otherwise locks 50 ms ahead of
+ * the real preamble and hides it. */
+#define OFDM_SC_REPLACE_RATIO 2.0
 
 /* Default metric threshold, matching the reference's 0.25. */
 #define OFDM_SC_THRESHOLD 0.25

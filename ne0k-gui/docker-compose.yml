@@ -1,0 +1,76 @@
+# modemgui — Linux/docker audio environment.
+#
+#   docker compose -f modemgui/docker-compose.yml build     (from /audiotestserver)
+#   docker compose -f modemgui/docker-compose.yml run --rm modemgui
+#   docker compose -f modemgui/docker-compose.yml run --rm modemgui \
+#       python -m modemgui loopback --tx pulse:SINK --rx pulse:SINK.monitor
+#
+# AUDIO.  Pick ONE of the three; see README.md.
+#   A. PulseAudio over TCP (default; also the macOS/Windows-host route).
+#      On the host:  pactl load-module module-native-protocol-tcp \
+#                      auth-ip-acl=127.0.0.1;172.16.0.0/12 port=4713
+#   B. Host Pulse/PipeWire unix socket (Linux host, no TCP, no ACL to open):
+#      uncomment the socket volume + PULSE_SERVER=unix:... lines below.
+#   C. Raw ALSA (Linux host): uncomment `devices:`; the `sd:` connector sees the
+#      cards directly and `pulse:` will report itself unavailable.
+
+services:
+  modemgui:
+    build:
+      context: ..                         # repo root: needs tests/*/c for the C cores
+      dockerfile: modemgui/docker/Dockerfile
+    image: modemgui:debian13
+    container_name: modemgui
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      PULSE_SERVER: "tcp:host.docker.internal:4713"        # A
+      # PULSE_SERVER: "unix:/run/pulse/native"             # B
+      # MODEMGUI_PLUGIN_PATH: /plugins                     # connector plugins
+    volumes:
+      - ..:/audiotestserver                                # live code; C is rebuilt on start
+      # - ${XDG_RUNTIME_DIR}/pulse/native:/run/pulse/native   # B
+      # - ./plugins:/plugins:ro
+    # devices: ["/dev/snd:/dev/snd"]                       # C
+    # group_add: ["audio"]                                 # C
+    # ports: ["8090:8090"]                                 # reserved for the GUI server
+    stdin_open: true
+    tty: true
+
+  # Qt GUI on a Linux desktop / xrdp session:   docker compose --profile gui run --rm gui
+  # Tests (offscreen):                          docker compose --profile gui run --rm gui-test
+  # Windows/macOS: run natively instead (see PLAN.md); Docker there is a VM with no USB or display.
+  gui:
+    profiles: ["gui"]
+    build:
+      context: ..
+      dockerfile: modemgui/docker/Dockerfile
+      target: gui
+    image: modemgui:gui
+    environment:
+      DISPLAY: "${DISPLAY:-:0}"
+      QT_QPA_PLATFORM: xcb
+      XAUTHORITY: /tmp/.docker.xauth        # see x11 note below
+      PULSE_SERVER: "${PULSE_SERVER:-unix:/run/pulse/native}"
+      QT_X11_NO_MITSHM: "1"
+    network_mode: host                      # reaches the xrdp display (:10) and the TCP Pulse server
+    volumes:
+      - ..:/audiotestserver
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-${HOME}/.Xauthority}:/tmp/.docker.xauth:ro
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/pulse/native:/run/pulse/native
+    # USB (Pico / Pluto): devices: ["/dev/bus/usb:/dev/bus/usb"]  (+ udev rules on the host)
+    command: ["python", "-m", "modemgui", "gui"]
+
+  gui-test:
+    profiles: ["gui"]
+    image: modemgui:gui
+    build:
+      context: ..
+      dockerfile: modemgui/docker/Dockerfile
+      target: gui
+    environment:
+      QT_QPA_PLATFORM: offscreen
+    volumes:
+      - ..:/audiotestserver
+    command: ["python", "-m", "pytest", "-q"]

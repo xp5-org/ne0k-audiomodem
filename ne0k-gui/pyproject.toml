@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modemgui"
+version = "0.1.0"
+description = "GUI and audio pipe for the OFDM and CSS modems"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "scipy>=1.12"]
+
+[project.optional-dependencies]
+audio = ["sounddevice>=0.4.6"]
+gui = ["PySide6-Essentials>=6.6", "pyqtgraph>=0.13", "sounddevice>=0.4.6", "reedsolo>=1.7"]
+ofdm = ["reedsolo>=1.7"]
+dev = ["pytest>=8", "pytest-qt>=4.4"]
+
+[project.scripts]
+modemgui = "modemgui.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["modemgui*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

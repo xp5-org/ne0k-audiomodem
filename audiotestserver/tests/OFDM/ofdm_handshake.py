@@ -169,6 +169,12 @@ MSG_GO         = 3
 MSG_RETRY      = 4
 MSG_FIN        = 5
 MSG_BAND       = 6      # renegotiate the band for ONE direction (see below)
+MSG_ANNOUNCE   = 7      # mesh presence round: body = [id u8][heard mask u16][flags u8] (see modemgui ofdm_announce)
+MSG_BLOCKOUT_REQ = 8    # mesh blockout window open: body = [announcer u8][peer u8][duration u16] (see modemgui
+                        # mesh_node.send_blockout) -- OFDM-only: CSS's baud rate can't carry this
+MSG_BLOCKOUT_END = 9    # mesh blockout window closed early: body = [announcer u8] (see mesh_node.end_blockout)
+MSG_BAT_TABLES = 10     # mesh broadcast BAT round: measured tables, a report or the coordinator's confirm (see
+                        # modemgui ofdm_announce.pack_tables) -- bootstrap ladder step, like BAT_REPORT
 
 # Band renegotiation.  Only the RECEIVER of a probe can judge which part of the
 # spectrum actually survives a path, so each direction's band is chosen by the
@@ -400,7 +406,8 @@ def bat_rle_unpack(blob: bytes) -> bytes:
     return _codes_pack(np.array(codes, dtype=np.uint8))
 
 _MSG_NAMES = {1: "BAT_REPORT", 2: "BAT_ACK", 3: "GO", 4: "RETRY", 5: "FIN",
-              6: "BAND"}
+              6: "BAND", 7: "ANNOUNCE", 8: "BLOCKOUT_REQ", 9: "BLOCKOUT_END",
+              10: "BAT_TABLES"}
 
 
 def pack_band(lo_hz: float, hi_hz: float,
@@ -977,7 +984,8 @@ HS_RL_BOOTSTRAP_STEP = 2
 #   two ends decoding on DIFFERENT carrier grids permanently, with no path back
 #   -- the one message in the protocol whose loss is unrecoverable.
 #   MSG_RETRY is the recovery path itself; if it needs recovering, nothing does.
-HS_RL_ALWAYS_ROBUST = frozenset({6, 4})     # MSG_BAND, MSG_RETRY
+HS_RL_ALWAYS_ROBUST = frozenset({6, 4, 7, 8, 9})     # MSG_BAND, MSG_RETRY, MSG_ANNOUNCE, MSG_BLOCKOUT_REQ,
+                                                      # MSG_BLOCKOUT_END (all sent before any BAT exists)
 
 
 def geometry_step_cap(msg_cfg: dict) -> int:
