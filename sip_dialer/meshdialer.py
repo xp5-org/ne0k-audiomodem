@@ -63,7 +63,7 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BRIDGE = os.path.join(HERE, "..", "..", "audiomodem_linux", "sipbridge.py")
+DEFAULT_BRIDGE = os.path.join(HERE, "sipbridge.py")
 
 
 def log(msg: str) -> None:
