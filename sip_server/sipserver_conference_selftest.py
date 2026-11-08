@@ -122,8 +122,9 @@ def main():
     tmp = tempfile.mkdtemp(prefix="conference_selftest_")
     cfg = {"listen": {"host": "127.0.0.1", "port": 0}, "rtp_ports": [31700, 31900],
            "ready_file": os.path.join(tmp, "ready"),
-           "lines": {"room": {"type": "conference"}, "small": {"type": "conference", "max_members": 2}},
-           "numbers": {"3000": {"lines": ["room"]}, "3001": {"lines": ["small"]}}}
+           "lines": {"room": {"type": "conference"}, "small": {"type": "conference", "max_members": 2},
+                     "reap": {"type": "conference", "max_members": 2, "rtp_timeout_s": 3}},
+           "numbers": {"3000": {"lines": ["room"]}, "3001": {"lines": ["small"]}, "3002": {"lines": ["reap"]}}}
     cfg_path, log_path = os.path.join(tmp, "cfg.json"), os.path.join(tmp, "server.log")
     json.dump(cfg, open(cfg_path, "w"))
     proc = subprocess.Popen([sys.executable, os.path.join(HERE, "sipserver.py"), "--config", cfg_path],
@@ -163,12 +164,34 @@ def main():
         D, E, F = (Caller(u, srv, "3001", 800) for u in ("1011", "1012", "1013"))
         st = [D.invite(), E.invite(), F.invite()]
         check("full room answers busy (200, 200, 486)", st == [200, 200, 486], st)
-        for c in (A, B, D, E):
+        # dropped client: H stops sending RTP without a BYE (killed). After rtp_timeout_s the server must BYE it
+        # and give its seat back; G, still streaming, stays in.
+        G, H, I = (Caller(u, srv, "3002", f) for u, f in (("1021", 600), ("1022", 900), ("1023", 1300)))
+        check("reap room: G and H joined", [G.invite(), H.invite()] == [200, 200])
+        run([G, H], 0.5)
+        run([G], 4.5)                                    # H silent 4.5 s > rtp_timeout_s 3 (> the 2 s ring of an invite)
+        H.sip.settimeout(0.2)
+        got_bye = False
+        try:
+            while True:
+                m = sc.parse(H.sip.recvfrom(4096)[0])
+                if m.is_request and m.method == "BYE":
+                    got_bye = True
+        except (socket.timeout, OSError):
+            pass
+        check("reap room: silent H was sent a BYE", got_bye)
+        check("reap room: H's seat is free again (I gets 200, not 486)", I.invite() == 200)
+        run([G, I], 0.6)                                 # drains G's backlog from the invite, I's buffer primes
+        G.heard.clear()
+        run([G, I], 1.5)
+        check("reap room: G (still streaming) was kept and hears I", level([p[12:] for p in G.heard[10:60]], 1300) > 3000)
+        for c in (A, B, D, E, G, I):
             c.bye()
         time.sleep(0.5)
         log = open(log_path).read()
         check("log: conference joined (members=3)", "conference room: joined (members=3)" in log, log)
         check("log: conference left", "conference room: left" in log, log)
+        check("log: reap room reaped exactly the silent member", log.count("conference reap: no RTP") == 1, log)
     finally:
         proc.terminate()
         proc.wait(5)

@@ -1025,6 +1025,7 @@ class ConfMember:
         self.primed = False         # playout starts once `prime` frames are buffered
         self.hold = False           # drift correction: skip advancing for one tick
         self.idle = 0               # consecutive ticks with nothing buffered
+        self.last_rx = time.monotonic()   # newest RTP packet of any kind (join counts): rtp_timeout_s reaps on this
         self.seq = random.getrandbits(16)
         self.ts = random.getrandbits(32)
         self.ssrc = random.getrandbits(32)
@@ -1051,7 +1052,9 @@ class ConferenceLine(LineBase):
     hard bound; beyond it a frame is dropped even mid-burst, counted in `overruns`), drift_slack_frames (4: depth
     above prime + this is trimmed in silence), silence_level (64: |sample| at or below it counts as silent), idle_frames (25: this long with nothing
     buffered = the sender stopped; playout waits and re-primes),
-    mix_gain (1.0). Log: "conference NAME: cN joined (members=K)", "conference NAME: cN left (members=K) ..." with
+    mix_gain (1.0), rtp_timeout_s (10: a member whose RTP has stopped this long is dropped from the room and sent
+    a BYE -- a client killed without hanging up would otherwise hold its seat forever and fill the room; every
+    client streams RTP the whole call, listeners included (digital silence); 0 = never). Log: "conference NAME: cN joined (members=K)", "conference NAME: cN left (members=K) ..." with
     the buffer counters."""
 
     audio_relay = True       # the caller's RTP arrives whole via on_audio, no byte pipe
@@ -1067,6 +1070,7 @@ class ConferenceLine(LineBase):
         self.quiet = int(cfg.get("silence_level", 64))
         self.idle_ticks = int(cfg.get("idle_frames", 25))
         self.gain = float(cfg.get("mix_gain", 1.0))
+        self.rtp_timeout = float(cfg.get("rtp_timeout_s", 10) or 0)
         self.task = None
 
     def admits(self, call):
@@ -1082,7 +1086,10 @@ class ConferenceLine(LineBase):
 
     def on_audio(self, call, pkt):
         m = self.members.get(call)
-        if m is None or len(pkt) < 12:
+        if m is None:
+            return
+        m.last_rx = time.monotonic()                        # any packet proves the client is alive
+        if len(pkt) < 12:
             return
         if pkt[0] & 0x10:                                   # header extension
             return
@@ -1116,12 +1123,32 @@ class ConferenceLine(LineBase):
     async def _mixer(self):
         loop = asyncio.get_running_loop()
         nxt = loop.time()
+        reap_at = 0.0
         while self.members:
             nxt += TICK
+            if self.rtp_timeout > 0 and loop.time() >= reap_at:
+                reap_at = loop.time() + 1.0
+                self._reap()
             self._tick()
             await asyncio.sleep(max(0.0, nxt - loop.time()))
             if loop.time() - nxt > 0.5:                     # the process stalled: resynchronise, don't burst
                 nxt = loop.time()
+
+    def _reap(self):
+        """Drop members whose RTP stopped rtp_timeout_s ago: free the seat now, then BYE (a dead client never answers
+        it; _send_bye gives up after 4 tries).  A half-dead one that is still listening is told the call is over."""
+        now = time.monotonic()
+        for call, m in list(self.members.items()):
+            gone = now - m.last_rx
+            if gone < self.rtp_timeout:
+                continue
+            log(f"{call.label} conference {self.name}: no RTP for {gone:.1f} s (rtp_timeout_s={self.rtp_timeout:g}) -- reaping")
+            call.event("conf_reap", silent_s=round(gone, 1))
+            self.on_end(call)                               # pops it: the room has the seat back at once
+            if call.state == "answered":
+                call.hangup("rtp timeout")
+            else:
+                call.end("rtp timeout")
 
     def _take(self, m):
         """The member's next 20 ms frame as decoded samples, or None (not playing / silence).
