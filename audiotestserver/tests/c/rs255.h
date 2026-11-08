@@ -54,6 +54,13 @@ int rs255_encode(rs255 *rs, const unsigned char *msg, int n,
 int rs255_decode(rs255 *rs, const unsigned char *buf, int n,
                  unsigned char *out, int out_cap, int *errata);
 
+/* Errors-and-erasures decode with reedsolo's exact algorithm and errata
+ * count (see rs255.c).  erase_pos are byte indices into buf, as reedsolo's
+ * RSCodec.decode(erase_pos=...) takes them.  Same returns as rs255_decode. */
+int rs255_decode_era(rs255 *rs, const unsigned char *buf, int n,
+                     const int *erase_pos, int n_erase,
+                     unsigned char *out, int out_cap, int *errata);
+
 /* Introspection: parity symbols per block, and the message bytes per block. */
 int rs255_nsym(const rs255 *rs);
 int rs255_block_k(const rs255 *rs);

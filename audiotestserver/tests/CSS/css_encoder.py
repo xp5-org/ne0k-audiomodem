@@ -68,6 +68,7 @@ Recommended: interleave_rows=8, rs_t=4, diff_encode=true, conv_code="k7r12".
 """
 
 import json
+import os
 import sys
 import wave
 import zlib
@@ -430,8 +431,23 @@ def encode(cfg):
 
     try:
         # Linear FM chirps -- unwindowed rectangular envelope (matched to decoder MF).
-        up_chirp   = generate_chirp(f_min, f_max, symbol_dur, fs)
-        down_chirp = generate_chirp(f_max, f_min, symbol_dur, fs)
+        # CSS_ENC_BACKEND=c: chirp table, seq+data+CRC and the bit pipeline
+        # (diff -> conv -> interleave) come from libcssenc (tests/CSS/c), the
+        # same C css_enc_regress grades against the Python helpers.  RS stays on
+        # _make_rs_codec (RS_BACKEND).  Requested but unloadable RAISES: a silent
+        # Python fallback would be logged as a C encode.
+        enc_c = enc_g = None
+        if os.environ.get("CSS_ENC_BACKEND", "").lower() == "c":
+            import css_enc_c
+            css_enc_c.require()
+            enc_c = css_enc_c
+            enc_g = css_enc_c.geometry(chunk_size, rs_t, conv_code, diff_enc, interleave_rows)
+            print(f"ENC_BACKEND=c frame_symbols={enc_g.frame_symbols}", flush=True)
+            up_chirp   = enc_c.chirp(f_min, f_max, symbol_dur, fs)
+            down_chirp = enc_c.chirp(f_max, f_min, symbol_dur, fs)
+        else:
+            up_chirp   = generate_chirp(f_min, f_max, symbol_dur, fs)
+            down_chirp = generate_chirp(f_max, f_min, symbol_dur, fs)
         # Payload source: a raw-bytes path for the modem layer (binary packets
         # whose bytes must survive intact), falling back to the UTF-8 text path
         # for plain-text messages.  message_bytes accepts bytes/bytearray or a
@@ -516,6 +532,17 @@ def encode(cfg):
             if actual_chunk_len < chunk_size:
                 chunk = chunk + b'\x00' * (chunk_size - actual_chunk_len)
             seq_num = (i // chunk_size) % 256
+            if enc_c is not None:
+                inner = enc_c.enc_inner(enc_g, seq_num, chunk)
+                frame = rs_encode_frame(inner, rs_codec)
+                bits = enc_c.enc_bits(enc_g, frame,
+                                      diff_ref=preamble[-1] if diff_enc else 0)
+                for bit in bits:
+                    _append_sym(up_chirp if bit == 1 else down_chirp)
+                num_frames += 1
+                print(f"encoded frame {num_frames} seq={seq_num} "
+                      f"({i + actual_chunk_len}/{len(raw_data)} bytes)", flush=True)
+                continue
             crc     = frame_crc(seq_num, chunk)
 
             inner = bytes([seq_num]) + chunk + crc

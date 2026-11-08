@@ -24,7 +24,13 @@ struct rs255 {
     unsigned char *omega;  /* nsym+1                                     */
     unsigned char *pos;    /* nsym  : error positions within the block   */
     unsigned char *blk;    /* 255   : working copy of one block          */
+    unsigned char *era;    /* RS_ERA_SCRATCH : rs255_decode_era scratch  */
 };
+
+/* rs255_decode_era works on reedsolo's own polynomial representation
+ * (highest degree first, Python list semantics) in 8 rows of 512 bytes. */
+#define RS_ERA_ROW     512
+#define RS_ERA_SCRATCH (8 * RS_ERA_ROW)
 
 static size_t al8(size_t v) { return (v + 7u) & ~(size_t)7u; }
 
@@ -70,7 +76,8 @@ size_t rs255_workspace(int nsym)
          + al8((size_t)nsym + 1)          /* tmp   */
          + al8((size_t)nsym + 1)          /* omega */
          + al8((size_t)nsym)              /* pos   */
-         + al8(255);                      /* blk   */
+         + al8(255)                       /* blk   */
+         + al8(RS_ERA_SCRATCH);           /* era   */
 }
 
 int rs255_init(rs255 **rsp, void *mem, size_t memlen, int nsym)
@@ -94,7 +101,8 @@ int rs255_init(rs255 **rsp, void *mem, size_t memlen, int nsym)
     r->tmp   = p;               p += al8((size_t)nsym + 1);
     r->omega = p;               p += al8((size_t)nsym + 1);
     r->pos   = p;               p += al8((size_t)nsym);
-    r->blk   = p;
+    r->blk   = p;               p += al8(255);
+    r->era   = p;
 
     r->nsym = nsym;
     r->k    = RS_NSIZE - nsym;
@@ -330,6 +338,252 @@ int rs255_decode(rs255 *r, const unsigned char *buf, int n,
         for (i = 0; i < dlen; i++) out[wr + i] = r->blk[i];
         wr  += dlen;
         off += blen;
+    }
+    *errata = total;
+    return wr;
+}
+
+
+/* ===========================================================================
+ * Errors-and-erasures decode, a line-for-line port of reedsolo 1.7
+ * rs_correct_msg (Forney syndromes -> Berlekamp-Massey with erase_count ->
+ * brute-force Chien -> rs_correct_errata with the FULL syndrome).  Kept as a
+ * separate path from decode_block so the errors-only decoder above, already
+ * held byte-identical to reedsolo, is untouched; this one exists because the
+ * streaming PLL decoder marks erasures and needs reedsolo's exact behaviour,
+ * including its errata count (erasures are counted even when the syndrome is
+ * already clean) and its failure conditions.
+ *
+ * Polynomials here are (array, length) pairs, highest degree first, exactly
+ * like the Python lists, so the Python index arithmetic (including negative
+ * indices) can be mirrored without re-deriving it.
+ * ======================================================================== */
+
+static unsigned char ra_pow(const rs255 *r, unsigned char x, int power)
+{
+    int e;
+    if (x == 0) return 0;                 /* reedsolo: gf_exp[(log*p)%255], log[0] unused */
+    e = ((int)r->log[x] * power) % 255;
+    if (e < 0) e += 255;                   /* Python % is non-negative */
+    return r->exp[e];
+}
+
+static unsigned char ra_eval(const rs255 *r, const unsigned char *p, int n,
+                             unsigned char x)
+{
+    unsigned char y;
+    int i;
+    if (n <= 0) return 0;
+    y = p[0];
+    for (i = 1; i < n; i++) y = (unsigned char)(gmul(r, y, x) ^ p[i]);
+    return y;
+}
+
+/* out = p + q, right-aligned (gf_poly_add); returns length. out may alias p. */
+static int ra_add(const unsigned char *p, int np, const unsigned char *q,
+                  int nq, unsigned char *out)
+{
+    int n = np > nq ? np : nq, i;
+    unsigned char t[RS_ERA_ROW];
+    for (i = 0; i < n; i++) t[i] = 0;
+    for (i = 0; i < np; i++) t[n - np + i] = p[i];
+    for (i = 0; i < nq; i++) t[i + n - nq] ^= q[i];
+    for (i = 0; i < n; i++) out[i] = t[i];
+    return n;
+}
+
+static int ra_mul(const rs255 *r, const unsigned char *p, int np,
+                  const unsigned char *q, int nq, unsigned char *out)
+{
+    int n = np + nq - 1, i, j;
+    unsigned char t[RS_ERA_ROW];
+    for (i = 0; i < n; i++) t[i] = 0;
+    for (j = 0; j < nq; j++)
+        for (i = 0; i < np; i++)
+            t[i + j] ^= gmul(r, p[i], q[j]);
+    for (i = 0; i < n; i++) out[i] = t[i];
+    return n;
+}
+
+static void ra_scale(const rs255 *r, const unsigned char *p, int n,
+                     unsigned char x, unsigned char *out)
+{
+    int i;
+    for (i = 0; i < n; i++) out[i] = gmul(r, p[i], x);
+}
+
+static int ra_syndromes_zero(const rs255 *r, const unsigned char *msg, int len,
+                             unsigned char *synd /* nsym+1 */)
+{
+    int i, zero = 1;
+    synd[0] = 0;
+    for (i = 0; i < r->nsym; i++) {
+        synd[i + 1] = ra_eval(r, msg, len, ra_pow(r, (unsigned char)RS_GEN, i + RS_FCR));
+        if (synd[i + 1]) zero = 0;
+    }
+    return zero;
+}
+
+/* One block. epos: erasure indices within the block. Returns errata count
+ * (len(erase_pos + err_pos)) or -1 for ReedSolomonError. */
+static int decode_block_era(rs255 *r, unsigned char *msg, int len,
+                            const int *epos, int ne)
+{
+    const int nsym = r->nsym;
+    unsigned char *synd  = r->era + 0 * RS_ERA_ROW;
+    unsigned char *fsynd = r->era + 1 * RS_ERA_ROW;
+    unsigned char *eloc  = r->era + 2 * RS_ERA_ROW;
+    unsigned char *oloc  = r->era + 3 * RS_ERA_ROW;
+    unsigned char *tmp   = r->era + 4 * RS_ERA_ROW;
+    unsigned char *tmp2  = r->era + 5 * RS_ERA_ROW;
+    unsigned char *E     = r->era + 6 * RS_ERA_ROW;
+    unsigned char *evl   = r->era + 7 * RS_ERA_ROW;
+    int errpos[RS_ERA_ROW], coef[RS_ERA_ROW];
+    unsigned char X[RS_ERA_ROW];
+    int nel, nol, i, j, nerr = 0, nall, nfs;
+
+    if (len > 255) return -1;
+    for (i = 0; i < ne; i++) {
+        if (epos[i] < 0 || epos[i] >= len) return -1;   /* Python IndexError */
+        msg[epos[i]] = 0;
+    }
+    if (ne > nsym) return -1;                      /* "Too many erasures" */
+    if (ra_syndromes_zero(r, msg, len, synd)) return ne;
+
+    /* --- rs_forney_syndromes */
+    nfs = nsym;
+    for (i = 0; i < nfs; i++) fsynd[i] = synd[i + 1];
+    for (i = 0; i < ne; i++) {
+        unsigned char x = ra_pow(r, (unsigned char)RS_GEN, len - 1 - epos[i]);
+        for (j = 0; j < nfs - 1; j++)
+            fsynd[j] = (unsigned char)(gmul(r, fsynd[j], x) ^ fsynd[j + 1]);
+    }
+
+    /* --- rs_find_error_locator(fsynd, nsym, erase_count=ne) */
+    eloc[0] = 1; nel = 1;
+    oloc[0] = 1; nol = 1;
+    for (i = 0; i < nsym - ne; i++) {
+        int K = i;                                  /* synd_shift = 0 */
+        unsigned char delta = fsynd[K];
+        for (j = 1; j < nel; j++) {
+            int si = K - j;
+            if (si < 0) si += nfs;                  /* Python negative index */
+            delta ^= gmul(r, eloc[nel - (j + 1)], fsynd[si]);
+        }
+        oloc[nol++] = 0;                            /* old_loc + [0] */
+        if (delta != 0) {
+            if (nol > nel) {
+                int nn = nol;
+                ra_scale(r, oloc, nol, delta, tmp);              /* new_loc */
+                ra_scale(r, eloc, nel, ginv(r, delta), oloc);    /* old_loc */
+                nol = nel;
+                for (j = 0; j < nn; j++) eloc[j] = tmp[j];
+                nel = nn;
+            }
+            ra_scale(r, oloc, nol, delta, tmp2);
+            nel = ra_add(eloc, nel, tmp2, nol, eloc);
+        }
+    }
+    /* drop leading zeros */
+    i = 0;
+    while (i < nel && eloc[i] == 0) i++;
+    if (i) { for (j = 0; j < nel - i; j++) eloc[j] = eloc[j + i]; nel -= i; }
+    {
+        int errs = nel - 1;
+        if ((errs - ne) * 2 + ne > nsym) return -1;  /* "Too many errors" */
+    }
+
+    /* --- rs_find_errors(err_loc[::-1], len) */
+    for (i = 0; i < nel; i++) tmp[i] = eloc[nel - 1 - i];
+    for (i = 0; i < len; i++) {
+        if (ra_eval(r, tmp, nel, ra_pow(r, (unsigned char)RS_GEN, i)) == 0) {
+            if (nerr >= RS_ERA_ROW) return -1;
+            errpos[nerr++] = len - 1 - i;
+        }
+    }
+    if (nerr != nel - 1) return -1;
+
+    /* --- rs_correct_errata(msg, synd, erase_pos + err_pos) */
+    nall = ne + nerr;
+    if (nall > RS_ERA_ROW / 2) return -1;
+    for (i = 0; i < ne; i++)   coef[i] = len - 1 - epos[i];
+    for (i = 0; i < nerr; i++) coef[ne + i] = len - 1 - errpos[i];
+    /* errata locator: prod (1 + x*alpha^c), as [alpha^c, 1] factors */
+    eloc[0] = 1; nel = 1;
+    for (i = 0; i < nall; i++) {
+        unsigned char f[2];
+        f[0] = ra_pow(r, (unsigned char)RS_GEN, coef[i]); f[1] = 1;
+        nel = ra_mul(r, eloc, nel, f, 2, eloc);
+    }
+    /* evaluator: remainder of (synd[::-1] * err_loc) / x^(L+1) = last L+1
+     * coefficients of the product (the divisor has no other terms), then
+     * reversed. */
+    {
+        int ns = nsym + 1, np, L = nel - 1;
+        for (i = 0; i < ns; i++) tmp[i] = synd[ns - 1 - i];
+        np = ra_mul(r, tmp, ns, eloc, nel, tmp2);
+        for (i = 0; i < L + 1; i++) evl[i] = tmp2[np - (L + 1) + i];
+        /* [::-1] once for err_eval, and gf_poly_eval(err_eval[::-1]) undoes
+         * it: evaluate the remainder in its original order. */
+    }
+    for (i = 0; i < nall; i++) {
+        int l = 255 - coef[i];
+        X[i] = ra_pow(r, (unsigned char)RS_GEN, -l);
+    }
+    for (i = 0; i < len; i++) E[i] = 0;
+    {
+        int L1 = nel;      /* evaluator length = L + 1 = nel */
+        for (i = 0; i < nall; i++) {
+            unsigned char Xi_inv = ginv(r, X[i]);
+            unsigned char prime = 1, y;
+            for (j = 0; j < nall; j++) {
+                if (j != i)
+                    prime = gmul(r, prime, (unsigned char)(1 ^ gmul(r, Xi_inv, X[j])));
+            }
+            if (prime == 0) return -1;
+            y = ra_eval(r, evl, L1, Xi_inv);
+            y = gmul(r, ra_pow(r, X[i], 1 - RS_FCR), y);
+            {
+                int pos = i < ne ? epos[i] : errpos[i - ne];
+                E[pos] = gdiv(r, y, prime);
+            }
+        }
+    }
+    for (i = 0; i < len; i++) msg[i] ^= E[i];
+    if (!ra_syndromes_zero(r, msg, len, synd)) return -1;
+    return nall;
+}
+
+int rs255_decode_era(rs255 *r, const unsigned char *buf, int n,
+                     const int *erase_pos, int n_erase,
+                     unsigned char *out, int out_cap, int *errata)
+{
+    int off = 0, wr = 0, total = 0, blkno = 0;
+    int ep[RS_ERA_ROW];
+    if (!r || !buf || !out || !errata || n < 0 || n_erase < 0) return -1;
+    if (n_erase > 0 && !erase_pos) return -1;
+    *errata = 0;
+    while (off < n) {
+        int blen = n - off, dlen, ne = 0, i, got;
+        if (blen > RS_NSIZE) blen = RS_NSIZE;
+        if (blen <= r->nsym) return -1;
+        dlen = blen - r->nsym;
+        /* reedsolo: e_pos = [x for x in erase_pos if x < nsize], then shifts
+         * the remainder down by nsize for the next chunk. */
+        for (i = 0; i < n_erase; i++) {
+            int x = erase_pos[i] - blkno * RS_NSIZE;
+            if (x >= 0 && x < RS_NSIZE) {
+                if (ne >= RS_ERA_ROW) return -3;
+                ep[ne++] = x;
+            }
+        }
+        for (i = 0; i < blen; i++) r->blk[i] = buf[off + i];
+        got = decode_block_era(r, r->blk, blen, ep, ne);
+        if (got < 0) return -3;
+        total += got;
+        if (wr + dlen > out_cap) return -2;
+        for (i = 0; i < dlen; i++) out[wr + i] = r->blk[i];
+        wr += dlen; off += blen; blkno++;
     }
     *errata = total;
     return wr;

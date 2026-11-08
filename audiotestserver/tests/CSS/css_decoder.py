@@ -490,6 +490,13 @@ def _frame_pipeline(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
     counts simply ignore rs_err.
     """
     fb = list(fb); fc = list(fc)
+    if os.environ.get("CSS_ENC_BACKEND", "").lower() == "c":
+        return _frame_pipeline_c(fb, fc, interleave_rows=interleave_rows,
+                                 conv_code=conv_code, diff_enc=diff_enc,
+                                 diff_ref=diff_ref, base_bits=base_bits,
+                                 rs_codec=rs_codec, chunk_size=chunk_size,
+                                 era_thr=era_thr, frame_snr=frame_snr,
+                                 verbose=verbose)
     if interleave_rows > 1:
         n_coded = len(fb)
         cols    = n_coded // interleave_rows
@@ -528,6 +535,61 @@ def _frame_pipeline(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
                 print(f"RS_FAIL snr={frame_snr:.1f}dB err={e}", flush=True)
             raw = b""
     ok, seq, dat = check_crc(raw, chunk_size)
+    return ok, seq, dat, rs_err, rs_fail
+
+
+_DEC_C_GEOM: dict = {}
+
+
+def _frame_pipeline_c(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
+                      base_bits, rs_codec, chunk_size, era_thr, frame_snr, verbose):
+    """CSS_ENC_BACKEND=c: _frame_pipeline with deinterleave, Viterbi, diff
+    decode, bit packing and CRC in libcssenc (css_dec.c).  RS stays on
+    rs_decode_frame (RS_BACKEND).  Same mapping css_dec_regress pins
+    (dec_raw + check_crc; dec_raw's byte confidence is min|fc| per byte, the
+    erasure key below).  Requested but unloadable raises, never falls back.
+    """
+    import css_enc_c
+    key = (chunk_size, base_bits, conv_code, bool(diff_enc), interleave_rows)
+    g = _DEC_C_GEOM.get(key)
+    if g is None:
+        rs_t = (base_bits // 8 - chunk_size - 1 - 4) // 2
+        g = css_enc_c.geometry(chunk_size, rs_t, conv_code, diff_enc, interleave_rows)
+        if g.base_bits != base_bits:
+            raise ValueError(f"libcssenc geometry base_bits={g.base_bits} != "
+                             f"decoder base_bits={base_bits} (cs={chunk_size})")
+        _DEC_C_GEOM[key] = g
+        print(f"DEC_BACKEND=c base_bits={g.base_bits} frame_symbols={g.frame_symbols}",
+              flush=True)
+    try:
+        raw, bconf = css_enc_c.dec_raw(g, [1 if b else 0 for b in fb],
+                                       [float(c) for c in fc], diff_ref)
+    except ValueError as e:             # malformed frame length: a CRC miss, as in Python
+        if verbose:
+            print(f"DEC_C reject n={len(fb)} err={e}", flush=True)
+        return False, 0, b"", 0, None
+    era = []
+    if rs_codec is not None and era_thr > 0:
+        era = [i for i, c in enumerate(bconf) if c < era_thr]
+        if era and verbose:
+            print(f"ERASURES n={len(era)} bytes={era[:8]}", flush=True)
+    rs_err = 0; rs_fail = None
+    if rs_codec is not None:
+        try:
+            raw, rs_err = rs_decode_frame(raw, rs_codec, era or None)
+            if rs_err and verbose:
+                print(f"RS_CORRECTED errors={rs_err} "
+                      f"snr={frame_snr:.1f}dB", flush=True)
+        except Exception as e:
+            rs_fail = str(e)
+            if verbose:
+                print(f"RS_FAIL snr={frame_snr:.1f}dB err={e}", flush=True)
+            raw = b""
+    if len(raw) < 1 + chunk_size + 4:      # short frame: css_fec.check_crc's (False, 0, b"")
+        return False, 0, b"", rs_err, rs_fail
+    ok, seq, dat = css_enc_c.check_crc(raw, chunk_size)
+    if not ok:                             # css_fec.check_crc still reports seq/data on a miss
+        seq, dat = raw[0], bytes(raw[1:1 + chunk_size])
     return ok, seq, dat, rs_err, rs_fail
 
 
@@ -1863,6 +1925,12 @@ def decode(cfg, stop_event=None):
     # arrives; a callback exception must never crash decoding.
     _on_frame = cfg.get("on_frame", None)
 
+    # Opt-in parity trace (regression/css_pll_regress.py): a list receives one
+    # record per symbol and per state event, the same records the C port
+    # (css_pll_c) emits.  Absent = no behaviour change.
+    _trace = cfg.get("trace") if isinstance(cfg.get("trace"), list) else None
+    _abs_pos = 0
+
     # Cooperative stop sentinel (see decode_longsym_mf for rationale).  Polled in
     # the main read loop so the wrapper can stop us gracefully on Windows, where
     # proc.terminate() (TerminateProcess) cannot deliver a catchable SIGTERM.
@@ -1896,6 +1964,12 @@ def decode(cfg, stop_event=None):
     if (dur > float(cfg.get("mf_longsym_min_dur", 0.25))
             and bool(cfg.get("mf_longsym", True))):
         return decode_longsym_mf(cfg, stop_event=stop_event)
+    # CSS_PLL_BACKEND=c / c64: the same loop in C (CSS/c/libcsspll), driven
+    # through css_pll_c with this function's own config semantics.  Requested
+    # but unloadable raises (cbackend.require), never falls back.
+    if os.environ.get("CSS_PLL_BACKEND", "").lower() in ("c", "c64"):
+        import css_pll_c
+        return css_pll_c.decode(cfg, stop_event)
     f_min         = float(cfg.get("f_min",      conf["f_min"]))
     f_max         = float(cfg.get("f_max",      conf["f_max"]))
     info_preamble = conf.get("preamble")
@@ -2016,6 +2090,10 @@ def decode(cfg, stop_event=None):
     # frequency-selective rejection and partial-chirp slice fallback) work
     # on the unmodified, degraded-but-still-present signal instead.
     impulse_blank_max_frac  = float(cfg.get("impulse_blank_max_frac", 0.08))
+    # Chunks whose median |x| is below this are digital silence: they neither
+    # seed nor move the blanker baseline (-120 dBFS; any real input's noise
+    # floor sits far above it).
+    impulse_silence_floor   = float(cfg.get("impulse_silence_floor", 1e-6))
 
     # ── Noise-whitening pre-filter ──────────────────────────────────────────
     # A matched filter (FFT-domain correlation against an LFM template) is
@@ -2156,8 +2234,19 @@ def decode(cfg, stop_event=None):
     _auto_lookback    = max(_n_preamble * 3,
                             frame_symbols + 2 * _n_preamble + _training_symbols)
     _syndet_lookback  = int(cfg.get("syndet_lookback", _auto_lookback))
+    # Energy-aware Barker score (see SoftPreambleDetector.__init__): a window
+    # must be FULL of confident symbols, not merely shaped like Barker-13.
+    # 0 disables a term; both 0 restores the plain cosine.
+    syndet_conf_floor = float(cfg.get("syndet_conf_floor", 0.50))
+    syndet_cov_knee   = float(cfg.get("syndet_cov_knee",   1.00))
     syndet = SoftPreambleDetector(sync_word, threshold=sync_threshold,
-                                  lookback=_syndet_lookback)
+                                  lookback=_syndet_lookback,
+                                  conf_floor=syndet_conf_floor,
+                                  cov_knee=syndet_cov_knee)
+    # Exclude stale / too-early windows from the detector's argmax instead of
+    # rejecting the winner afterwards (a never-acquirable winner otherwise
+    # masks the real preamble until it ages out of the ring).
+    syndet_mask_ineligible = bool(cfg.get("syndet_mask_ineligible", True))
 
     # -- Syndet noise-immunity parameters ------------------------------------
     # SNR gate: symbols with snr_db < syndet_min_snr_db are zeroed before
@@ -2290,7 +2379,28 @@ def decode(cfg, stop_event=None):
     # settled tracking (post_acq_search = sps×0.04) the bias exceeds the
     # search radius whenever gap_frac > 0.04, meaning the true peak is
     # completely outside the search window and the decoder reads noise.
-    expected_peak = buf_size - gap_samps - 1
+    #
+    # Look-ahead.  With the chirp end gap_samps before the ring end, the wide
+    # (+-search_range) acquisition window can see an EARLY chirp search_range
+    # samples away but a LATE one only gap_samps away: anything later lies
+    # past the newest sample.  The loop then measures timing_err ~0 against
+    # whatever partial-template or slice match sits at expected_peak and
+    # stays there -- measured at 0.15 s: locked 750 samples early (the chirp's
+    # end not yet in the ring), conf ~0.6, 9 dB instead of 31, for 450
+    # symbols, every frame lost.  So the chirp end is placed ring_lookahead
+    # samples before the ring end, ring_lookahead >= the wide search range,
+    # making the window symmetric.  Cost: ring_lookahead/fs of extra latency
+    # (37 ms at 0.15 s).  ring_lookahead = gap_samps restores the old layout.
+    _rl_cfg = int(cfg.get("ring_lookahead", -1))
+    ring_lookahead = (max(gap_samps, correlator.search_range) if _rl_cfg < 0
+                      else max(gap_samps, _rl_cfg))
+    ring_lookahead = min(ring_lookahead,
+                         max(gap_samps, buf_size - 1 - sps - correlator.search_range))
+    # _frame_audio keeps one chirp+gap per chunk: take each chunk that many
+    # samples back from the ring end, so the retro fold and its phase formula
+    # are unchanged by the look-ahead.
+    _fa_delay     = ring_lookahead - gap_samps
+    expected_peak = buf_size - ring_lookahead - 1
     peak_est      = expected_peak
     timing_frac   = 0.0
     timing_settled = False
@@ -2347,8 +2457,21 @@ def decode(cfg, stop_event=None):
     #   symbols, not every symbol — the background spectrum changes slowly
     #   relative to one symbol's duration.
     whiten_stft_win  = max(64, int(round(whiten_stft_win_s * fs)))
+    # The per-bin MEDIAN across STFT slices only rejects the chirp while the
+    # chirp lights a minority of the slices.  A chunk is n_read long and
+    # normally straddles two chirps, so each in-band bin is lit in up to
+    # 2*(win/hop + 1) = 6 slices; a 0.05 s window gives a 0.15 s symbol only
+    # 5 slices, and the "background" then IS the chirp (measured: in-band cut
+    # 4-14 dB, SNR at the correlator 9 dB instead of 31, every frame of the
+    # run lost, inverted bit reads).  Cap the window so a chunk holds >= 13
+    # slices.  0.5 s+ symbols keep the configured window; 0 disables the cap.
+    whiten_stft_win_max = int(cfg.get("whiten_stft_win_max", sps_eff // 7))
+    if whiten_stft_win_max > 0:
+        whiten_stft_win = min(whiten_stft_win, max(64, whiten_stft_win_max))
     whiten_stft_hop  = max(1, whiten_stft_win // 2)
-    whiten_stft_nfft = 1 << (whiten_stft_win - 1).bit_length()
+    # The design FFT must hold the whole FIR: below whiten_taps the design
+    # falls into the pad branch, which leaves the filter off-centre (a delay).
+    whiten_stft_nfft = 1 << (max(whiten_stft_win, whiten_taps) - 1).bit_length()
     _whiten_stft_window    = np.hanning(whiten_stft_win).astype(SIG)
     _whiten_psd_ema        = None
     _whiten_fir            = None
@@ -2437,6 +2560,9 @@ def decode(cfg, stop_event=None):
         nonlocal peak_est, timing_frac, n_read, _acq_syms_left, _last_resync_sym
         nonlocal _last_resync_soft
         nonlocal _timing_snapshot, _fa_nbytes, _one_shot_correction, rate_est_smp
+        if _trace is not None:
+            _trace.append({"event": "RESYNC", "sym": sym_count,
+                           "a": 1 if reset_timing else 0})
         print(f"RESYNC{': ' + reason if reason else ''}"
               f"{' (timing reset)' if reset_timing else ' (soft)'}",
               flush=True)
@@ -2562,6 +2688,8 @@ def decode(cfg, stop_event=None):
                 _one_shot_correction = 0
                 raw, _overflowed = stream.read(_nr)
                 raw    = raw.flatten()
+                _sym_abs_start = _abs_pos
+                _abs_pos += _nr
                 # PortAudio sets overflowed=True when it had to discard captured
                 # input between reads (buffer overrun).  Each overrun silently
                 # removes samples from the stream, shifting every subsequent chirp
@@ -2607,6 +2735,10 @@ def decode(cfg, stop_event=None):
                             frames_decoded += 1
                             frames_errored  = max(0, frames_errored - 1)
                             _decoded_seqs.add(_seq)
+                            if _trace is not None:
+                                _trace.append({"event": "FRAME", "sym": sym_count,
+                                               "seq": int(_seq), "source": "retro_deferred",
+                                               "hex": _dat.hex()})
 
                 # Impulse blanker. Two distinct interference regimes occur in
                 # real captures: (a) brief clicks/knocks, tens of ms, a small
@@ -2630,9 +2762,16 @@ def decode(cfg, stop_event=None):
                 # worst bursts) feeds the matched filter.
                 _abs_raw   = np.abs(raw)
                 _chunk_med = float(np.median(_abs_raw))
-                if _bg_amp_ema is None:
-                    _bg_amp_ema = _chunk_med          # bootstrap on first chunk
-                if impulse_blank_enable:
+                # Digital silence (a muted / TX-gated input, a zero-filled
+                # stream) is not a background level.  Learning it pins the
+                # baseline near 0, and the >3x contamination guard below then
+                # refuses every real chunk forever: each symbol "would blank"
+                # ~90% and the blanker is skipped for the rest of the run.
+                # Such chunks neither bootstrap nor update the baseline.
+                _silent = _chunk_med < impulse_silence_floor
+                if _bg_amp_ema is None and not _silent:
+                    _bg_amp_ema = _chunk_med          # bootstrap on first live chunk
+                if impulse_blank_enable and _bg_amp_ema is not None:
                     # min(), not max(): blank a sample if it exceeds EITHER
                     # threshold (actual clipping, OR too far above baseline).
                     # Using max() here would mean clip_floor (0.98) always
@@ -2675,7 +2814,8 @@ def decode(cfg, stop_event=None):
                 # ambient level still tracks fine: most chunks during such a
                 # drift look "not too contaminated" relative to the
                 # recently-updated EMA, so it keeps adapting.
-                if _bg_amp_ema == 0 or _chunk_med < 3.0 * _bg_amp_ema:
+                if _bg_amp_ema is not None and not _silent and (
+                        _bg_amp_ema == 0 or _chunk_med < 3.0 * _bg_amp_ema):
                     _bg_amp_ema += impulse_bg_alpha * (_chunk_med - _bg_amp_ema)
 
                 # ── Noise-whitening filter ───────────────────────────────────
@@ -2802,7 +2942,11 @@ def decode(cfg, stop_event=None):
                 # Cleared on every resync so stale audio never bleeds into
                 # the next frame.
                 if sync_found:
-                    _frame_audio.append(agc_audio)
+                    if _fa_delay > 0:
+                        _frame_audio.append(
+                            ring[buf_size - _fa_delay - _nr: buf_size - _fa_delay].copy())
+                    else:
+                        _frame_audio.append(agc_audio)
                     _fa_nbytes += agc_audio.nbytes
 
                 correlator.verbose = (sym_count in _verbose_syms)
@@ -3413,6 +3557,21 @@ def decode(cfg, stop_event=None):
                 if not tim_snr_ok:
                     final_conf = 0.0
 
+                if _trace is not None:
+                    _trace.append({
+                        "sym": sym_count, "abs_start": _sym_abs_start, "nr": _nr,
+                        "found_peak": int(found_peak), "bit": int(bit),
+                        "conf": float(confidence), "snr_db": float(snr_db),
+                        "winner_pk": float(winner_pk), "pll_conf": float(pll_conf),
+                        "pll_r2": float(pll_r2), "timing_err": int(timing_err),
+                        "peak_est": int(peak_est), "n_read": int(n_read),
+                        "acq_left": int(_acq_syms_left), "settled": int(bool(timing_settled)),
+                        "sync_found": int(bool(sync_found)), "rate_est": float(rate_est_smp),
+                        "timing_frac": float(timing_frac), "final_conf": float(final_conf),
+                        "agc_gain": float(agc.gain), "outlier": int(bool(_pll_outlier)),
+                        "wpk_strong": int(bool(_wpk_strong)),
+                        "signal_present": int(bool(signal_present)),
+                        "whitened": int(_whiten_fir is not None)})
                 if not sync_found:
                     tim_flush_thr = int(cfg.get("syndet_flush_terr", sps // 2))
                     if abs(timing_err) <= tim_flush_thr:
@@ -3429,7 +3588,16 @@ def decode(cfg, stop_event=None):
                         (snr_db - syndet_min_snr_db)
                         / max(syndet_snr_ref_db - syndet_min_snr_db, 1.0),
                         0.0, 1.0))
-                    _, score = syndet.push(final_conf * snr_w)
+                    _min_preamble_end = _training_symbols + _n_preamble - 1
+                    if syndet_mask_ineligible:
+                        _, score = syndet.push(
+                            final_conf * snr_w,
+                            lag_max=syndet_max_lag if syndet_lag_guard else None,
+                            early_lag=sym_count - _last_resync_sym - _min_preamble_end,
+                            soft=bool(_last_resync_soft),
+                            trust_thr=sync_threshold, alt_thr=syndet_alt_thr)
+                    else:
+                        _, score = syndet.push(final_conf * snr_w)
 
                     # Adaptive effective threshold: rises syndet_margin above
                     # the background EMA in bursty noise, clamped to
@@ -3443,7 +3611,17 @@ def decode(cfg, stop_event=None):
 
                     # Lag guard: reject stale acquisitions triggered by chance
                     # correlations deep in the history ring.
-                    if acquired and syndet_lag_guard:
+                    if (syndet_mask_ineligible and not acquired
+                            and syndet.raw_reason
+                            and syndet.raw_best_score >= effective_thr):
+                        # Diagnostics only: the best window overall could not
+                        # be acquired, and was left out of the decision.
+                        print(f"SYNC_{'STALE_REJECT' if syndet.raw_reason == 'stale' else 'TOO_EARLY'} "
+                              f"lag={syndet.raw_best_lag} "
+                              f"window_end={sym_count - syndet.raw_best_lag} "
+                              f"score={syndet.raw_best_score:.3f} (masked; "
+                              f"best eligible {score:.3f})", flush=True)
+                    if acquired and syndet_lag_guard and not syndet_mask_ineligible:
                         if syndet.best_lag > syndet_max_lag:
                             print(f"SYNC_STALE_REJECT "
                                   f"lag={syndet.best_lag} > max={syndet_max_lag} "
@@ -3506,7 +3684,6 @@ def decode(cfg, stop_event=None):
                     # The old score-based bypass is kept for the case where the
                     # window IS alternating but a soft re-arm makes a real
                     # preamble imminent anyway.
-                    _min_preamble_end = _training_symbols + _n_preamble - 1
                     _window_end_rel   = (sym_count - syndet.best_lag) - _last_resync_sym
                     _alt = syndet.alternation()
                     _looks_training = (_alt is not None
@@ -3532,7 +3709,7 @@ def decode(cfg, stop_event=None):
                                     and (score >= sync_threshold
                                          or not _looks_training))
                     if (acquired and _window_end_rel < _min_preamble_end
-                            and not _trust_early):
+                            and not _trust_early and not syndet_mask_ineligible):
                         print(f"SYNC_TOO_EARLY "
                               f"window_end={sym_count - syndet.best_lag} "
                               f"(+{_window_end_rel} since resync) "
@@ -3561,6 +3738,10 @@ def decode(cfg, stop_event=None):
                               f"{f' lag={lag}' if lag else ''}", flush=True)
                         sync_found            = True
                         _acq_syms_left        = timing_acq_symbols
+                        if _trace is not None:
+                            _trace.append({"event": "SYNC_ACQUIRED", "sym": sym_count,
+                                           "a": int(lag), "b": int(sym_count - lag),
+                                           "x": float(score)})
                         # Open wide search during acquisition.
                         # The pre-sync scanner (line below the syndet block) sets
                         # timing_settled = True whenever abs(timing_err) is small,
@@ -3743,6 +3924,8 @@ def decode(cfg, stop_event=None):
                             # FIFO.  Only attempt anchoring within the same
                             # sample budget the retro cap uses.
                             retro = None
+                            # chirp-end distance from the end of retro_audio
+                            _retro_end_off = gap_samps
                             _anchor_ok = (_anchor_enabled
                                           and len(_audio_hist) >= frame_symbols + 2)
                             if _anchor_ok:
@@ -3759,6 +3942,8 @@ def decode(cfg, stop_event=None):
                                             retro        = _cand[:5]
                                             retro_audio  = anchor_audio
                                             n_retro_syms = frame_symbols
+                                            # raw history ends AT the ring end
+                                            _retro_end_off = ring_lookahead
                                             print(f"RETRO_ANCHOR locked frame at "
                                                   f"shift={_cand[5]:+d} sym (CRC ok)",
                                                   flush=True)
@@ -3817,7 +4002,7 @@ def decode(cfg, stop_event=None):
                                 # contaminants.
                                 N_retro   = len(retro_audio)
                                 p_last    = retro_t0 + (n_retro_syms - 1) * retro_sps
-                                delta     = p_last - (N_retro - gap_samps - 1)
+                                delta     = p_last - (N_retro - _retro_end_off - 1)
                                 sps_drift = retro_sps - sps_eff
 
                                 # ── Phase correction (one-shot) ───────────────
@@ -4000,6 +4185,11 @@ def decode(cfg, stop_event=None):
                                       f"rate_est={rate_est_smp:+.3f} "
                                       f"n_read={n_read}",
                                       flush=True)
+                                if _trace is not None:
+                                    _trace.append({"event": "RETRO_GATE" if _gate_reason else "RETRO_SYNC",
+                                                   "sym": sym_count,
+                                                   "a": int(_one_shot_correction),
+                                                   "x": float(delta)})
                                 _timing_snapshot = None   # retro supersedes snapshot
                             else:
                                 print("RETRO insufficient audio — using streaming bits",
@@ -4085,6 +4275,10 @@ def decode(cfg, stop_event=None):
                             frames_decoded += 1
                             consec_errors  = 0
                             _decoded_seqs.add(seq_num)
+                            if _trace is not None:
+                                _trace.append({"event": "FRAME", "sym": sym_count,
+                                               "seq": int(seq_num), "source": src,
+                                               "hex": data.hex()})
                             if _on_frame is not None:
                                 try:
                                     _on_frame(dict(_frame_rec))

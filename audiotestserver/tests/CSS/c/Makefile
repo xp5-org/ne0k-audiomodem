@@ -47,7 +47,27 @@ HDR     := css_mf.h css_fft.h
 ENCSRC  := css_enc.c css_dec.c
 ENCHDR  := css_enc.h css_dec.h
 
-all: $(LIB) $(ENCLIB) $(ENC64)
+# Streaming PLL decoder (port of css_decoder.decode()).  C99, not part of the
+# C89 gate: it is the host/GUI receiver, not (yet) the DOS target.  Links the
+# frame codec and the shared RS core directly so one library is the whole RX.
+PLLLIB  := libcsspll.$(TAG)$(EXT)
+PLL64   := libcsspll64.$(TAG)$(EXT)
+PLLSRC  := css_pll.c css_corr.c css_pllaux.c css_retro.c css_pfft.c \
+           css_trk.c css_enc.c css_dec.c ../../c/rs255.c
+PLLHDR  := css_pll.h css_corr.h css_pllaux.h css_retro.h css_pfft.h \
+           css_trk.h css_real.h css_util.h css_win.h css_enc.h css_dec.h \
+           ../../c/rs255.h
+
+all: $(LIB) $(ENCLIB) $(ENC64) $(PLLLIB) $(PLL64)
+
+$(PLLLIB): $(PLLSRC) $(PLLHDR)
+	$(CC) $(CFLAGS) -shared -o $@ $(PLLSRC) $(LDLIBS)
+
+# Grading build: SIG arrays in double, to be held against Python run with
+# CSS_SIG_DTYPE=float64.  The frame codec stays float (the reference's
+# _frame_pipeline_c uses the float libcssenc), so only the DSP precision moves.
+$(PLL64): $(PLLSRC) $(PLLHDR)
+	$(CC) $(CFLAGS) -DCSS_PLL_F64 -shared -o $@ $(PLLSRC) $(LDLIBS)
 
 $(LIB): $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -shared -o $@ $(SRC) $(LDLIBS)
@@ -72,12 +92,13 @@ $(ENC64): $(ENCSRC) $(ENCHDR)
 # Only this host's artifact: on the shared mount a blanket rm would delete the
 # other nodes' working builds.
 clean:
-	rm -f $(LIB) $(ENCLIB) $(ENC64)
+	rm -f $(LIB) $(ENCLIB) $(ENC64) $(PLLLIB) $(PLL64)
 
 clean-all:
 	rm -f libcssmf.*.so libcssmf.*.dylib libcssmf.so \
 	      libcssenc.*.so libcssenc.*.dylib \
-	      libcssenc64.*.so libcssenc64.*.dylib
+	      libcssenc64.*.so libcssenc64.*.dylib \
+	      libcsspll.*.so libcsspll.*.dylib libcsspll64.*.so libcsspll64.*.dylib
 
 # Strict-C89 syntax gate for the OpenWatcom / embedded target, mirroring the
 # OFDM core's c89check.  Compile-only with the host compiler: it does not prove
