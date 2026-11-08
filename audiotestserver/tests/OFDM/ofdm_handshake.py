@@ -1229,10 +1229,12 @@ def data_payload_for(seconds: float, bat: np.ndarray, sample_rate: int,
 
 def make_data_audio(sample_rate: int, payload: bytes, bat: np.ndarray,
                     band: tuple | None = None,
-                    chunk_bytes: int = HS_DATA_CHUNK) -> np.ndarray:
-    """Encode `payload` as data frames at the transmitter's rate."""
+                    chunk_bytes: int = HS_DATA_CHUNK, seq0: int = 0,
+                    gap: bool = True) -> np.ndarray:
+    """Encode `payload` as data frames at the transmitter's rate; the first chunk is numbered `seq0`.
+    `gap=False`: no inter-frame silence (a continuous broadcast's chunks play back to back)."""
     cfg = hs_data_cfg(sample_rate, band, chunk_bytes)
-    return AdaptiveModulator(cfg, bat).encode_bytes(payload)
+    return AdaptiveModulator(cfg, bat).encode_bytes(payload, seq0, gap=gap)
 
 
 def try_decode_data(capture: np.ndarray, mic_fs: int, tx_rate: int,

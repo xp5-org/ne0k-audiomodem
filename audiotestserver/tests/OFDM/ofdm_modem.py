@@ -392,6 +392,14 @@ def _known_bpsk(n: int, seed: int) -> np.ndarray:
 # PAPR-benign in it: random BPSK on every occupied carrier.
 REF_SYM_BOOST = math.sqrt(2.0)
 
+# Data frames transmit the Schmidl-Cox preamble at the data symbols' level.  Built as-is (_make_sc_preamble) it fills
+# only the even occupied bins at 1/sqrt(2), a quarter of a data symbol's power: 6 dB down on the sparse comb, once per
+# frame.  Back-to-back broadcast chunks made that an audible ~1 Hz beat (measured 2026-11-07: preamble -5.9 dB vs data).
+# x2 restores the level; its PAPR (8.2 dB) stays under the data's (12-14 dB), so a frame's peak scaling is unchanged.
+# TX only: sc_td stays the reference the C/Python regressions and the detector use, and SC detection is a normalised
+# metric, so the gain is invisible to the receiver.  The handshake probe (Modem.build_probe) keeps the old level.
+SC_TX_GAIN = 2.0
+
 
 # NO CHANNEL-ESTIMATE SMOOTHING HERE, AND THAT IS A MEASURED RESULT.
 #
@@ -1750,8 +1758,14 @@ class AdaptiveModulator:
             bit_ptr += self.bits_per_ofdm_sym
         return occ_list
 
-    def encode_bytes(self, data: bytes) -> np.ndarray:
+    def encode_bytes(self, data: bytes, seq0: int = 0, gap: bool = True) -> np.ndarray:
+        """`seq0` numbers the first chunk (wrapping at seq_bytes): a continuous broadcast encodes one chunk per call
+        with a running counter, so a listener that joins mid-stream can order and gap-count what it hears.
+        `gap=False` leaves out the inter-frame silence, so frames from consecutive calls play back to back (a
+        continuous broadcast: the silence is 6% of its air time and audible as a pause every chunk).  The SC
+        detector's min_gap already excludes the gap (see _frame_min_gap), so gapless frames still acquire."""
         data = bytes(data)
+        seq_mod = 1 << (8 * self.seq_bytes)
         pad  = (-len(data)) % self.chunk_bytes
         data += b'\x00' * pad
         chunks = [data[i : i + self.chunk_bytes]
@@ -1759,14 +1773,14 @@ class AdaptiveModulator:
         self.total_frames = len(chunks)
 
         gap    = (np.zeros(self.frame_gap_samp)
-                  if self.frame_gap_samp > 0 else None)
+                  if gap and self.frame_gap_samp > 0 else None)
         pieces: list[np.ndarray] = []
 
         for seq_idx, chunk in enumerate(chunks):
-            occ_list = self._frame_occ(seq_idx, chunk)
+            occ_list = self._frame_occ((seq0 + seq_idx) % seq_mod, chunk)
             T     = self.taper_samples
             frame = np.concatenate([
-                self.sc_td,
+                self.sc_td * SC_TX_GAIN,
                 _build_ola(occ_list, self.n_fft, self.bin_lo, self.cp_len, T),
             ])
             if gap is not None:
