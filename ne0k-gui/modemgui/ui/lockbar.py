@@ -48,6 +48,10 @@ class LockBar(QWidget):
             self.align.setValue(int(max(0.0, min(1.0, score)) * 100))
         self._paint()
 
+    def unlocked(self) -> None:
+        self._t_lock = None
+        self._paint()
+
     def _paint(self) -> None:
         if not self._open:
             self.state.setText("PLL: audio closed"); self.state.setStyleSheet("color:gray")

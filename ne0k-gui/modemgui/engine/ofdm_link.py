@@ -41,6 +41,15 @@ Two phases:
 
       stream body = [len u32] + data + [crc16 of data]
 
+* ``bcast``  -- a continuous broadcast: only ``cfg.sender`` transmits, and once it has data it keeps the carrier
+  up, one chunk after another with a running 16-bit chunk seq and no gaps, filling with empty chunks while
+  ``send``/``feed`` has nothing queued (it unkeys after ``BCAST_IDLE_S`` with nothing to say).  There is no start
+  and no end: a listener locks on whichever chunk it hears first, delivers every newer chunk in seq order, counts
+  a seq gap in ``lost_frames`` and re-acquires after a stall.  Lossy by design, like UDP: what it carries must
+  survive a gap (an H.264 / MPEG-TS stream recovers at the next IDR).
+
+      bcast chunk = [len u16] + data (len <= chunk_bytes - 2) + zero pad        (len 0 = filler)
+
 * ``full``   -- full duplex (FDD): after the full-band BAT exchange the band is split in two
   around ``duplex_guard_hz`` (``ofdm_fdd.plan_duplex_bands``), the initiator transmitting on
   the low half and the responder on the high one, and BOTH may be on the air at once.  Each
@@ -78,9 +87,13 @@ from .modemcfg import OfdmConfig
 BACKEND = "python"
 HDR = 6                             # addr, seq, ack, len, crc16
 BROADCAST_ID = 0xF                  # frame destination 0xF = every station (as css_modem.BROADCAST_ID)
-MODES = ("half", "oneway", "stream", "full", "arq")
+MODES = ("half", "oneway", "stream", "full", "arq", "bcast")
 MAX_CHUNKS = 65535                  # chunk seq is 2 bytes
 STREAM_STALL_S = 3.0                          # quiet that ends a stream still short of its length
+BCAST_HDR = 2                       # bcast chunk length prefix
+BCAST_IDLE_S = 10.0                 # bcast sender: unkey after this long with nothing queued
+BCAST_BACKLOG_S = 20.0              # bcast sender: older queued bytes beyond this much air time are dropped
+BCAST_LOG_S = 10.0                  # bcast: one progress line per this long
 _TESTS = Path(os.environ.get("MODEMGUI_TESTS_DIR",
                              Path(__file__).resolve().parents[3] / "audiotestserver" / "tests"))
 _dsp_lock = threading.Lock()        # redirect_stdout is process-global: one DSP call at a time
@@ -296,7 +309,15 @@ class OfdmLink:
         self.retry_count = self.fail_count = 0
         self.lost_frames = self.rx_errors = 0          # oneway/stream listener
         self._txlock = threading.Lock()
+        self._feed = bytearray()                        # bcast sender: bytes queued for the carrier
+        self._feed_lock = threading.Lock()
+        self._feed_max = 1 << 20                        # set from the chunk air time once up
+        self.bcast_dropped = 0                          # bcast sender: backlog bytes dropped (fed faster than the air)
+        self.bcast_chunks = 0                           # bcast: chunks aired (sender) / delivered (listener)
+        self.bcast_bytes = 0                            # bcast: payload bytes aired (sender) / delivered (listener)
+        self.phy_bps = 0.0                              # payload bit/s of the carrier while keyed (0 = not known yet)
         self._hs_rx_end = 0                             # capture index where the last HS message ended
+        self._go_end = None                             # monotonic time the responder saw GO (set by the handshake; None when up from a preset)
         self.tx_frames = self.rx_frames = 0
         self.foreign_frames = 0                        # good frames between other stations (shared channel)
         self._cap = _Capture(c.fs)
@@ -539,6 +560,8 @@ class OfdmLink:
                     self._stop.wait()            # frames arrive through deliver(); TX runs on the caller's thread
                 elif m in ("full", "arq"):
                     self._listen_full()
+                elif m == "bcast":
+                    self._bcast_tx() if self.role == self.cfg.sender else self._listen_bcast()
                 elif self.role != self.cfg.sender or self.cfg.sender == "both":
                     self._listen(stream=(m == "stream"))
         except Exception as e:                   # the link thread must never die silently
@@ -625,7 +648,7 @@ class OfdmLink:
             if c.backend == "cdx":
                 self._start_cdx()
         self.capacity = (self._capacity(H) if m == "half" else 255 - HDR if m in ("oneway", "full", "arq")
-                         else MAX_CHUNKS * c.chunk_bytes - 6)
+                         else c.chunk_bytes - BCAST_HDR if m == "bcast" else MAX_CHUNKS * c.chunk_bytes - 6)
         now_m = time.monotonic()
         self._ev("lock", now_m, now_m, how)
         self.log(f"bat exchanged{'' if how == 'BAT exchanged' else ' (broadcast round)'} tx={int((self._tx_bat > 0).sum())} carriers "
@@ -940,7 +963,11 @@ class OfdmLink:
 
     def send(self, data: bytes, timeout: float | None = None) -> bool:
         """half: queue one payload for the next TX window; True once the peer ACKed it.
-        oneway / stream: transmit now; True once it has aired (nobody ACKs)."""
+        oneway / stream: transmit now; True once it has aired (nobody ACKs).
+        bcast: queue for the running broadcast; True at once."""
+        if self.cfg.mode == "bcast":
+            self.feed(bytes(data))
+            return True
         if self.cfg.mode in ("full", "arq"):
             if self.role != self.cfg.sender and self.cfg.mode == "arq":
                 raise RuntimeError(f"mode arq: this end ({self.role}) only listens")
@@ -1139,6 +1166,167 @@ class OfdmLink:
         if self.on_stream:
             self.on_stream(ok, st["sent"])
         return n, None
+
+    # -- bcast (continuous broadcast) ----------------------------------------
+
+    def feed(self, data: bytes) -> None:
+        """bcast sender: queue bytes for the carrier.  Fed faster than the air for longer than BCAST_BACKLOG_S, the
+        OLDEST bytes go (a live stream wants the present, and its next IDR recovers it)."""
+        with self._feed_lock:
+            self._feed += data
+            over = len(self._feed) - self._feed_max
+            if over > 0:
+                del self._feed[:over]
+                self.bcast_dropped += over
+
+    def _bcast_audio(self, H, piece: bytes, seq: int, bat=None, band=None, gap: bool = False) -> np.ndarray:
+        """One chunk's audio.  Gapless by default: while keyed, chunks play back to back with no inter-frame
+        silence (it was 40 ms per chunk, 6% of the air and an audible pause).  ``gap`` keeps the silence, used for
+        the first chunk of a keying so the lead-in tone stays apart from the first preamble."""
+        c = self.cfg
+        bat = self._tx_bat if bat is None else bat
+        band = self._tx_band if band is None else band
+        body = len(piece).to_bytes(BCAST_HDR, "big") + piece
+        body += b"\0" * (c.chunk_bytes - len(body))
+        with _quiet():
+            audio = H.make_data_audio(c.fs, body, bat, band, c.chunk_bytes, seq0=seq, gap=gap)
+            return H.scale_hs_tx(audio, c.amplitude, c.fs, is_probe=False, band=band)[0]
+
+    def _bcast_rate(self, H, bat, band) -> tuple[int, float]:
+        """(samples per chunk, payload bytes/s while keyed) of a carrier modulated with ``bat``."""
+        n_one = len(self._bcast_audio(H, b"", 0, bat, band))
+        return n_one, (self.cfg.chunk_bytes - BCAST_HDR) * self.cfg.fs / n_one
+
+    def _bcast_tx(self) -> None:
+        """Keep exactly one chunk queued ahead of the sink, so the carrier never breaks while there is data (and
+        filler while there briefly is not); key up with the usual lead-in tone, unkey after BCAST_IDLE_S idle."""
+        H, _ = _imports()
+        c, pipe, fs = self.cfg, self.session.pipe, self.cfg.fs
+        room = c.chunk_bytes - BCAST_HDR
+        n_one, rate = self._bcast_rate(H, self._tx_bat, self._tx_band)   # payload bytes/s while keyed
+        self.phy_bps = rate * 8
+        with self._feed_lock:
+            self._feed_max = int(BCAST_BACKLOG_S * rate)
+        self.log(f"bcast ready: {n_one / fs:.2f} s per {c.chunk_bytes} B chunk, {rate * 8:.0f} bit/s payload, "
+                 f"backlog cap {self._feed_max} B")
+        seq, keyed, t_data = 0, False, 0.0
+        tot = dict(data=0, fill=0, chunks=0)
+        t_log = time.monotonic()
+        while not self._stop.is_set():
+            now = time.monotonic()
+            with self._feed_lock:
+                have = len(self._feed)
+            if have:
+                t_data = now
+            if not keyed:
+                if not have:
+                    self._stop.wait(0.05)
+                    continue
+                self._defer_for_air()
+                keyed = True
+                self.log(f"bcast carrier up at seq={seq}")
+            elif not have and now - t_data > BCAST_IDLE_S:
+                if pipe.tx_pending:
+                    self._stop.wait(0.05)
+                    continue
+                keyed = False
+                self.log(f"bcast carrier down at seq={seq}: nothing queued for {BCAST_IDLE_S:.0f} s")
+                continue
+            pending = pipe.tx_pending
+            if pending > n_one // 2:                               # one chunk ahead is enough; wait for it to drain
+                self._stop.wait(min(0.05, (pending - n_one // 2) / fs))
+                continue
+            with self._feed_lock:
+                piece = bytes(self._feed[:room])
+                del self._feed[:room]
+            first = pending == 0 and not pipe.tx_pending          # first chunk of a keying (or after an underrun)
+            audio = self._bcast_audio(H, piece, seq, gap=first)
+            if first:                                             # lead-in tone, then the silence, then the chunk
+                audio = keyup(self.session, audio, fs)
+            t0 = time.monotonic() + pipe.tx_pending / fs
+            self.session._keyup_end = t0 + len(audio) / fs
+            self.session.play(audio, ident=True)
+            self._ev("tx", t0, t0 + len(audio) / fs, f"BCAST seq={seq} {len(piece)}B")
+            self.tx_frames += 1
+            self.bcast_chunks += 1
+            self.bcast_bytes += len(piece)
+            tot["chunks"] += 1
+            tot["data" if piece else "fill"] += len(piece) if piece else 1
+            seq = (seq + 1) & 0xFFFF
+            if now - t_log >= BCAST_LOG_S:
+                t_log = now
+                with self._feed_lock:
+                    backlog = len(self._feed)
+                self.log(f"bcast tx: chunks={tot['chunks']} data={tot['data']}B filler={tot['fill']} "
+                         f"backlog={backlog}B dropped={self.bcast_dropped}B")
+
+    def _listen_bcast(self) -> None:
+        """Lock on whatever chunk comes first, then deliver every newer one in seq order.  The decode window starts
+        just inside the last delivered frame, so each poll only demodulates the new audio; audio that will not
+        decode (a fade, a station ID between chunks) is skipped once it is clearly not a frame still arriving."""
+        H, _ = _imports()
+        c, fs = self.cfg, self.cfg.fs
+        scan = max(self._hs_rx_end, self._cap._start)
+        st = None
+        n_one, rate = self._bcast_rate(H, self._rx_bat, self._rx_band)  # the sender modulates with our rx BAT
+        self.phy_bps = rate * 8
+        while not self._stop.wait(0.25):
+            n, now = self._cap.n, time.monotonic()
+            if st is None:
+                spans = self._bursts(scan, n, gap_s=max(c.hang_s, 0.5))
+                if not spans:
+                    scan = max(scan, n - fs)
+                    continue
+                st = dict(frm=spans[0][0], last=None, t_poll=0.0, t_got=now, chunks=0, data=0, lost=0, t_log=now)
+                self.log("bcast carrier heard, acquiring")
+            if now - st["t_poll"] < c.stream_poll_s:
+                continue
+            st["t_poll"] = now
+            base, stats, chunks = self._decode_from(H, st["frm"] - int(0.2 * fs), None)
+            evm = {s["seq"]: s.get("evm_pct", 0.0) for s in stats if s.get("seq") in chunks}
+            got = sorted((base + int(s["frame_start"]), s["seq"]) for s in stats if s.get("seq") in chunks)
+            for start, seq in got:
+                if st["last"] is None:
+                    self.log(f"bcast lock at seq={seq}")
+                    self._ev("lock", self._cap.t_of(start), self._cap.t_of(start), f"bcast seq={seq}")
+                else:
+                    d = (seq - st["last"]) & 0xFFFF
+                    if d == 0 or d >= 0x8000:                     # already delivered (or a stale echo)
+                        continue
+                    if d > 1:
+                        st["lost"] += d - 1
+                        self.lost_frames += d - 1
+                        self._ev("err", self._cap.t_of(start), self._cap.t_of(start), f"{d - 1} chunk(s) lost before seq={seq}")
+                        self.log(f"bcast gap: {d - 1} chunk(s) lost before seq={seq} (total lost={st['lost']})")
+                st["last"], st["frm"], st["t_got"] = seq, start + 1, now
+                st["chunks"] += 1
+                self.bcast_chunks += 1
+                body = chunks[seq]
+                ln = int.from_bytes(body[:BCAST_HDR], "big")
+                t0 = self._cap.t_of(start)
+                if ln > len(body) - BCAST_HDR:
+                    self.rx_errors += 1
+                    self._ev("err", t0, t0 + n_one / fs, f"BCAST seq={seq} bad length {ln}")
+                    continue
+                self._ev("rx", t0, t0 + n_one / fs, f"BCAST seq={seq} {ln}B evm={evm.get(seq, 0.0):.1f}%")
+                if ln:
+                    self.rx_frames += 1
+                    self.bcast_bytes += ln
+                    st["data"] += ln
+                    if self.on_data:
+                        self.on_data(bytes(body[BCAST_HDR:BCAST_HDR + ln]))
+            if not got:
+                if n - st["frm"] > 6 * fs:                         # several chunks' worth that will not decode
+                    st["frm"] = n - 2 * fs
+                if now - st["t_got"] > STREAM_STALL_S + 2 * c.stream_poll_s and not self._air_busy(STREAM_STALL_S):
+                    self.log(f"bcast carrier lost after seq={st['last']}: chunks={st['chunks']} data={st['data']}B "
+                             f"lost={st['lost']}")
+                    self._ev("err", now, now, "bcast carrier lost")
+                    st, scan = None, n
+                    continue
+            if now - st["t_log"] >= BCAST_LOG_S:
+                st["t_log"] = now
+                self.log(f"bcast rx: seq={st['last']} chunks={st['chunks']} data={st['data']}B lost={st['lost']}")
 
 
     # -- full duplex --------------------------------------------------------

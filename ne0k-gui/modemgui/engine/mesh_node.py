@@ -19,6 +19,12 @@ Every node runs the same code on a shared medium.  A transfer ``src -> dst`` is:
 Links that see no traffic for ``link_idle_s`` are torn down on both ends, so a quiet mesh
 leaves the band to the CSS control plane.  ``phy_mode="css_only"`` skips OFDM altogether.
 
+``phy_mode="ofdm_only"`` has no CSS at all (no control plane, no listening, no fallback): steps 1-3
+above do not apply.  The mesh is OFDM HALF duplex: one shared channel and one receiver per node
+(``mesh_rx``), turns set by the id-ordered announce round (``ofdm_announce``: announce, BAT training,
+one data turn per node), and each link still one-way ``mode="arq"`` on the full band.  There is no
+full-duplex (``mode="full"``, split band) mesh yet; that exists point-to-point only.
+
 BLOCKOUT (``send_blockout``/``end_blockout``, ``self.blockout``): an on-demand exclusive window
 for two nodes, requiring OFDM -- CSS's baud rate cannot carry it, so it is only available under
 ``phy_mode="ofdm_only"`` (refused outright under ``css_only``/``css_then_ofdm`` for now; a
@@ -133,7 +139,7 @@ class MeshNode:
         self.own_events = own_events              # False: the host drains the session and calls handle()
         self.css_cfg = dataclasses.replace(css, node_id=mesh.node_id)
         self.ofdm_cfg = ofdm
-        self.css = CssLink(session, self.css_cfg)
+        self.css = CssLink(session, self.css_cfg, log=self.log)   # CSS RX lines reach debug.log
         self.on_data = None                       # f(src, bytes)
         self.links: dict[tuple[int, str], OfdmLink] = {}      # (peer, "tx" | "rx") -> link
         self.events: collections.deque = collections.deque(maxlen=4000)

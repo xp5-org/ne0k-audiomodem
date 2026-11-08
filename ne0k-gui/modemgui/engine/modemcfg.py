@@ -69,6 +69,16 @@ class CssConfig(_Config):
     hang_s: float = F(1.0, "Burst end after quiet (s)", "Receive", "", 0.1, 10)
     hear_own: bool = F(False, "Decode own transmissions", "Receive",
                        "For self-loop through a null sink.")
+    backend: str = F("python", "DSP backend", "Engine",
+                     "c = libcssenc (chirp, CRC, conv/Viterbi, interleave), libcssmf (matched filter) "
+                     "and librs255, process-wide; fails if a library is missing.  python = numpy/reedsolo.",
+                     choices=["python", "c"])
+    decoder: str = F("pll_c", "Decoder", "Engine",
+                     "pll_c = continuous RX on the C streaming PLL decoder (libcsspll, the port of "
+                     "css_decoder.decode()) plus the running chirp tracker (own / peer / echo / phase "
+                     "step / collision).  auto = css_decoder per burst (PLL at symbol_dur <= 0.25 s, "
+                     "matched filter above).  mf = per-burst matched filter at any symbol length.",
+                     choices=["pll_c", "auto", "mf"])
 
 
 @dataclasses.dataclass
@@ -81,8 +91,9 @@ class OfdmConfig(_Config):
                   choices=["auto", "initiator", "responder"])
     mode: str = F("half", "Mode", "Link",
                   "half = timed windows both ways, oneway/stream = one sender, full = FDD, "
-                  "arq = one-way with ACKs (mesh data plane).",
-                  choices=["half", "oneway", "stream", "full", "arq"])
+                  "arq = one-way with ACKs (mesh data plane), bcast = continuous broadcast carrier (late joiners lock "
+                  "on any chunk).",
+                  choices=["half", "oneway", "stream", "full", "arq", "bcast"])
     sender: str = F("initiator", "Sender (oneway/stream/arq)", "Link",
                     "Which role transmits data; the other listens.  both = oneway/stream in either "
                     "direction, a sender waits for the peer's burst to end (turn-taking, no ACK).",
@@ -303,6 +314,27 @@ class SerialConfig(_Config):
     retries: int = F(3, "Retries", "Reliability", "Retransmissions before TXFAIL.", 0, 20)
     rx_host: int = F(0, "RX host filter", "Port", "Mesh only: only hand the host bytes received from this "
                      "station id; 0 = accept from any neighbour (CSS is mostly multicast/broadcast).", 0, 15)
+
+
+@dataclasses.dataclass
+class UdpConfig(_Config):
+    """UDP data port: the alternative to the virtual serial port.  A sender node takes the UDP datagrams an
+    encoder (ffmpeg) sends to ``listen`` and airs them on a continuous OFDM broadcast carrier (mode bcast); a
+    receiver node hands what it decodes to ``dest`` (VLC, ffmpeg).  Use this or the serial port, not both."""
+    autostart: bool = F(False, "Start with audio", "Port", "Open the UDP port whenever audio is opened.")
+    role: str = F("send", "Role", "Port", "send = datagrams in, OFDM out.  receive = OFDM in, datagrams out.",
+                  choices=["send", "receive"])
+    listen_host: str = F("127.0.0.1", "Listen address", "Send", "Where the encoder sends its UDP datagrams.")
+    listen_port: int = F(5000, "Listen port", "Send", "", 1, 65535)
+    dest_host: str = F("127.0.0.1", "Destination address", "Receive", "Where decoded datagrams go (the player).")
+    dest_port: int = F(5001, "Destination port", "Receive", "", 1, 65535)
+    chunk_bytes: int = F(256, "Bytes per chunk", "Send",
+                         "OFDM chunk size (2 of them are the length prefix); larger = higher net rate, but a lost chunk "
+                         "costs more.  Sender and receivers must agree.", 16, 1024)
+    bat_file: str = F("", "Saved BAT (JSON)", "Port",
+                      "Engine config + the two BAT tables from a saved handshake.  The link comes up from it "
+                      "with no handshake on the air, so a listener can join at any time.")
+    sender_id: int = F(1, "Sender node id", "Receive", "", 0, 15)
 
 
 PRESETS = {

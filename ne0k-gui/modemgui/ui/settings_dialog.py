@@ -17,7 +17,7 @@ from .appsettings import AppSettings
 # Settings-menu pages -> the config sections each one edits.
 TABS = (("output", "Output Device"), ("mode", "Modem Mode"), ("css", "CSS Modem"), ("ofdm", "OFDM Modem"),
         ("ham", "Ident"), ("diag", "Debug && Logging"))
-SECTIONS_OF = {"diag": ("diag", "serial"), "mode": ("general",)}
+SECTIONS_OF = {"diag": ("diag", "serial", "udp"), "mode": ("general",)}
 KEEP_ON_PRESET = ("node_id", "peer_id", "role", "mode", "sender", "hear_own", "backend", "fs")
 
 

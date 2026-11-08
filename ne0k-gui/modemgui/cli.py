@@ -96,6 +96,7 @@ def _css_cfg(a):
     from .engine.modemcfg import PRESETS
     c = PRESETS[a.preset]
     c.hear_own = getattr(a, "hear_own", False)
+    c.backend = "c" if getattr(a, "backend", "python") in ("c", "cdx") else "python"
     if getattr(a, "band_lo", None):
         c.f_min = a.band_lo
     if getattr(a, "band_hi", None):
@@ -148,14 +149,14 @@ def cmd_recv(a, reg: Registry) -> int:
 def cmd_selfloop(a, reg: Registry) -> int:
     """Send --text out of --tx and decode it from --rx in one process."""
     from .engine import Session
-    from .engine.css_link import BACKEND, CssLink
+    from .engine.css_link import CssLink
     a.hear_own = True
     s = Session(reg, a.rate, a.block)
     s.open(a.rx, a.tx)
     log: list[str] = []
     link = CssLink(s, _css_cfg(a), log=log.append); link.start()
     air = link.send(a.text)
-    print(f"backend={BACKEND} airtime={air:.1f}s")
+    print(f"backend={link.backend} airtime={air:.1f}s")
     seen: list = []
     d = _wait_decoded(s, air + a.timeout, seen)
     st = s.pipe.stats if s.pipe else None
@@ -363,7 +364,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--band-lo", type=float, default=None, help="Hz; OFDM default 400, CSS keeps its preset")
     p.add_argument("--band-hi", type=float, default=None, help="Hz; OFDM default 4000.  3300 keeps both inside a phone line")
     p.add_argument("--backend", choices=["python", "c", "cdx"], default="python",
-                   help="ofdm/mesh: DSP cores. c = libofdmacq + librs255 (fails if missing), python = numpy/reedsolo; "
+                   help="DSP cores. ofdm/mesh: c = libofdmacq + librs255 (fails if missing), python = numpy/reedsolo; "
+                        "css: c (or cdx) = libcssenc + libcssmf + librs255; "
                         "cdx = c + the full-duplex data plane (ofdm --mode full) run by the C engine")
     p.add_argument("--buffer", type=int, default=None, help="TX buffer bytes (1..250; ofdm oneway/stream up to 1048576; default 4000 for ofdm stream, else 32)")
     p.add_argument("--mode", choices=["rts", "auto", "fifo"], default="rts",

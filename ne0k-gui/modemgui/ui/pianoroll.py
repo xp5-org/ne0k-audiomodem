@@ -27,6 +27,9 @@ KINDS = {
     "ack":   ("#39c5cf", "ACK"),
     "retry": ("#d070d0", "retry"),
     "fail":  ("#ff7b00", "FAIL"),
+    "phase": ("#a371f7", "phase step"),
+    "collision": ("#ff4fa3", "collision"),
+    "echo":  ("#8b949e", "echo"),
 }
 BARS = ("tx", "rx")                       # kinds that have airtime
 

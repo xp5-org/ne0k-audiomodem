@@ -46,9 +46,16 @@ class LinkInfoPanel(QWidget):
         self.tx_total += nbytes
         self._tx.append((time.monotonic(), nbytes))
 
+    def set_linkrate(self, rx_bps: float, tx_bps: float) -> None:
+        """PHY payload rate of each direction while the carrier is keyed (0 = not reported: '-')."""
+        for w, v in ((self.rx_rate, rx_bps), (self.tx_rate, tx_bps)):
+            w.setText(f"{v:.0f} bit/s" if v else "-")
+            w.setToolTip("Payload bit/s of the OFDM carrier while keyed." if v else "Not reported by the engine yet.")
+
     def clear(self) -> None:
         self._rx.clear(); self._tx.clear()
         self.rx_total = self.tx_total = 0
+        self.set_linkrate(0, 0)
         self.refresh("")
 
     @staticmethod

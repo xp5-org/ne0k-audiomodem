@@ -104,6 +104,11 @@ class AudioPipe:
         self._hist_n, self._hist_cap = 0, int(history_s * self.spec.rate)
         self._rx_index = 0
         self._tx: deque[np.ndarray] = deque()
+        self._tx_fresh: deque[bool] = deque()   # parallel to _tx: buffer not yet started
+        # f(rx_index, samples) when a queued buffer's first sample reaches the sink, with the
+        # RX sample count at that moment: puts our own transmissions on the RX timebase.
+        # Called from the sink thread after the TX lock is released: keep it cheap.
+        self.tx_onset_hooks: list = []
         self._tx_lock = threading.Lock()
         self._tx_midflight = False
         self._tx_last = -1e9             # monotonic time the sink last got real audio
@@ -220,6 +225,7 @@ class AudioPipe:
             return
         with self._tx_lock:
             self._tx.append(x)
+            self._tx_fresh.append(True)
             self._tx_midflight = True
             self._tx_idle.clear()
 
@@ -235,20 +241,27 @@ class AudioPipe:
     def stop_tx(self) -> None:
         with self._tx_lock:
             self._tx.clear()
+            self._tx_fresh.clear()
             self._tx_midflight = False
             self._tx_idle.set()
 
     def _pull(self, n: int) -> np.ndarray:
         out = np.zeros(n, np.float32)
         got = 0
+        onsets = []
         with self._tx_lock:
             while got < n and self._tx:
                 head = self._tx[0]
+                if self._tx_fresh and self._tx_fresh[0]:
+                    onsets.append((self._rx_index + got, head))
+                    self._tx_fresh[0] = False
                 take = min(n - got, len(head))
                 out[got:got + take] = head[:take]
                 got += take
                 if take == len(head):
                     self._tx.popleft()
+                    if self._tx_fresh:
+                        self._tx_fresh.popleft()
                 else:
                     self._tx[0] = head[take:]
             if got:
@@ -259,4 +272,10 @@ class AudioPipe:
                 self._tx_idle.set()
         if self._snk and self._snk.error:
             self.stats.tx_error = self._snk.error
+        for idx, buf in onsets:
+            for h in list(self.tx_onset_hooks):
+                try:
+                    h(idx, buf)
+                except Exception:          # a diagnostics hook must never break TX
+                    pass
         return out

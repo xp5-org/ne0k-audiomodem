@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         self.app = AppSettings(self.settings)
         self.link: MeshNode | None = None     # css = control plane only, ofdm = CSS + on-demand OFDM links
         self.serial = None                    # engine.serialbridge.SerialBridge (POSIX only)
+        self.udp = None                       # engine.udpbridge.UdpBridge (data stream over UDP)
         self.session = session or Session()
         self.bridge = EngineBridge(self.session, parent=self)
         self.diag = Diagnostics(self.app.diag, header={"modemgui": __version__,
@@ -177,9 +178,42 @@ class MainWindow(QMainWindow):
         self.column.set_mode(f"{g.modem.upper()}, {'point to point' if g.topology == 'p2p' else 'mesh'}, "
                              f"node {g.node_id}" + (f" -> {g.peer_id}" if g.topology == "p2p" else ", beacons " + ("on" if g.beacon else "off")))
 
+    def _bridge_counts(self) -> None:
+        """The UDP / serial data port moves bytes without the mesh link: count what it carried (the bcast link's
+        aired / delivered payload for UDP) into Link Info, and show the carrier's payload rate as the link rate."""
+        br = self.udp or self.serial
+        if br is None:
+            self._br_seen = None
+            return
+        L = getattr(br, "link", None)
+        if self.udp:
+            sent, got = L.bcast_bytes if self.app.udp.role == "send" else 0, br.rx_count
+        else:
+            sent, got = br.tx_count, br.rx_count
+        last = getattr(self, "_br_seen", None)
+        if last is None or last[0] is not br:
+            last = (br, 0, 0)
+        if sent > last[1]:
+            self.column.link_info.record_tx(sent - last[1])
+        if got > last[2]:
+            self.column.link_info.record_rx(got - last[2])
+        self._br_seen = (br, max(sent, last[1]), max(got, last[2]))
+        if self.udp and L is not None:
+            send = self.app.udp.role == "send"
+            self.column.link_info.set_linkrate(0 if send else L.phy_bps, L.phy_bps if send else 0)
+
     def _refresh_info(self) -> None:
         m = self.link
         detail = ""
+        self._bridge_counts()
+        if self.udp is not None:
+            L = self.udp.link
+            if self.app.udp.role == "send":
+                detail = (f"OFDM broadcast sender: chunks aired {L.bcast_chunks}, payload {L.bcast_bytes} B, "
+                          f"backlog dropped {L.bcast_dropped} B")
+            else:
+                detail = (f"OFDM broadcast listener (from node {self.app.udp.sender_id}): chunks {L.bcast_chunks}, "
+                          f"payload {L.bcast_bytes} B, lost {L.lost_frames}, bad {L.rx_errors}")
         if m is not None:
             links = ", ".join(f"{k} {v}" for k, v in m.link_states().items()) or "none"
             near = ", ".join(f"{n} ({snr:.0f} dB)" for n, (snr, _) in sorted(m.neighbors.items())) or "none"
@@ -330,6 +364,8 @@ class MainWindow(QMainWindow):
         self._show_mode()
         if self.serial:
             self._stop_serial()
+        if self.udp:
+            self._stop_udp()
         self._restart_link()
 
     def _send_id_now(self) -> None:
@@ -450,6 +486,35 @@ class MainWindow(QMainWindow):
             self.link = None
             self.statusBar().showMessage(f"Serial port closed (tx {br.tx_count} B, rx {br.rx_count} B).")
 
+    # -- UDP data port (the data-stream alternative to the serial port) -------
+
+    def _start_udp(self) -> None:
+        from ..engine.udpbridge import UdpBridge
+        if self.link:
+            self.link.stop(); self.link = None
+            self.feed.set_link(None)
+        try:
+            br = UdpBridge(self.session, self.app.ofdm, self.app.udp,
+                           log=lambda m: (self.diag.log("udp: " + m), _echo("udp: " + m)))
+            what = br.start()
+        except Exception as e:
+            self.diag.log(f"udp port failed: {type(e).__name__}: {e}")
+            self.statusBar().showMessage(f"UDP port: {e}")
+            self._restart_link()
+            return
+        self.udp = br
+        self.statusBar().showMessage(f"UDP port open: {what}")
+        u = self.app.udp
+        self.column.set_mode(f"OFDM broadcast, node {self.app.general.node_id}, "
+                             + ("sender (UDP in)" if u.role == "send" else f"listener of node {u.sender_id} (UDP out)"))
+
+    def _stop_udp(self) -> None:
+        br, self.udp = self.udp, None
+        if br:
+            self._show_mode()
+            br.stop()
+            self.statusBar().showMessage(f"UDP port closed (tx {br.tx_count} B, rx {br.rx_count} B).")
+
     # -- links -------------------------------------------------------------
 
     def _make_mesh(self) -> MeshNode:
@@ -488,7 +553,7 @@ class MainWindow(QMainWindow):
         if self.link:
             self.link.stop(); self.link = None
             self.feed.set_link(None)
-        if not self.session.is_open or self.serial:
+        if not self.session.is_open or self.serial or self.udp:
             return
         try:
             link = self._make_mesh()
@@ -591,11 +656,15 @@ class MainWindow(QMainWindow):
             self.diag.log("settings: " + json.dumps(self.app.dump(), default=str))
             self.diag.attach(self.session)
             self._restart_link()
-            if self.app.serial.autostart and not self.serial:
+            if self.app.udp.autostart and not self.udp and not self.serial:
+                self._start_udp()
+            elif self.app.serial.autostart and not self.serial and not self.udp:
                 self._start_serial()
         elif st.state == "closed":
             if self.serial:
                 self._stop_serial()
+            if self.udp:
+                self._stop_udp()
             if self.link:
                 self.link.stop(); self.link = None
                 self.feed.set_link(None)

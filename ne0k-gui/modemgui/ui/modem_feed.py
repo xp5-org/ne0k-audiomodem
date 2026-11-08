@@ -46,6 +46,10 @@ class ModemFeed(QObject):
     def on_link(self, ev: LinkEvent) -> None:
         if ev.kind == "lock":
             self.lockbar.locked()                  # on_decoded() refines it with timing
+        elif ev.kind == "rx":
+            self.lockbar.locked()                  # every decoded frame (each bcast chunk) proves the lock still holds
+        elif ev.kind == "err" and ev.detail == "bcast carrier lost":
+            self.lockbar.unlocked()
 
     def _poll_handshake(self) -> None:
         l = self.link
