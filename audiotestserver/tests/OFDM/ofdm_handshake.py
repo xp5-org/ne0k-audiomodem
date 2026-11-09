@@ -173,6 +173,7 @@ MSG_ANNOUNCE   = 7      # mesh presence round: body = [id u8][heard mask u16][fl
 MSG_BLOCKOUT_REQ = 8    # mesh blockout window open: body = [announcer u8][peer u8][duration u16] (see modemgui
                         # mesh_node.send_blockout) -- OFDM-only: CSS's baud rate can't carry this
 MSG_BLOCKOUT_END = 9    # mesh blockout window closed early: body = [announcer u8] (see mesh_node.end_blockout)
+MSG_BEACON = 11         # mesh beacon: body = [id u8]; an ofdm_only mesh node announces itself on the mesh beacon timer
 MSG_BAT_TABLES = 10     # mesh broadcast BAT round: measured tables, a report or the coordinator's confirm (see
                         # modemgui ofdm_announce.pack_tables) -- bootstrap ladder step, like BAT_REPORT
 
@@ -407,7 +408,7 @@ def bat_rle_unpack(blob: bytes) -> bytes:
 
 _MSG_NAMES = {1: "BAT_REPORT", 2: "BAT_ACK", 3: "GO", 4: "RETRY", 5: "FIN",
               6: "BAND", 7: "ANNOUNCE", 8: "BLOCKOUT_REQ", 9: "BLOCKOUT_END",
-              10: "BAT_TABLES"}
+              10: "BAT_TABLES", 11: "BEACON"}
 
 
 def pack_band(lo_hz: float, hi_hz: float,

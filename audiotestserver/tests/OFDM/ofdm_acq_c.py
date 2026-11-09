@@ -94,7 +94,10 @@ def _load(path: Path):
     _ip = ctypes.POINTER(ctypes.c_int)
     _up = ctypes.POINTER(ctypes.c_ubyte)
     lib.ofdm_dem_workspace.restype  = ctypes.c_size_t
-    lib.ofdm_dem_workspace.argtypes = [ctypes.c_int] * 9
+    # 10 ints, as ofdm_dem.h.  With 9 declared ctypes passed the 10th, n_bits_total, as a variadic argument: harmless
+    # on x86-64, but Apple arm64 lays variadic args out differently, so C read garbage and rejected every frame
+    # -- "ofdm_dem_workspace rejected this geometry" on the macOS mesh node, 2026-11-09
+    lib.ofdm_dem_workspace.argtypes = [ctypes.c_int] * 10
     lib.ofdm_dem_init.restype  = ctypes.c_int
     lib.ofdm_dem_init.argtypes = [
         ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_size_t,
