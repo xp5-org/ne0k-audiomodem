@@ -38,11 +38,15 @@ python3 meshgui.py --stats-dir ~/md/stats --node D --ping-host 0x13h.org
 
 Monitor audio plays `mesh_D_rx.monitor`: what the conference sends to D.
 
+## macOS / Windows test nodes
+
+The group tests run on macOS and Windows hosts too. Two loopback audio devices stand in for the null sinks: BlackHole 16ch/2ch on macOS, VB-Cable plus VAC Lite on Windows. The `audio_loopback_check` testlist proves them and writes their names to `loopback.json`. `sipbridge.py --source/--sink sd:name=TEXT` opens those devices through PortAudio instead of `parec`/`pacat`. `meshdialer.py --tx-source/--rx-sink` passes the names through, and `--hosts NODE=auto` advertises the address that routes to `--server`. The container's `__testplan__.py` picks each node's steps by host OS.
+
 ## Windows user PC
 
-The testlist path does not run on Windows:
+Outside the test framework, `meshgui.py` alone still assumes Linux:
 
-- `sipbridge.py call` needs `parec`/`pacat`.
+- `sipbridge.py call` without `sd:` devices needs `parec`/`pacat`.
 - meshgui's Monitor audio needs `pactl`.
 - meshgui's latency uses Linux `ping -c`/`-W` flags.
 

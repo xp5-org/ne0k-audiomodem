@@ -46,7 +46,8 @@ later run that joins the same conference.
 Playback (--player): `pulse` (pacat, Linux/PipeWire), `sounddevice` .
 `ffplay`, or `wav:FILE` .  `auto` takes the first of these
 
-Needs numpy and the pulseaudio-utils parec/pacat.  Exit code 0 when a call was established.
+Needs numpy and the pulseaudio-utils parec/pacat, or sounddevice for sd: devices.  Exit code 0 when a call was
+established.
 """
 from __future__ import annotations
 
@@ -189,6 +190,9 @@ class StreamResampler:
 
     def __init__(self, in_rate: int, out_rate: int, cutoff_hz: float = 3700.0, beta: float = 8.0):
         self.nominal = self.step = in_rate / out_rate
+        # downsampling, as capture does from the device rate to 8 kHz: the kernel is in input samples, so it has to span as many
+        # more of them as the rate ratio for the same filter
+        self.HALF = self.HALF * max(1, int(np.ceil(in_rate / out_rate)))
         h, fc = self.HALF, cutoff_hz / in_rate               # fc in cycles per input sample
         k = np.arange(-h + 1, h + 1)                         # taps at i-h+1 .. i+h around the read position i+frac
         frac = np.arange(self.PHASES)[:, None] / self.PHASES
@@ -217,27 +221,52 @@ class StreamResampler:
         return y.astype(np.float32)
 
 
+def sd_rate(device, kind):
+    """48 kHz when the device takes it, else its default rate.  The default can be a worse choice: Windows MME reports
+    44.1 kHz for VAC Lite's "Line 1", and played at 44.1 kHz the cable dropped ~1.4 ms every 0.3 s, 0.5%, on the way to
+    the 48 kHz reader -- the modem behind it lost the OFDM link; at 48 kHz, the rate audio_loopback_check proved, it is
+    clean, 2026-11-09."""
+    import sounddevice as sd
+    try:
+        (sd.check_output_settings if kind == "output" else sd.check_input_settings)(
+            device=device, samplerate=48000, channels=1, dtype="float32")
+        return 48000
+    except Exception:
+        return int(sd.query_devices(device, kind=None if device is not None else kind)["default_samplerate"])
+
+
 class SoundDevicePlayer:
-    """PortAudio (pip install sounddevice) -- the path on Windows and macOS.  Resampled to the output device's
-    own rate (StreamResampler) and played from a jitter buffer that holds about `prime_ms`: playout starts once
-    that much is queued, and the resampler's rate is trimmed by up to TRIM to keep the fill there, so the two
-    clocks (the sender's 8 kHz, this sound card) drifting apart never needs a drop.  An underrun fades out and
-    re-primes, a far overrun (a stall) drops the oldest audio with a short crossfade -- never a hard edge."""
+    """PortAudio via pip install sounddevice -- the path on Windows and macOS.  Resampled to the output device's
+    own rate by StreamResampler and played from a jitter buffer that holds about `prime_ms`: playout starts once
+    that much is queued.  The two clocks, the sender's 8 kHz and this sound card, drift apart by tens of ppm, so the
+    resampler's rate is trimmed by at most TRIM to keep the buffer near prime -- never more: an OFDM modem
+    signal does not survive its pitch being steered, and a bigger trim chasing the fill is exactly that.
+    The fill is sampled in the output callback, as the level just after the device took its block, and averaged over
+    ~FILL_TAU_S, so CoreAudio's large blocks, 4096 frames = 85 ms on BlackHole, do not read as fill swings.
+    An underrun fades out and re-primes, a far overrun from a stall drops the oldest audio with a short crossfade --
+    both counted, and logged every LOG_S while they happen as AUDIO OUT underruns=... overruns=...."""
 
-    TRIM = 0.004             # most the playout rate is nudged to follow the fill (0.4%: inaudible)
+    TRIM = 300e-6            # most the playout rate is nudged to follow the fill. 300 ppm covers clock drift, inaudible,
+                             # 1.2 Hz at 4 kHz -- an OFDM receiver tracks that; the old 0.4% broke it, 2026-11-08
+    GAIN = 0.002             # trim per unit of relative fill error: err 0.15 -> the full 300 ppm
+    FILL_TAU_S = 8.0
     FADE_S = 0.004           # fade at an underrun / re-prime / overrun splice
+    LOG_S = 10.0
 
-    def __init__(self, prime_ms=200, max_ms=1000):
+    def __init__(self, prime_ms=300, max_ms=2000, device=None):
         import sounddevice as sd
-        self.rate = int(sd.query_devices(kind="output")["default_samplerate"])
+        self.device = device
+        self.rate = sd_rate(device, "output")
         self.rs = StreamResampler(RATE, self.rate)
         self.prime, self.max = int(self.rate * prime_ms / 1000), int(self.rate * max_ms / 1000)
         self.fade = max(8, int(self.rate * self.FADE_S))
-        self.buf, self.lock, self.primed, self.fill = np.zeros(0, dtype=np.float32), threading.Lock(), False, 0.0
+        self.buf, self.lock, self.primed = np.zeros(0, dtype=np.float32), threading.Lock(), False
+        self.fill = float(self.prime)
         self.fade_in = False
         self.underruns = self.overruns = 0
-        self.stream = sd.OutputStream(samplerate=self.rate, channels=1, dtype="float32", callback=self._cb,
-                                      latency="high")
+        self._logged = (0, 0, time.monotonic())
+        self.stream = sd.OutputStream(device=device, samplerate=self.rate, channels=1, dtype="float32",
+                                      callback=self._cb, latency="high")
         self.stream.start()
 
     def _cb(self, out, frames, _time, _status):
@@ -259,16 +288,16 @@ class SoundDevicePlayer:
                     y[n - m:] *= np.linspace(1, 0, m, dtype=np.float32)
                 self.primed = False
                 self.underruns += 1
+            else:                                            # level right after the device's take, slow average
+                a = min(1.0, frames / (self.rate * self.FILL_TAU_S))
+                self.fill += a * (len(self.buf) + frames / 2 - self.fill)
             out[:n, 0] = y
             out[n:, 0] = 0
 
     def write(self, pcm: bytes):
         x = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-        with self.lock:
-            fill = len(self.buf)
-        self.fill += 0.05 * (fill - self.fill)               # ~1 s smoothing at 50 packets/s: jitter averages out
         err = (self.fill - self.prime) / self.prime          # > 0: too much queued -> read the input faster
-        self.rs.step = self.rs.nominal * (1 + float(np.clip(0.02 * err, -self.TRIM, self.TRIM)))
+        self.rs.step = self.rs.nominal * (1 + float(np.clip(self.GAIN * err, -self.TRIM, self.TRIM)))
         y = self.rs.process(x)
         with self.lock:
             self.buf = np.concatenate((self.buf, y))
@@ -281,10 +310,140 @@ class SoundDevicePlayer:
                 self.buf[:m] = head * (1 - r) + tail * r
                 self.fill = float(self.prime)
                 self.overruns += 1
+        u, o, t = self._logged
+        if (self.underruns, self.overruns) != (u, o) and time.monotonic() - t >= self.LOG_S:
+            log(f"AUDIO OUT underruns={self.underruns} overruns={self.overruns} fill={self.fill / self.rate * 1000:.0f}ms "
+                f"trim={(self.rs.step / self.rs.nominal - 1) * 1e6:+.0f}ppm")
+            self._logged = (self.underruns, self.overruns, time.monotonic())
 
     def close(self):
+        log(f"AUDIO OUT closed underruns={self.underruns} overruns={self.overruns} "
+            f"fill={self.fill / self.rate * 1000:.0f}ms trim={(self.rs.step / self.rs.nominal - 1) * 1e6:+.0f}ppm")
         self.stream.stop()
         self.stream.close()
+
+
+def sd_device(spec: str, kind: str):
+    """'sd:name=TEXT' / 'sd:3' / 'sd:' -> PortAudio device index, None = default, the way modemgui's sd: connector
+    picks one: the first device whose name contains TEXT, case-insensitive, and has channels of that kind.  The mesh
+    nodes on macOS / Windows write the names audio_loopback_check.py proved into audio_route.json."""
+    import sounddevice as sd
+    dev = spec[3:] if spec.startswith("sd:") else spec
+    if dev == "":
+        return None
+    key = "max_input_channels" if kind == "input" else "max_output_channels"
+    if dev.startswith("name="):
+        want = dev[5:].lower()
+        for i, d in enumerate(sd.query_devices()):
+            if want in d["name"].lower() and d[key] > 0:
+                return i
+        raise SystemExit(f"no {kind} device whose name contains {want!r}; devices: "
+                         + "; ".join(f"{i}:{d['name']}" for i, d in enumerate(sd.query_devices()) if d[key] > 0))
+    return int(dev)
+
+
+class SdCapture:
+    """--source sd:...: PortAudio capture in place of parec.  The device's own rate, resampled to 8 kHz
+    by StreamResampler with the kernel widened for decimation, handed out as 20 ms s16le frames at the device clock's
+    pace -- the same contract as reading parec's stdout."""
+
+    def __init__(self, spec: str):
+        import queue
+        import sounddevice as sd
+        self.device = sd_device(spec, "input")
+        info = sd.query_devices(self.device, kind=None if self.device is not None else "input")
+        self.rate = sd_rate(self.device, "input")
+        self.rs = StreamResampler(self.rate, RATE)
+        self.q, self.buf, self.closed = queue.Queue(maxsize=500), np.zeros(0, dtype=np.float32), False
+        self.overflows = 0
+
+        def cb(indata, _frames, _time, status):
+            if status:
+                self.overflows += 1
+            try:
+                self.q.put_nowait(indata[:, 0].copy())
+            except queue.Full:                               # reader stalled: drop, never block PortAudio
+                self.overflows += 1
+        self.stream = sd.InputStream(device=self.device, samplerate=self.rate, channels=1, dtype="float32",
+                                     blocksize=int(self.rate * PTIME), callback=cb)
+        self.stream.start()
+        log(f"AUDIO IN sounddevice device={self.device} ({info['name']}) rate={self.rate}")
+
+    PRIME_S = 0.12           # held back before the first frame: covers one large device block, 85 ms on CoreAudio
+
+    def _pull(self, timeout):
+        import queue
+        try:
+            blk = self.q.get(timeout=timeout)
+        except queue.Empty:
+            return False
+        self.buf = np.concatenate((self.buf, self.rs.process(blk)))
+        return True
+
+    def read(self, need: int) -> bytes:
+        """need bytes of 8 kHz s16le, one 20 ms frame per 20 ms tick; b'' once closed.
+        The device hands audio over in its own block size, 4096 frames = 85 ms on CoreAudio/BlackHole, so frames are
+        served from a small reserve on a steady clock instead of in bursts of four -- a burst is up to 85 ms late at
+        the far end, where the conference only primes 100 ms: RTP TX STALL on every 4th packet, 2026-11-08.
+        The reserve follows the device clock: above PRIME_S + 100 ms the tick is skipped to catch up, empty blocks."""
+        n = need // 2
+        prime = int(RATE * self.PRIME_S)
+        if not hasattr(self, "t_next"):
+            while len(self.buf) < prime + n:
+                if self.closed:
+                    return b""
+                self._pull(0.5)
+            self.t_next = time.monotonic()
+        while self._pull(0):                                 # take whatever the callback has queued
+            pass
+        if len(self.buf) < prime + int(RATE * 0.1):          # not far ahead: keep the 20 ms beat
+            delay = self.t_next - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+        self.t_next = max(self.t_next + PTIME, time.monotonic() - 0.2)
+        while len(self.buf) < n:                             # reserve ran dry, the device slower or stalled: wait
+            if self.closed:
+                return b""
+            self._pull(0.5)
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return (np.clip(out, -1.0, 32767 / 32768) * 32768).astype("<i2").tobytes()
+
+    def close(self):
+        self.closed = True
+        try:
+            self.stream.abort()
+            self.stream.close()
+        except Exception:
+            pass
+
+
+class ParecCapture:
+    """--source PULSE_SOURCE, the default: parec's stdout."""
+
+    def __init__(self, source):
+        self.proc = subprocess.Popen(["parec", *(["-d", source] if source else []), *PULSE_FMT,
+                                      "--client-name=sipbridge-tx"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def read(self, need: int) -> bytes:
+        return self.proc.stdout.read(need)
+
+    def close(self):
+        try:
+            self.proc.terminate()
+        except OSError:
+            pass
+
+
+def make_capture(source):
+    return SdCapture(source) if source and source.startswith("sd:") else ParecCapture(source)
+
+
+def make_sink(sink):
+    if sink and sink.startswith("sd:"):
+        p = SoundDevicePlayer(device=sd_device(sink, "output"))
+        log(f"AUDIO OUT sounddevice device={p.device} rate={p.rate}")
+        return p
+    return PacatPlayer(sink)
 
 
 class MuteGate:
@@ -331,7 +490,8 @@ def make_player(spec: str):
 
 
 class Audio:
-    """parec -> RTP out, RTP in -> pacat.  One instance per call.
+    """parec -> RTP out, RTP in -> pacat.  One instance per call.  --source/--sink sd:name=... use PortAudio instead:
+    on macOS / Windows loopback devices stand in for the PulseAudio null sinks.
 
     listen mode: `player` replaces pacat and `silent_tx` replaces parec with paced digital silence."""
 
@@ -340,10 +500,8 @@ class Audio:
         self.tx = self.rx = self.lost = self.late = self.jumps = 0
         self.seq, self.ts, self.ssrc = random.randint(0, 65535), random.randint(0, 2 ** 32 - 1), random.getrandbits(32)
         self.silent_tx = silent_tx
-        self.rec = None if silent_tx else subprocess.Popen(
-            ["parec", *(["-d", source] if source else []), *PULSE_FMT, "--client-name=sipbridge-tx"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self.play = player or PacatPlayer(sink)
+        self.rec = None if silent_tx else make_capture(source)
+        self.play = player or make_sink(sink)
         self.threads = [threading.Thread(target=self._send, daemon=True),
                         threading.Thread(target=self._recv, daemon=True)]
         for t in self.threads:
@@ -354,7 +512,7 @@ class Audio:
         need = SAMPLES * 2
         if not self.silent_tx:
             while True:
-                buf = self.rec.stdout.read(need)
+                buf = self.rec.read(need)
                 if len(buf) < need:
                     return
                 yield buf
@@ -434,10 +592,7 @@ class Audio:
     def close(self):
         self.stop.set()
         if self.rec:
-            try:
-                self.rec.terminate()
-            except OSError:
-                pass
+            self.rec.close()
         try:
             self.play.close()
         except Exception:
@@ -709,8 +864,10 @@ def main(argv=None) -> int:
     p.add_argument("--bind", default="127.0.0.1", help="local address for RTP (and SIP when --listen is absent)")
     p.add_argument("--advertise", help="address put in SDP/Contact (default: --bind)")
     p.add_argument("--rtp-port", type=int, default=0)
-    p.add_argument("--source", help="pulse source whose audio is sent (e.g. SINK.monitor); default source")
-    p.add_argument("--sink", help="pulse sink that plays the far end's audio; default sink")
+    p.add_argument("--source", help="pulse source whose audio is sent (e.g. SINK.monitor), or sd:name=TEXT / sd:INDEX "
+                                    "for a PortAudio capture device (macOS / Windows); default pulse source")
+    p.add_argument("--sink", help="pulse sink that plays the far end's audio, or sd:name=TEXT / sd:INDEX for a "
+                                  "PortAudio output device; default pulse sink")
     p.add_argument("--register", help="answer: REGISTER --user with this SIP server HOST:PORT first, so it can ring us "
                                       "(unauthenticated; refreshed while waiting, removed on exit)")
     p.add_argument("--reg-expires", type=int, default=60, help="REGISTER Expires seconds (sipserver caps at 120)")
@@ -747,6 +904,8 @@ def main(argv=None) -> int:
     c = Call(a)
     signal.signal(signal.SIGTERM, lambda *_: c.quit.set())
     signal.signal(signal.SIGINT, lambda *_: c.quit.set())
+    if hasattr(signal, "SIGBREAK"):                    # Windows: CTRL_BREAK_EVENT from a process-group stop
+        signal.signal(signal.SIGBREAK, lambda *_: c.quit.set())
     try:
         rc = c.run_call() if a.mode in ("call", "listen") else c.run_answer()
     finally:

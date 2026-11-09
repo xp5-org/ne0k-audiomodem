@@ -7,7 +7,7 @@ DISCONNECTED, RX/TX bit/s, latency (ping), dropped RTP frames, and the Monitor a
 Works on Windows/macOS/Linux; needs numpy, sounddevice and tkinte.
 
     python listengui.py                                   # mesh conference 3000 on the external SIP server
-    python listengui.py --to HOST:PORT --number 3000
+    python listengui.py --to HOST[:PORT] --number 3000
 
 Monitor audio OFF/ON flips sipbridge's --mute-file; the call and the audio device stay open.
 meshgui.py is the one in prereqs/meshsip; it is not copied.
@@ -47,7 +47,8 @@ class Listener:
         self.source = f"conference {a.number} @ {a.to}"
         argv = [sys.executable, BRIDGE, "listen", "--to", a.to, "--number", a.number,
                 "--player", a.player, "--mute-file", self.mute, "--stats-file", stats]
-        self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.errlog = os.path.join(os.path.dirname(stats), "sipbridge.err")
+        self.proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=open(self.errlog, "w"))
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -77,11 +78,13 @@ class Listener:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--to", default="127.0.0.1:15064", help="SIP server HOST:PORT (default: the external mesh server)")
+    ap.add_argument("--to", default="127.0.0.1:15064", help="SIP server HOST[:PORT] (port defaults to 15064)")
     ap.add_argument("--number", default="3000", help="conference number (default 3000)")
     ap.add_argument("--player", default="auto", help="sipbridge --player when Monitor audio is ON")
     ap.add_argument("--meshgui", help="directory containing meshgui.py")
     a = ap.parse_args()
+    if ":" not in a.to:
+        a.to += ":15064"                                     # sipbridge splits HOST:PORT and dies on a bare host
 
     sys.path.insert(0, find_meshgui(a.meshgui))
     import meshgui

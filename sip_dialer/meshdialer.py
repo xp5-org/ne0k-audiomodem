@@ -29,6 +29,8 @@ Each node n has two PulseAudio sinks:
     PREFIX_n_rx    the modem's RX; every call leg plays into it, and PulseAudio sums the streams
 
 (--server --conference N replaces all of this with ONE call per node to a hosted conference bridge.)
+macOS / Windows have no PulseAudio: --tx-source / --rx-sink sd:name=TEXT name the two loopback devices -- BlackHole,
+VB-Cable / VAC -- that stand in for the sinks, and --hosts NODE=auto advertises the address that routes to --server.
 
 For every pair (i < j) there is ONE call, which carries both directions: node j answers, node i dials.
 A node with k peers therefore hears the sum of k calls on its RX sink and its TX goes to all k --
@@ -57,6 +59,7 @@ import argparse
 import itertools
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -68,6 +71,18 @@ DEFAULT_BRIDGE = os.path.join(HERE, "sipbridge.py")
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def route_ip(host: str) -> str:
+    """The local address the OS would use to reach host; no packet is sent."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((host, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 class Leg:
@@ -107,6 +122,10 @@ def main(argv=None) -> int:
     p.add_argument("--local", default="", help="nodes started on THIS machine (default: all)")
     p.add_argument("--server", help="route every call through this SIP server HOST:PORT instead of node-to-node")
     p.add_argument("--prefix", default="mesh", help="sink prefix: PREFIX_<node>, PREFIX_<node>_rx")
+    p.add_argument("--tx-source", help="what the local node's legs send, instead of PREFIX_<node>.monitor: a pulse "
+                                       "source or sd:name=TEXT (macOS / Windows loopback device; one local node)")
+    p.add_argument("--rx-sink", help="where the local node's legs play, instead of PREFIX_<node>_rx: a pulse sink or "
+                                     "sd:name=TEXT (one local node)")
     p.add_argument("--sip-base", type=int, default=15100)
     p.add_argument("--rtp-base", type=int, default=41000)
     p.add_argument("--bridge", default=DEFAULT_BRIDGE)
@@ -133,7 +152,18 @@ def main(argv=None) -> int:
     nodes = a.nodes.split(",")
     hosts = {n: "127.0.0.1" for n in nodes}
     hosts.update(dict(kv.split("=", 1) for kv in a.hosts.split(",") if kv))
+    for n, h in hosts.items():
+        if h == "auto":                   # the address that routes to the SIP server, on any OS, without hostname -I
+            hosts[n] = route_ip(a.server.rsplit(":", 1)[0]) if a.server else "127.0.0.1"
     local = set(a.local.split(",")) if a.local else set(nodes)
+    if (a.tx_source or a.rx_sink) and len(local) != 1:
+        p.error("--tx-source / --rx-sink name ONE local node's devices: give --local NODE")
+
+    def src(n):
+        return a.tx_source or f"{a.prefix}_{n}.monitor"
+
+    def snk(n):
+        return a.rx_sink or f"{a.prefix}_{n}_rx"
     os.makedirs(a.out, exist_ok=True)
     if a.stats_dir:
         os.makedirs(a.stats_dir, exist_ok=True)
@@ -142,6 +172,8 @@ def main(argv=None) -> int:
     quit_ = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: quit_.set())
     signal.signal(signal.SIGINT, lambda *_: quit_.set())
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, lambda *_: quit_.set())
 
     def port(j, i):                       # i < j; keyed by the answerer j
         return 10 * j + i
@@ -150,8 +182,8 @@ def main(argv=None) -> int:
 
     def bridge_argv(mode, node, peer_idx_pair, extra):
         st = ["--stats-file", f"{a.stats_dir}/{nodes[peer_idx_pair[0]]}-{nodes[peer_idx_pair[1]]}_{mode}.json"] if a.stats_dir else []
-        return [a.python, a.bridge, mode, "--source", f"{a.prefix}_{node}.monitor",
-                "--sink", f"{a.prefix}_{node}_rx", "--max-s", str(a.max_s), *st, *extra]
+        return [a.python, a.bridge, mode, "--source", src(node),
+                "--sink", snk(node), "--max-s", str(a.max_s), *st, *extra]
 
     pairs = [(i, j) for i, j in itertools.combinations(range(len(nodes)), 2)]
     expected = 0
@@ -175,8 +207,8 @@ def main(argv=None) -> int:
                     bind = "127.0.0.1" if h == "127.0.0.1" else "0.0.0.0"
                     st = ["--stats-file", f"{a.stats_dir}/{n}-conference_call.json"] if a.stats_dir else []
                     legs.append(Leg(f"{n}-conference", "call", [
-                        a.python, a.bridge, "call", "--source", f"{a.prefix}_{n}.monitor",
-                        "--sink", f"{a.prefix}_{n}_rx", "--max-s", str(a.max_s), *st,
+                        a.python, a.bridge, "call", "--source", src(n),
+                        "--sink", snk(n), "--max-s", str(a.max_s), *st,
                         "--to", a.server, "--number", a.conference, "--user", f"{a.prefix}{n}",
                         "--bind", bind, "--advertise", h, "--rtp-port", str(a.rtp_base + 4 * i + 2)],
                         f"{a.out}/leg_{n}-conference_call.log"))
