@@ -38,7 +38,8 @@ simply carry on with whatever was already queued -- nothing is discarded while m
 is no backlog to replay, just normal CSMA/CA picking up again.  See ``mesh_mac.Blockout``.
 
 Medium access follows the reference daemon (``mesh_mac``): every CSS packet goes through a
-CSMA/CA outbox (carrier sense, ``U(0, cw_s) + id * id_slot_s`` backoff, ID-staggered ACKs), beacons
+CSMA/CA outbox (carrier sense, slotted ``randrange(cw) * slot_s + id * id_slot_s`` backoff with an
+exponential window on unanswered packets, ID-staggered ACKs), beacons
 are paced by the measured clock drift of the peers, handshakes wait for a quiet channel (and for the
 link's exclusive wall-clock window when ``airtime_windows`` is on), and a duty-cycled passive detector
 re-arms an OFDM upgrade that was given up on when it hears OFDM on the air.
@@ -60,7 +61,7 @@ import numpy as np
 from .css_link import CssLink
 from .css_link import _imports as _css_imports
 from .events import Decoded, LinkEvent
-from .mesh_mac import Airtime, Ambient, Blockout, Csma, Rechirp
+from .mesh_mac import STAGGER_MOD, Airtime, Ambient, Blockout, Csma, Rechirp
 from .modemcfg import CssConfig, OfdmConfig, _Config
 from .mesh_rx import MeshReceiver
 from .ofdm_link import OfdmLink, _Capture, _quiet, keyup
@@ -98,6 +99,7 @@ class _Job:
         self.done = threading.Event()
         self.air = 0.0
         self.err: Exception | None = None
+        self.carried_id = False              # the station ID went out with this packet
 
 
 @dataclasses.dataclass
@@ -109,11 +111,16 @@ class MeshConfig(_Config):
     ack_wait_s: float = 0.0              # CSS ACK wait; 0 = derive from the ACK airtime
     hold_s: float = 150.0                # stay quiet this long after overhearing a REQ
     link_idle_s: float = 90.0            # tear an OFDM link down after this much silence
-    beacon: bool = False                 # announce this node on the CSS control plane (mesh topology)
+    beacon: bool = False                 # mesh topology: announce this node -- a CSS beacon, or under ofdm_only an OFDM one
     beacon_min_s: float = 20.0           # the beacon interval follows the peers' clock drift, clamped to [min, max]
     beacon_max_s: float = 300.0
     first_beacon_s: float = 20.0         # listen first: the first beacon comes a random time up to this after start
-    cw_s: float = 4.0                    # CSMA/CA contention window
+    slot_s: float = 2.5                  # CSMA/CA backoff slot; must exceed the carrier-sense latency
+    cw_slots: int = 8                    # initial contention window (slots); 3 nodes started together pick
+                                         # distinct slots ~66% of the time at 8, ~38% at 4
+    cw_max_slots: int = 16               # window cap after repeated unanswered packets
+    tx_tail_s: float = 2.0               # after our own frame, wait this before backoff (listeners' end-of-frame lag)
+    cw_id_hold_s: float = 2.0            # ham CW ID on: carrier sense stays busy cw_gap_s + this after any burst
     id_slot_s: float = 0.1               # per-id backoff phase (id % 16 slots)
     ack_stagger_s: float = 0.5           # per-id hold before answering (id % 16 steps)
     airtime_windows: bool = False        # confine each link's handshake to its own wall-clock window
@@ -121,6 +128,7 @@ class MeshConfig(_Config):
     hs_slots: int = 4
     hs_guard_s: float = 45.0
     hs_init_offset_s: float = 6.0
+    auto_link: bool = False              # powered on = link trained with the ring peer, no data needed (GUI sets True)
     announce_round: bool = False         # ofdm_only: id-ordered OFDM presence round + BAT turn order (ofdm_announce)
     announce_bat_turn_s: float = 60.0
     announce_bat_mode: str = "pairwise"  # pairwise (acoustic) | broadcast (one probe each, see ofdm_announce)
@@ -152,10 +160,12 @@ class MeshNode:
         self.neighbors: dict[int, tuple[float, float]] = {}    # node -> (snr_db, last heard)
         self.beacons_tx = 0
         self._csslock = threading.Lock()
+        self._tx_carried_id: dict[str, bool] = {}
         c = self.css_cfg
         sps = int(c.fs * c.symbol_dur)
         sps += int(round(sps * c.symbol_gap_frac))
-        self.csma = Csma(mesh.node_id, cw_s=mesh.cw_s, id_slot_s=mesh.id_slot_s, ack_stagger_s=mesh.ack_stagger_s)
+        self.csma = Csma(mesh.node_id, slot_s=mesh.slot_s, cw_slots=mesh.cw_slots, cw_max_slots=mesh.cw_max_slots,
+                         id_slot_s=mesh.id_slot_s, ack_stagger_s=mesh.ack_stagger_s, tx_tail_s=mesh.tx_tail_s)
         self.rechirp = Rechirp(mesh.node_id, c.fs, sps, min_s=mesh.beacon_min_s, max_s=mesh.beacon_max_s,
                                first_s=mesh.first_beacon_s)
         self.air = (Airtime(window_s=mesh.hs_window_s, slots=mesh.hs_slots, guard_s=mesh.hs_guard_s,
@@ -185,7 +195,7 @@ class MeshNode:
         self.session.ident.channel_busy = self._channel_busy
         detect = self.mesh.phy_mode == "css_then_ofdm" and self.mesh.ofdm_detect   # re-arms a CSS->OFDM upgrade
         for fn, name in ((((self._ctl, "mesh-ctl"),) if self.own_events else ())
-                          + ((self._reap, "mesh-reap"), (self._mac, "mesh-mac"))
+                          + ((self._reap, "mesh-reap"), (self._mac, "mesh-mac"), (self._keeper, "mesh-keeper"))
                           + (((self._detect, "mesh-detect"),) if detect else ())):
             t = threading.Thread(target=fn, name=name, daemon=True)
             t.start()
@@ -213,6 +223,28 @@ class MeshNode:
             rx.announce = a
             a.start()
         rx.start()
+
+    def _is_initiator(self, dst: int) -> bool:
+        role = self.ofdm_cfg.role
+        return role == "initiator" or (role == "auto" and self.me < dst)
+
+    def _keeper(self) -> None:
+        """Powered on = trained: bring the link to the ring peer up without waiting for data.  The initiator
+        handshakes (again, whenever the link drops); the responder (ofdm_only, where no CSS REQ will ever
+        announce the initiator) just listens.  The announce round runs its own BAT turns, so it is left alone."""
+        while not self._stop.wait(2.0):
+            if not self.mesh.auto_link or self.announce is not None:
+                continue
+            dst = self.ring_dst_fn()
+            if not dst:
+                continue
+            try:
+                if self._is_initiator(dst):
+                    self._open_tx_link(dst)
+                elif self.mesh.phy_mode == "ofdm_only":
+                    self._ensure_rx_link(dst)
+            except Exception as e:
+                self.log(f"auto link to {dst}: {type(e).__name__}: {e}")
 
     def _all_links(self) -> list[OfdmLink]:
         with self._lock:
@@ -354,7 +386,27 @@ class MeshNode:
                 return 0.0
         if job.err:
             raise job.err
+        if job.carried_id:
+            self._tx_carried_id[tag] = True
         return job.air
+
+    def _rearm_ident_if_lost(self, tag: str) -> None:
+        """An unanswered packet that carried our ID: nobody may have heard it, send it again."""
+        if self._tx_carried_id.pop(tag, False):
+            ident = getattr(self.session, "ident", None)
+            if ident is not None:
+                ident.rearm()
+                self.log("ident rode on an unanswered packet: re-sending it with the next one")
+
+    def _settle_s(self) -> float:
+        """How long the channel counts as busy after the last burst energy.  With a ham CW ID the ID is a
+        separate burst ``cw_gap_s`` of silence after the frame (so the data burst ends first): a node
+        that took that gap for a free channel keyed over the peer's callsign.  Peers are assumed to run
+        the same ident mode as this node (it is a network-wide station setting)."""
+        ident = getattr(self.session, "ident", None)
+        if ident is not None and ident._active() and ident.cfg.id_mode in ("cw", "both"):
+            return max(0.4, ident.cfg.cw_gap_s + self.mesh.cw_id_hold_s)
+        return 0.4
 
     def _channel_busy(self) -> bool:
         """Carrier sense: CSS on the air, one of our own OFDM handshakes in progress (a responder
@@ -362,10 +414,12 @@ class MeshNode:
         bystander only -- see Blockout.muted) someone else's exclusive blockout window."""
         if self.blockout.muted(time.monotonic()):
             return True
-        if self.mesh.phy_mode == "ofdm_only":
+        if getattr(self.session, "ignore_busy", False):
+            pass                                  # microphone use: room noise is not a station on the air
+        elif self.mesh.phy_mode == "ofdm_only":
             if self.rx is not None and self.rx.channel_busy():
                 return True
-        elif self.css.channel_busy():
+        elif self.css.channel_busy(settle_s=self._settle_s()):
             return True
         with self._lock:
             return any(not lk.up and lk.state not in ("failed", "closed") and not lk.passive_listen()
@@ -387,7 +441,15 @@ class MeshNode:
                     self.log("queueing CSS beacon")
                     self.csma.enqueue(_Job(self.css.send_type, (BROADCAST, 0, 0, b"", "BEACON"), beacon=True),
                                       "beacon:", 0.0)
-                got = self.csma.poll(now, busy)
+                # ofdm_only: the same mesh beacon timer, an OFDM BEACON frame.  A mesh node has to make itself known
+                # without waiting for data to send; the announce round, when it runs, already does that.
+                ofdm_beacon = (self.mesh.beacon and self.mesh.phy_mode == "ofdm_only" and self.announce is None
+                               and not busy and now >= self.rechirp.next_at and now >= self._hold_until
+                               and not self.blockout.muted(now) and self.rechirp.due(now))
+                got = None if ofdm_beacon else self.csma.poll(now, busy)
+            if ofdm_beacon:
+                self._send_ofdm_beacon()
+                continue
             if not got:
                 continue
             job = got[0]
@@ -400,12 +462,18 @@ class MeshNode:
                 job.done.set()
                 continue
             try:
+                ident = getattr(self.session, "ident", None)
+                n_id = len(ident.sent) if ident is not None else 0
                 with self._csslock:
                     job.air = job.fn(*job.args)
+                job.carried_id = ident is not None and len(ident.sent) > n_id
                 pipe = self.session.pipe
                 if pipe:
                     pipe.wait_tx(job.air + 10)
                 time.sleep(0.3)
+                with self._lock:
+                    # listeners see us quiet only after their own settle: count slots from the same moment
+                    self.csma.tx_done(time.monotonic(), max(self.mesh.tx_tail_s, self._settle_s()))
                 if job.beacon:
                     self.beacons_tx += 1
             except Exception as e:
@@ -416,15 +484,26 @@ class MeshNode:
             for job, _, _ in self.csma.outbox:
                 job.done.set()
 
-    def _ack_wait(self) -> float:
+    def _ack_wait(self, peer: int | None = None) -> float:
         if self.mesh.ack_wait_s:
             return self.mesh.ack_wait_s
-        # the peer holds its ACK by its id stagger and backs off before sending it
-        return (self.css.ack_airtime() + 2 * self.css_cfg.hang_s + 10 + self.mesh.cw_s
-                + 16 * self.mesh.id_slot_s + Csma.max_ack_delay(self.mesh.ack_stagger_s))
+        # ACKs do not contend (Csma: no backoff, everyone else waits >= 1 slot), so the answer comes once
+        # the peer has decoded our frame, its carrier sense has settled and its id stagger has run
+        stagger = ((peer % STAGGER_MOD) * self.mesh.ack_stagger_s if peer is not None
+                   else Csma.max_ack_delay(self.mesh.ack_stagger_s))
+        return (self.css.ack_airtime() + 2 * self.css_cfg.hang_s + self._settle_s() + stagger + 10)
 
     def _wait_ack(self, peer: int, seq: int) -> bool:
-        end = time.monotonic() + self._ack_wait()
+        with self._lock:
+            self.csma.awaiting += 1               # keep our own outbox (bar ACKs) off the air meanwhile
+        try:
+            return self._wait_ack_inner(peer, seq)
+        finally:
+            with self._lock:
+                self.csma.awaiting -= 1
+
+    def _wait_ack_inner(self, peer: int, seq: int) -> bool:
+        end = time.monotonic() + self._ack_wait(peer)
         while not self._stop.is_set():
             if (peer, seq) in self._acks:
                 self._acks.discard((peer, seq))
@@ -559,11 +638,30 @@ class MeshNode:
             self.log(f"blockout end (from {src}): resuming")
             self.session._emit(LinkEvent("blockout", self.me, -1, now, now, "resume"))
 
+    def _send_ofdm_beacon(self) -> None:
+        """ofdm_only mesh beacon: one OFDM BEACON broadcast carrying this node's id, keyed like BLOCKOUT_REQ."""
+        try:
+            H, _ = _ofdm_imports()
+            band, fs = self._ofdm_band(), self.ofdm_cfg.fs
+            audio = H.make_msg_audio(fs, H.MSG_BEACON, 0, struct.pack("<B", self.me), band)
+            audio, _ = H.scale_hs_tx(audio, self.ofdm_cfg.amplitude, fs, is_probe=False, band=band)
+            audio = keyup(self.session, audio, fs)
+            self.log("tx OFDM beacon")
+            self.session.play(audio, ident=False)
+            pipe = self.session.pipe
+            if pipe:
+                pipe.wait_tx(len(audio) / fs + 10)
+            with self._lock:
+                self.csma.tx_done(time.monotonic(), max(self.mesh.tx_tail_s, self._settle_s()))
+            self.beacons_tx += 1
+        except Exception as e:
+            self.log(f"OFDM beacon tx failed: {e}")
+
     def _ofdm_band(self) -> tuple[float, float]:
         return (self.ofdm_cfg.freq_lo, self.ofdm_cfg.freq_hi)
 
     def _on_ofdm_msg(self, got) -> None:
-        """ofdm_only: BLOCKOUT_REQ/BLOCKOUT_END broadcasts, handed over by the node's MeshReceiver.  The broadcast
+        """ofdm_only: BEACON, BLOCKOUT_REQ and BLOCKOUT_END broadcasts, handed over by the node's MeshReceiver.  The broadcast
         IS the mechanism (see ``send_blockout``/``end_blockout``), so this is the only way any node -- muted or
         not -- ever learns a window opened or closed."""
         H, _ = _ofdm_imports()
@@ -577,6 +675,9 @@ class MeshNode:
             (announcer,) = struct.unpack(_BO_END_BODY, body[:end_len])
             if announcer != self.me:
                 self._apply_blockout_end(announcer)
+        elif mtype == H.MSG_BEACON and len(body) >= 1 and body[0] != self.me:
+            self.neighbors[body[0]] = (0.0, time.monotonic())
+            self.log(f"heard OFDM beacon from {body[0]}")
 
     def _peer_on_css(self, src: int) -> None:
         """Any CSS data/ACK from an OFDM-linked peer is proof it is back on CSS: drop our end of
@@ -720,7 +821,11 @@ class MeshNode:
             self.reqs += 1
             self._css_tx(self.css.send_type, dst, 6, seq, b"", f"OFDM_HS_REQ seq={seq}", tag=f"req:{dst}:{seq}")
             if self._wait_ack(dst, seq):
+                self._tx_carried_id.pop(f"req:{dst}:{seq}", None)
+                self.csma.acked()
                 return True
+            self.csma.no_ack()
+            self._rearm_ident_if_lost(f"req:{dst}:{seq}")
             self.log(f"REQ to {dst} unanswered (attempt {attempt + 1})")
         return False
 
@@ -740,7 +845,8 @@ class MeshNode:
             with self._lock:
                 dead = [k for k, lk in self.links.items()
                         if lk.state in ("failed", "closed")
-                        or (lk.up and now - max(lk.last_activity, since or 0.0) > idle_s)]
+                        or (lk.up and not self.mesh.auto_link     # a powered-on modem stays trained, quiet or not
+                            and now - max(lk.last_activity, since or 0.0) > idle_s)]
                 gone = [self.links.pop(k) for k in dead]
             for lk in gone:
                 self.log(f"closing idle/failed link to {lk.cfg.peer_id}")
@@ -992,9 +1098,15 @@ class MeshNode:
             if attempt:
                 now = time.monotonic()
                 self.session._emit(LinkEvent("retry", self.me, dst, now, now, f"css attempt {attempt}"))
-            self._css_tx(self.css.send_bytes, _frame(payload), seq, dst, tag=f"data:{dst}:{seq}:{attempt}")
+            tag = f"data:{dst}:{seq}:{attempt}"
+            self._css_tx(self.css.send_bytes, _frame(payload), seq, dst, tag=tag)
             if self._wait_ack(dst, seq):
+                self._tx_carried_id.pop(tag, None)
+                self.csma.acked()
                 return True
+            self.csma.no_ack()
+            self._rearm_ident_if_lost(tag)
+            self.log(f"css DATA seq={seq} to {dst} unanswered: contention window now {self.csma.cw} slots")
         now = time.monotonic()
         self.session._emit(LinkEvent("fail", self.me, dst, now, now, "css: no ACK"))
         return False

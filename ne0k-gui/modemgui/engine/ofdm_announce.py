@@ -268,7 +268,8 @@ class AnnounceRound:
 
     def _clear(self, quiet_s: float = 0.8) -> bool:
         x = self._cap.get(self._cap.n - int(quiet_s * self.cfg.fs))
-        return time.monotonic() >= self._tx_until and (len(x) == 0 or float(np.sqrt(np.mean(x * x))) <= self._thr())
+        return time.monotonic() >= self._tx_until and (getattr(self.session, "ignore_busy", False) or len(x) == 0
+                                                        or float(np.sqrt(np.mean(x * x))) <= self._thr())
 
     # -- receive: driven by _rx below, or by the node's MeshReceiver (shared_rx) -----------------
 

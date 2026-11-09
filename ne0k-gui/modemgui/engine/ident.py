@@ -154,24 +154,38 @@ def decode_cw(pcm: np.ndarray, fs: int, tone_hz: float | None = None) -> str | N
     runs = np.diff(np.concatenate([[0], edges, [len(on)]]))
     state = bool(on[0])
     # a key-down shorter than any real CW element (50 wpm dot = 24 ms) is a click or the edge of the next burst's
-    # keyup tone; the dot length is the shortest key-down, so one such blip read every element as a dash ("T T T")
+    # keyup tone; taken for the dot, one such blip read every element as a dash ("T T T")
     min_mark = int(MIN_MARK_S * fs)
     marks = [r for i, r in enumerate(runs) if (i % 2 == 0) == state and r >= min_mark]
     if not marks:
         return None
-    dot = min(marks)
+    # The dot length from the short end of the marks, not the single shortest one: a SIP jitter-buffer
+    # insert (~1026 samples of silence) inside an element splits it into a mark and a 15-20 ms stub, and a
+    # stub taken for the dot read every element after it as a dash (5071: "T T T T T N T T ...").
+    q = float(np.percentile(marks, 25))
+    dot = float(np.median([m for m in marks if 0.5 * q <= m < 2 * q]))
+    # ...and bridge a gap far shorter than any element space (a dropout, not keying), so the split element
+    # reads as one again; what is left shorter than half a dot is a click
+    seq: list[list] = []                                  # [is_mark, length]
+    for r in runs:
+        if seq and not state and r < 0.4 * dot and seq[-1][0]:
+            seq[-1][1] += r                                # the gap joins the mark before it...
+        elif seq and state and seq[-1][0]:
+            seq[-1][1] += r                                # ...and so does the mark after it
+        else:
+            seq.append([state, r])
+        state = not state
     inv = {v: k for k, v in MORSE.items()}
     out, code = "", ""
-    for i, r in enumerate(runs):
-        if state and r < min_mark:
+    for is_mark, r in seq:
+        if is_mark and r < max(min_mark, 0.5 * dot):
             pass
-        elif state:
+        elif is_mark:
             code += "." if r < 2 * dot else "-"
         elif code and r >= 2 * dot:
             out += inv.get(code, "?"); code = ""
             if r >= 5 * dot:
                 out += " "
-        state = not state
     if code:
         out += inv.get(code, "?")
     return out.strip() or None
@@ -290,6 +304,12 @@ class Identifier:
                 self.log(f"ident {c.callsign.upper()} sent ({m}, with frame)")
             self._tx_end = max(self._tx_end, now) + len(out) / self._fs()
         return out
+
+    def rearm(self) -> None:
+        """The frame the last interval ID rode on was lost (no ACK): put the ID on the next frame.
+        Sent once per ``id_interval_s``, a collided ID would otherwise go unheard for that long."""
+        with self._lock:
+            self._last_id = None
 
     def send_now(self, reason: str = "manual") -> float:
         """Transmit the ID on its own.  Returns its airtime."""

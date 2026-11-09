@@ -42,6 +42,7 @@ class Session:
         self._lock = threading.Lock()
         self.ident = Identifier(self)       # ham-mode station ID; inert until HamConfig.enabled
         self.tx_hooks: list = []            # f(samples, rx_sample_index): called for every play()
+        self.ignore_busy = False            # GeneralConfig.ignore_busy: skip the energy checks before TX
 
     # -- events -------------------------------------------------------------
 

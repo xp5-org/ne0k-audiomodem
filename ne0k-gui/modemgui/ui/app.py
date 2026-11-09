@@ -32,6 +32,7 @@ def main(rx: str | None = None, tx: str | None = None, autosend: str | None = No
         w.io.select(rx, tx)
         try:
             w.session.open(rx, tx)
+            w._power_on()                # a scripted launch (tests, demos) is a powered-on modem
         except Exception as e:
             w.statusBar().showMessage(f"open failed: {e}")
     w.show()

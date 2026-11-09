@@ -214,3 +214,38 @@ def test_a_click_at_the_end_does_not_turn_the_id_into_dashes():
     blip = 0.3 * np.sin(2 * np.pi * 800.0 * np.arange(int(0.004 * fs)) / fs)
     x = np.concatenate([cw, np.zeros(int(0.3 * fs)), blip]).astype(np.float32)
     assert heard_ident(x, fs, tone_hz=800.0) == ("cw", "DE QKRE0")
+
+
+def _g711_leg(x: np.ndarray) -> np.ndarray:
+    """48 kHz -> 8 kHz mu-law -> 48 kHz, the SIP conference leg (band-limited, so the keying edges ring)."""
+    t = np.arange(191) - 95
+    h = np.sinc(2 * 3600.0 / FS * t) * np.hamming(191)
+    h /= h.sum()
+    y = np.convolve(x.astype(np.float64), h, "same")[::6]
+    c = np.round(np.sign(y) * np.log1p(255 * np.minimum(np.abs(y), 1)) / np.log1p(255) * 127) / 127
+    up = np.zeros(len(y) * 6)
+    up[::6] = np.sign(c) * (256 ** np.abs(c) - 1) / 255 * 6
+    return np.convolve(up, h, "same").astype(np.float32)
+
+
+@pytest.mark.parametrize("wpm", [12.0, 15.0, 20.0, 30.0])
+def test_heard_cw_id_reads_back(wpm):
+    from modemgui.engine.ident import heard_ident
+    pcm = _g711_leg(cw_audio(id_text("ktq4u"), FS, wpm, 800, 0.3))
+    assert heard_ident(pcm, FS, tone_hz=800.0) == ("cw", "DE KTQ4U")
+
+
+def test_heard_cw_id_survives_a_jitter_buffer_insert_inside_an_element():
+    # 5071: the conference's jitter buffer put ~1026 samples of silence into a dot of node A's ID; node C
+    # took the 15 ms stub after the gap for the dot length and read "T T T T T N T T ..."
+    from modemgui.engine.ident import heard_ident
+    rx = _g711_leg(cw_audio(id_text("ktq4u"), FS, 15, 800, 0.3))   # the insert lands after the leg
+    keyed = np.flatnonzero(np.abs(rx) > 0.01)
+    bad = []
+    # every 15 ms across the whole ID: inside dots and dashes, on their edges, inside spaces
+    for at in range(int(keyed[0]), int(keyed[-1]), 720):
+        for n in (1122,):
+            got = heard_ident(np.concatenate([rx[:at], np.zeros(n, np.float32), rx[at:]]), FS, tone_hz=800.0)
+            if got != ("cw", "DE KTQ4U"):
+                bad.append((at, n, got))
+    assert not bad, bad[:5]

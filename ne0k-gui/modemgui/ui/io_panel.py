@@ -18,6 +18,7 @@ METER_FLOOR_DB = -80
 
 class IoPanel(QWidget):
     message = Signal(str)
+    power_clicked = Signal()
     _test_done = Signal(str)            # worker thread -> GUI thread
 
     def __init__(self, session: Session, settings: QSettings | None = None, parent=None):
@@ -29,7 +30,11 @@ class IoPanel(QWidget):
             c.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             c.setMinimumContentsLength(24)
         self.refresh_btn = QPushButton("Refresh")
-        self.open_btn = QPushButton("Open")
+        self.open_btn = QPushButton("Open audio")
+        self.power_btn = QPushButton("Start modem")
+        self.power_btn.setEnabled(False)
+        self.power_btn.setToolTip("Power the modem on: it handshakes and trains with its peer right away. "
+                                  "Stop it to change modem settings.")
         self.test_btn = QPushButton("Test loopback")
         self.unavail = QLabel(); self.unavail.setWordWrap(True)
         self.unavail.setStyleSheet("color: gray")
@@ -45,7 +50,7 @@ class IoPanel(QWidget):
         dev.addRow("Input (RX)", self.rx)
         dev.addRow("Output (TX)", self.tx)
         row = QHBoxLayout()
-        for b in (self.refresh_btn, self.open_btn, self.test_btn):
+        for b in (self.refresh_btn, self.open_btn, self.power_btn, self.test_btn):
             row.addWidget(b)
         meters = QHBoxLayout()
         meters.addWidget(self.peak, 1); meters.addWidget(self.peak_lbl)
@@ -58,6 +63,7 @@ class IoPanel(QWidget):
         self.refresh_btn.clicked.connect(self.refresh)
         self.open_btn.clicked.connect(self.toggle_open)
         self.test_btn.clicked.connect(self.run_test)
+        self.power_btn.clicked.connect(self.power_clicked)
         self._test_done.connect(self._on_test_done)
         self.refresh()
 
@@ -151,7 +157,10 @@ class IoPanel(QWidget):
     # -- engine events ------------------------------------------------------
 
     def on_status(self, st: Status) -> None:
-        self.open_btn.setText("Close" if st.state == "open" else "Open")
+        self.open_btn.setText("Close audio" if st.state == "open" else "Open audio")
+        self.power_btn.setEnabled(st.state == "open")
+        if st.state != "open":
+            self.set_powered(False)
         for w in (self.rx, self.tx, self.refresh_btn, self.test_btn):
             w.setEnabled(st.state != "open")
         if st.state != "open":
@@ -159,6 +168,10 @@ class IoPanel(QWidget):
             self._tx_style(False)
         if st.state == "error":
             self.message.emit(f"audio error: {st.message}")
+
+    def set_powered(self, on: bool) -> None:
+        self.power_btn.setText("Stop modem" if on else "Start modem")
+        self.open_btn.setEnabled(not on)             # audio stays open while the modem runs
 
     def on_levels(self, lv: Levels) -> None:
         self.peak.setValue(int(max(METER_FLOOR_DB, lv.peak_db)))

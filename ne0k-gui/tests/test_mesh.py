@@ -54,7 +54,7 @@ def test_ofdm_only_never_beacons():
             s.open(f"mix:mo_bcn/{nid}", f"mix:mo_bcn/{nid}")
             n = MeshNode(s, MeshConfig(node_id=nid, phy_mode=mode, beacon=True,
                                         first_beacon_s=0.01, beacon_min_s=0.01, beacon_max_s=0.02,
-                                        cw_s=0.05, id_slot_s=0.01),
+                                        slot_s=0.01, id_slot_s=0.01),
                          CssConfig(), OfdmConfig())
             n.start(); made.append((n, s))
         n1, n2 = made[0][0], made[1][0]
@@ -99,7 +99,7 @@ def test_ofdm_only_mac_backstop():
     reg = Registry()
     s = Session(reg, 48000, 1024)
     s.open("mix:mo_bs/1", "mix:mo_bs/1")
-    n = MeshNode(s, MeshConfig(node_id=1, phy_mode="ofdm_only", cw_s=0.05, id_slot_s=0.01),
+    n = MeshNode(s, MeshConfig(node_id=1, phy_mode="ofdm_only", slot_s=0.01, id_slot_s=0.01),
                  CssConfig(), OfdmConfig())
     try:
         n.start()

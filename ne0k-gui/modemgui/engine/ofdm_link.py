@@ -495,6 +495,8 @@ class OfdmLink:
         return x
 
     def _air_busy(self, look_s: float = 0.4) -> bool:
+        if getattr(self.session, "ignore_busy", False):
+            return False                          # GeneralConfig.ignore_busy: microphone use, noise always present
         x = self._cap.get(self._cap.n - int(look_s * self.cfg.fs))
         return len(x) > 0 and float(np.sqrt(np.mean(x * x))) > self._thr()
 

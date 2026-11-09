@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -80,14 +81,32 @@ def _enc_cfg(c: CssConfig, raw: bytes, base: Path) -> dict:
     return dict(fs=c.fs, f_min=c.f_min, f_max=c.f_max, symbol_dur=c.symbol_dur,
                 amplitude=c.amplitude, symbol_gap_frac=c.symbol_gap_frac,
                 chunk_size=c.chunk_size, diff_encode=c.diff_encode, rs_t=c.rs_t,
+                crc_bytes=int(getattr(c, "crc_bytes", 4)),
                 conv_code=(None if c.conv_code in ('', 'none') else c.conv_code),
                 interleave_rows=c.interleave_rows, message_bytes=bytes(raw),
                 output=str(base) + ".wav", info_out=str(base) + "_i.json",
                 result_out=str(base) + "_e.json")
 
 
-def encode_packet(c: CssConfig, raw: bytes, tag: str = "tx") -> np.ndarray:
+SHORT_CHUNK = 2                    # a header-only css_modem packet (ACK, BEACON) is 2 bytes
+
+
+def short_cfg(c: CssConfig) -> CssConfig | None:
+    """The frame geometry header-only packets go out in (``CssConfig.short_frames``): a 2-byte chunk,
+    89 symbols instead of 137 at chunk_size 8 (73 vs 121 with the 2-byte CRC).  The receiver runs a
+    second decoder on it; a frame's CRC only passes in the decoder whose geometry it was sent in, so
+    no marker is needed."""
+    if not getattr(c, "short_frames", False) or c.chunk_size <= SHORT_CHUNK:
+        return None
+    return dataclasses.replace(c, chunk_size=SHORT_CHUNK)
+
+
+def encode_packet(c: CssConfig, raw: bytes, tag: str = "tx", short: bool | None = None) -> np.ndarray:
+    """``short``: None = the short geometry for a header-only packet when enabled, True/False = force."""
     enc, _, _ = _imports()
+    sc = short_cfg(c)
+    if sc is not None and (short if short is not None else len(raw) <= SHORT_CHUNK):
+        c = sc
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         enc.encode(_enc_cfg(c, raw, _work / tag))
@@ -121,11 +140,13 @@ def encode_text(c: CssConfig, text: str, seq: int = 0) -> np.ndarray:
     return encode_bytes(c, text.encode("utf-8"), seq)
 
 
-def _info(c: CssConfig, max_frames: int = 256) -> str:
-    """Frame-geometry info.json the decoder needs, from a throwaway encode."""
+def _info(c: CssConfig, max_frames: int = 256, short: bool = False) -> str:
+    """Frame-geometry info.json the decoder needs, from a throwaway encode (``short``: the header-only
+    frames' geometry, see short_cfg)."""
     _, cm, _ = _imports()
-    encode_packet(c, cm.pack_packet(0, 0, 0, 0), "dec")
-    p = _work / "dec_i.json"
+    tag = "dec_s" if short else "dec"
+    encode_packet(c, cm.pack_packet(0, 0, 0, 0), tag, short=short)
+    p = _work / f"{tag}_i.json"
     info = json.loads(p.read_text())
     info["frames"] = max_frames
     p.write_text(json.dumps(info))
@@ -159,6 +180,8 @@ def decode_samples(c: CssConfig, pcm: np.ndarray) -> list[Decoded]:
     ov = {"mf_longsym": True, "mf_longsym_min_dur": 0.0} if c.decoder == "mf" else None
     with _decode_lock, _no_signals():
         res = tl.decode_array(cap, c.fs, _info(c), ov)
+        if not res.get("frames") and short_cfg(c) is not None:      # a header-only packet's short frame
+            res = tl.decode_array(cap, c.fs, _info(c, short=True), ov)
     log = res.get("_log") or ""
     mf = "MF_SEGMENTS" in log or "MF_BACKEND=" in log
     last_codec.update(path="mf" if mf else "pll",
@@ -204,6 +227,7 @@ class CssLink:
         self.backend = ""                # set_backend's description, once applied
         self._codec_logged: dict = {}
         self.stream = None               # CssStreamRx when decoder == "pll_c"
+        self.stream_short = None         # its twin on the short header-only frame geometry
         self._tx_onsets: collections.deque = collections.deque()
         self._pipe_hooked = None
 
@@ -274,6 +298,13 @@ class CssLink:
             emit=self.session._emit,
             emit_link=lambda kind, peer, t0, t1, d: self.session._emit(LinkEvent(kind, me, peer, t0, t1, d)),
             decoded_cls=Decoded, unpack=cm.unpack_packet)
+        if short_cfg(self.cfg) is not None:
+            info_s = json.loads(Path(_info(self.cfg, short=True)).read_text())
+            self.stream_short = CssStreamRx(
+                self.cfg, info_s, node_id=me, hear_own=self.cfg.hear_own, log=self.log,
+                emit=self.session._emit,
+                emit_link=lambda kind, peer, t0, t1, d: self.session._emit(LinkEvent(kind, me, peer, t0, t1, d)),
+                decoded_cls=Decoded, unpack=cm.unpack_packet, track=False, quiet=True)
         pipe.tx_onset_hooks.append(self._on_tx_onset)
         self._pipe_hooked = pipe
         last_codec.update(path="pll_c", mf=None, dec="c")
@@ -341,6 +372,8 @@ class CssLink:
                 continue
             if st is not None:
                 st.feed(b.samples, b.tx_active)
+            if self.stream_short is not None:
+                self.stream_short.feed(b.samples, b.tx_active)
             if b.tx_active and not c.hear_own:
                 continue
             x = np.concatenate([rem, b.samples])
@@ -380,7 +413,11 @@ class CssLink:
                 LinkEvent("rx", me, -1, t0, t1, d)), tail_from=tail_from):
             if self.stream is not None:
                 self.stream.burst_end()
+            if self.stream_short is not None:
+                self.stream_short.burst_end()
             return
+        if self.stream_short is not None:
+            self.stream_short.burst_end()
         if self.stream is not None:
             # frames came off the streaming decoder as they arrived; the burst
             # boundary only finishes the packet and re-arms the decoder

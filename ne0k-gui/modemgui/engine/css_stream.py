@@ -34,13 +34,20 @@ import numpy as np
 class CssStreamRx:
     def __init__(self, cfg, info: dict, *, node_id: int, hear_own: bool,
                  log: Callable[[str], None], emit: Callable, emit_link: Callable,
-                 decoded_cls, unpack: Callable, f64: bool = False) -> None:
+                 decoded_cls, unpack: Callable, f64: bool = False,
+                 dec: dict | None = None, track: bool = True, quiet: bool = False) -> None:
+        """``dec``: decode() cfg overrides for the C decoder (tests switch single
+        decoder features off with it); None = the reference defaults.
+        ``track=False, quiet=True``: the second decoder CssLink runs on the short header-only
+        frame geometry -- no chirp tracker of its own (carrier sense and grids stay with the
+        main one), and it only speaks up for a packet: it syncs on every frame's preamble and
+        fails the CRC of every full-size one, which is expected, not news."""
         import css_pll_c
         self.cfg, self.node_id, self.hear_own = cfg, node_id, hear_own
         self.log, self.emit, self.emit_link = log, emit, emit_link
         self.Decoded, self.unpack = decoded_cls, unpack
         self.lock = threading.Lock()
-        dec = {"fs": cfg.fs}
+        dec = {"fs": cfg.fs, **(dec or {})}
         self.pll = css_pll_c.PllStream(dec, info, f64=f64, on_frame=self._on_frame,
                                        on_symbol=self._on_symbol, on_event=self._on_event)
         self.lib = self.pll.lib
@@ -51,23 +58,26 @@ class CssStreamRx:
         ex = self.pll.extras
         self.fs, self.sps, self.sps_eff = ex["fs"], ex["sps"], ex["sps_eff"]
         self.buf_size = 3 * self.sps
-        self.trk = css_pll_c.TrkStream(ex["fs"], ex["dur"], ex["f_min"], ex["f_max"],
+        self.quiet = quiet
+        self.trk = None if not track else css_pll_c.TrkStream(ex["fs"], ex["dur"], ex["f_min"], ex["f_max"],
                                        ex["gap_samps"] / ex["sps"] if ex["sps"] else 0.0,
                                        on_chirp=self._on_chirp, on_event=self._on_trk_event)
         self._pkt: list | None = None          # [bytearray, [frame dicts], last_seq]
+        self._pkt_t: float | None = None
         self._sync_score = 0.0
         self._sync_mono = None
         self.locked_peer = None
         self.counts = {"OWN": 0, "PEER": 0, "ECHO": 0, "UNKNOWN": 0}
         self._synced = False
-        self.log(f"css rx: C streaming PLL decoder (workspace {self.pll.workspace_bytes / 1e6:.0f} MB) "
+        self.log(f"css rx: C streaming PLL decoder{' (short frames)' if quiet else ''} (workspace {self.pll.workspace_bytes / 1e6:.0f} MB) "
                  f"+ chirp tracker, sps={self.sps} sps_eff={self.sps_eff}")
 
     # -- feeding -------------------------------------------------------------
     def feed(self, samples: np.ndarray, tx_active: bool) -> None:
         x = np.asarray(samples, np.float32)
         with self.lock:
-            self.trk.push(x)
+            if self.trk is not None:
+                self.trk.push(x)
             # The decoder hears the line continuously (its preamble score is
             # energy/coverage-gated and its ring sees late chirps, so noise,
             # silence and signal onset no longer false-lock it).  Only our own
@@ -80,12 +90,12 @@ class CssStreamRx:
         chirp schedule (directions read back off the waveform) with the tracker."""
         first, dirs = chirp_dirs(pcm, self.fs, self.cfg.f_min, self.cfg.f_max,
                                  self.cfg.symbol_dur, self.sps, self.sps_eff)
-        if dirs:
+        if dirs and self.trk is not None:
             with self.lock:
                 self.trk.tx(rx_index + first, dirs)
 
     def busy(self) -> bool:
-        return self.trk.busy
+        return self.trk is not None and self.trk.busy
 
     def burst_end(self) -> None:
         """The channel went quiet: finish the packet in progress and re-arm the decoder."""
@@ -95,12 +105,17 @@ class CssStreamRx:
 
     # -- decoder callbacks (called inside push, under self.lock) --------------
     def _on_symbol(self, s: dict) -> None:
-        if s["sync_found"]:
+        if s["sync_found"] and self.trk is not None:
             # where this symbol's chirp sits in the RX stream
             abs_peak = s["abs_start"] + s["nr"] - self.buf_size + s["found_peak"]
             self.trk.decoder_peak(abs_peak)
 
     def _on_event(self, e: dict) -> None:
+        if self.quiet:
+            if e["event"] == "SYNC_ACQUIRED":
+                self._sync_score = e["x"]
+                self._sync_mono = time.monotonic()
+            return
         if e["event"] in ("SYNC_TOO_EARLY", "SYNC_STALE_REJECT", "FRAME_ERROR", "RETRO_GATE"):
             self.log(f"css rx: {e['event']} sym={e['sym']} a={e['a']} b={e['b']} x={e['x']:.3f}")
         if e["event"] == "RESYNC":
@@ -116,19 +131,26 @@ class CssStreamRx:
             self.log(f"css rx: decoder resync ({'hard' if e['a'] else 'soft'})")
         elif e["event"] in ("RETRO_GATE", "RETRO_SYNC") and e["event"] == "RETRO_GATE":
             self.log("css rx: retro timing gate tripped, re-acquiring")
+        elif e["event"] == "PHASE_STEP":
+            # a=step (smp), b=1 confirmed / 0 candidate, x=snr there, y=snr in the window
+            self.log(f"css rx: PHASE_STEP {e['a']:+d} smp ({e['a'] / self.fs * 1e3:+.2f} ms) "
+                     f"{'confirmed, read stepped' if e['b'] else 'candidate'} "
+                     f"snr {e['y']:.1f} -> {e['x']:.1f} dB")
 
     def _on_frame(self, f: dict) -> None:
         seq = f["seq"]
         if seq == 0 or self._pkt is None or seq != self._pkt[2] + 1:
             if seq != 0:
                 if self._pkt is not None:
-                    self.log(f"css rx: chunk gap (got {seq} after {self._pkt[2]}) -- partial dropped")
+                    if not self.quiet:
+                        self.log(f"css rx: chunk gap (got {seq} after {self._pkt[2]}) -- partial dropped")
                 self._pkt = None
                 return
             self._finish()
             self._pkt = [bytearray(), [], -1]
         self._pkt[0] += f["data"]
         self._pkt[1].append(f)
+        self._pkt_t = time.time()             # wall clock at this frame's decode (TIME packets use the last one)
         self._pkt[2] = seq
 
     def _finish(self) -> None:
@@ -140,10 +162,11 @@ class CssStreamRx:
         try:
             pk = self.unpack(raw)
         except Exception:
-            self.log(f"css rx: {len(frames)} frame(s) did not form a packet ({raw[:6].hex()})")
+            if not self.quiet:
+                self.log(f"css rx: {len(frames)} frame(s) did not form a packet ({raw[:6].hex()})")
             return
         grid_sps, peer_db = None, None
-        if pk["src"] != self.node_id:
+        if pk["src"] != self.node_id and self.trk is not None:
             self.trk.decoder_frame(pk["src"])
             for g in self.trk.grids():
                 if g["label"] == "PEER" and g["peer"] == pk["src"]:
@@ -156,7 +179,7 @@ class CssStreamRx:
                          frames_errored=0, snr_db=snr,
                          rs_errors=sum(f["rs_errors"] for f in frames),
                          payload=pk["payload"], acq_s=None,
-                         sync_score=self._sync_score, grid_sps=grid_sps)
+                         sync_score=self._sync_score, grid_sps=grid_sps, t_last=self._pkt_t)
         self.log(f"css rx src={d.src} seq={d.seq} {d.type_name} frames={d.frames} snr={snr:.1f}dB "
                  f"{'grid %.2f smp/sym (%+.0f ppm)' % (grid_sps, (grid_sps / self.sps_eff - 1) * 1e6) if grid_sps else 'grid ?'}")
         now = time.monotonic()

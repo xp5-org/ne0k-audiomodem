@@ -50,9 +50,16 @@ def test_open_file_source_and_close(win, qtbot, tmp_path):
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(48000); w.writeframes(x.tobytes())
     win.session.open(f"file:{p}#repeat", None)
     qtbot.waitUntil(lambda: win.spectro._buf is not None, timeout=5000)
-    assert win.io.open_btn.text() == "Close"
+    assert win.io.open_btn.text() == "Close audio"
+    assert win.io.power_btn.isEnabled() and win.link is None      # opening audio does not power the modem
+    win.io.power_btn.click()
+    assert win.modem_on and win.link is not None and win.io.power_btn.text() == "Stop modem"
+    win._open_settings("mode")                                     # locked while on (no dialog opened)
+    win.io.power_btn.click()
+    assert not win.modem_on and win.link is None
     win.io.toggle_open()
-    qtbot.waitUntil(lambda: win.io.open_btn.text() == "Open", timeout=3000)
+    qtbot.waitUntil(lambda: win.io.open_btn.text() == "Open audio", timeout=3000)
+    assert not win.io.power_btn.isEnabled()
     assert win.spectro._buf is None
 
 
@@ -180,9 +187,9 @@ def test_modem_mode_lives_in_settings_and_front_panel_shows_it(win):
     assert dlg.tabs.tabText(dlg.tabs.currentIndex()) == "Modem Mode"
     g = dlg.pages["general"].w
     assert {"modem", "topology", "node_id", "peer_id", "beacon", "beacon_min_s", "beacon_max_s"} <= set(g)
-    _set(g["modem"], "ofdm"); _set(g["topology"], "mesh")
+    _set(g["modem"], "css_promote_ofdm"); _set(g["topology"], "mesh")
     dlg.apply(); win._show_mode()
-    assert win.app.general.modem == "ofdm" and "OFDM, mesh" in win.column.mode.text()
+    assert win.app.general.modem == "css_promote_ofdm" and "CSS_PROMOTE_OFDM, mesh" in win.column.mode.text()
     assert not win.column.io_type.model().item(1).isEnabled()      # GNURadio not available yet
 
 

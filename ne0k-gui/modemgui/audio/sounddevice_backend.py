@@ -53,11 +53,18 @@ class SdSource(Source):
         def cb(indata, frames, t, status):
             if status:
                 self.error = str(status)       # overflow etc.; non-fatal, pipe counts it
-            on_block(as_mono_f32(indata[:, 0]))
+                self.overflows = getattr(self, "overflows", 0) + 1
+            # copy: indata is PortAudio's buffer, reused for the next callback.  as_mono_f32 returns a single
+            # contiguous float32 channel as is, and the pipe queues blocks to its consumers -- without the copy the
+            # decoder read blocks already overwritten by later audio: macOS/Windows RX never decoded, 2026-11-09
+            on_block(as_mono_f32(indata[:, 0]).copy())
         try:
+            # latency="high": the device buffers enough to ride out the callback waiting for the GIL while the DSP
+            # threads run on a slow host such as the macOS mesh VM.  RX latency is irrelevant to a half-duplex modem; TX
+            # keeps its own setting.
             self._st = _sd.InputStream(device=self._dev, samplerate=self.spec.rate,
                                        blocksize=self.spec.block, channels=1,
-                                       dtype="float32", callback=cb)
+                                       dtype="float32", callback=cb, latency="high")
             self._st.start()
         except Exception as e:
             raise AudioError(f"cannot open input: {e}") from e
@@ -67,6 +74,7 @@ class SdSource(Source):
             self._st.abort()
             self._st.close()
             self._st = None
+            print(f"sd input closed: {getattr(self, 'overflows', 0)} overflow callbacks", flush=True)
 
 
 class SdSink(Sink):

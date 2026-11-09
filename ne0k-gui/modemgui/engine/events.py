@@ -72,6 +72,7 @@ class Decoded(Event):
     acq_s: float | None = None  # est. seconds from burst start to preamble lock
     sync_score: float = 0.0     # preamble correlation score at lock (0..1)
     grid_sps: float | None = None   # fitted samples per symbol: the sender's clock error vs ours
+    t_last: float | None = None     # time.time() when the packet's last frame decoded (streaming decoder only)
 
 
 @dataclasses.dataclass(frozen=True)

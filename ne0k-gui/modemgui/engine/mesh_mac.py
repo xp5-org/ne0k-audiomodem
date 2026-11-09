@@ -4,10 +4,25 @@
 airtime scheduling in ``meshmodem_node``.  Pure logic, no audio and no threads, so it is testable
 with a fake clock.
 
-* ``Csma``       outbox with per-entry ``ready_at`` (ID-staggered ACK hold), non-persistent CSMA/CA
-                 (a busy channel drops the countdown; on idle a fresh backoff
-                 ``U(0, cw_s) + (id % 16) * id_slot_s`` is drawn), tag de-duplication and
-                 ``drop(prefix)`` for packets a state change has made obsolete.
+* ``Csma``       outbox with per-entry ``ready_at`` (ID-staggered ACK hold), slotted CSMA/CA in the
+                 802.11 style: a backoff ``randrange(cw) * slot_s + (id % 16) * id_slot_s`` is drawn once
+                 per packet and counts down only after the channel has been idle for one slot (DIFS);
+                 a busy channel freezes it, it is not redrawn (redrawing starved a large window: with
+                 a 23 s frame every ~25 s a 40 s draw never ran out), binary exponential
+                 contention window (``no_ack`` doubles ``cw`` up to ``cw_max_slots``, ``acked`` resets it),
+                 tag de-duplication and ``drop(prefix)`` for packets a state change has made obsolete.
+                 An ACK skips the backoff and keys as soon as the channel is clear, while everything
+                 else waits at least one slot: like 802.11's SIFS < DIFS, a third node can never land
+                 on an ACK (only the addressed node ACKs a unicast frame, so ACKs do not contend).
+                 Release order: a queued ACK always goes first (and holds everything else while its
+                 id stagger runs), a beacon only when nothing else is queued (any frame re-chirps the
+                 peers), and while ``awaiting`` an ACK only ACKs may key up -- otherwise a node keys
+                 over the very answer it is waiting for.  After our own frame, ``tx_done`` holds the
+                 countdown for ``tx_tail_s``: listeners only see the channel go quiet that long after
+                 the frame ends, so without it the last sender's slot 0 lands mid-way into theirs.
+                 ``slot_s`` must exceed the carrier-sense latency (path delay + time for the chirp
+                 tracker to raise busy, ~1.4 s over the SIP conference): two nodes whose draws land
+                 closer than that cannot hear each other key up and collide for the whole frame.
 * ``Rechirp``    beacon cadence from the measured clock drift of the peers: chirp before the fastest
                  drifting peer's freewheeled symbol grid slides out of the re-acquisition window,
                  clamped to [min, max], next deadline jittered 0.7-1.0x so beacons do not phase-align.
@@ -26,13 +41,40 @@ STAGGER_MOD = 16
 
 
 class Csma:
-    def __init__(self, node_id: int, *, cw_s: float = 4.0, id_slot_s: float = 0.1,
-                 ack_stagger_s: float = 0.5, rng: random.Random | None = None) -> None:
-        self.id, self.cw_s, self.id_slot_s, self.ack_stagger_s = node_id, cw_s, id_slot_s, ack_stagger_s
-        self.rng = rng or random.Random(0xC0FFEE ^ node_id)
+    def __init__(self, node_id: int, *, slot_s: float = 2.5, cw_slots: int = 8, cw_max_slots: int = 16,
+                 id_slot_s: float = 0.1, ack_stagger_s: float = 0.5, tx_tail_s: float = 2.0,
+                 rng: random.Random | None = None) -> None:
+        self.id, self.slot_s, self.id_slot_s, self.ack_stagger_s = node_id, slot_s, id_slot_s, ack_stagger_s
+        self.cw_min = max(1, int(cw_slots))
+        self.cw_max = max(self.cw_min, int(cw_max_slots))
+        self.cw = self.cw_min
+        # unseeded: a fixed per-node seed replays the same draw sequence every run, so a pair of nodes
+        # that collide once tend to collide on the same retry again
+        self.rng = rng or random.Random()
         self.outbox: list[tuple[object, str, float]] = []          # (job, tag, ready_at)
         self._backoff: float | None = None
         self._last: float | None = None
+        self.tx_tail_s = tx_tail_s
+        self._tail_until = -1e18
+        self.awaiting = 0                     # ACK waits in progress (only ACKs may be released meanwhile)
+        self._idle_since: float | None = None
+
+    def tx_done(self, now: float, tail_s: float | None = None) -> None:
+        """Our own frame has just left the radio: start the backoff when the listeners do."""
+        # the pending countdown (if any) belongs to a packet still queued -- an ACK we just sent ahead
+        # of our own DATA must not restart it (it is frozen through the tail like any busy time)
+        self._tail_until = now + (self.tx_tail_s if tail_s is None else tail_s)
+
+    def no_ack(self) -> None:
+        """A sent packet went unanswered (most likely a collision): double the contention window."""
+        self.cw = min(self.cw_max, self.cw * 2)
+
+    def acked(self) -> None:
+        self.cw = self.cw_min
+
+    def max_backoff(self) -> float:
+        """Longest backoff the largest window can draw."""
+        return self.cw_max * self.slot_s + (STAGGER_MOD - 1) * self.id_slot_s
 
     def ack_delay(self) -> float:
         """Per-node ACK hold so two peers never answer at the same instant."""
@@ -60,24 +102,52 @@ class Csma:
         return any(t.startswith(prefix) for _, t, _ in self.outbox)
 
     def _draw(self) -> float:
-        return self.rng.uniform(0.0, self.cw_s) + (self.id % STAGGER_MOD) * self.id_slot_s
+        return self.rng.randrange(self.cw) * self.slot_s + (self.id % STAGGER_MOD) * self.id_slot_s
+
+    def _next(self, now: float) -> int | None:
+        """Index of the entry to contend for now, by priority, or None."""
+        acks = [k for k, (_, t, _) in enumerate(self.outbox) if t.startswith("ack:")]
+        if acks:
+            # an ACK is due: nothing else may take the channel ahead of it, even while it is held
+            return next((k for k in acks if self.outbox[k][2] <= now), None)
+        if self.awaiting:
+            return None
+        ready = [k for k, (_, t, ra) in enumerate(self.outbox) if ra <= now]
+        other = [k for k in ready if not self.outbox[k][1].startswith("beacon:")]
+        if other:
+            return other[0]
+        if ready and len(self.outbox) == len(ready) == 1:      # a lone beacon, nothing else queued
+            return ready[0]
+        return None
 
     def poll(self, now: float, channel_busy: bool):
         """The (job, tag) to transmit now, or None."""
-        dt = (now - self._last) if self._last is not None else 0.0
-        self._last = now
-        i = next((k for k, (_, _, ra) in enumerate(self.outbox) if ra <= now), None)
+        last, self._last = self._last, now
+        busy = channel_busy or now < self._tail_until
+        if busy:
+            self._idle_since = None
+        elif self._idle_since is None:
+            self._idle_since = now
+        i = self._next(now)
         if i is None:
-            self._backoff = None
+            # held (an ACK's id stagger, or awaiting an ACK): a queued packet keeps its countdown, frozen
+            # like busy time.  Resetting it here meant every ACK this node sent redrew its own DATA's
+            # backoff, so a node that ACKs a lot rarely won the channel (8fbd: node 1's DATA waited 3.5 min)
+            if not any(not t.startswith("ack:") for _, t, _ in self.outbox):
+                self._backoff = None
             return None
-        if channel_busy:             # non-persistent: nodes that waited on the same burst re-draw apart
-            self._backoff = None
+        if busy:                                     # frozen, not redrawn
             return None
+        if self.outbox[i][1].startswith("ack:"):     # no contention for an ACK: its id stagger was the hold
+            job, tag, _ = self.outbox.pop(i)
+            return job, tag
         if self._backoff is None:
             self._backoff = self._draw()
-            return None
-        self._backoff -= dt
-        if self._backoff <= 0.0:
+        difs_end = self._idle_since + self.slot_s    # everyone but an ACK first waits one idle slot
+        start = max(last if last is not None else now, difs_end)
+        if now > start:
+            self._backoff -= now - start
+        if now >= difs_end and self._backoff <= 0.0:
             self._backoff = None
             job, tag, _ = self.outbox.pop(i)
             return job, tag

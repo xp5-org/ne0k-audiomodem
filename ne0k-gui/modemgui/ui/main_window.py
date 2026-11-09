@@ -69,9 +69,11 @@ class MainWindow(QMainWindow):
         self.resize(1200, 760)
         self.settings = settings or QSettings("XP5-ORG", "modemgui")
         self.app = AppSettings(self.settings)
+        self.modem_on = False                 # powered on: Start modem pressed (audio open is separate)
         self.link: MeshNode | None = None     # css = control plane only, ofdm = CSS + on-demand OFDM links
         self.serial = None                    # engine.serialbridge.SerialBridge (POSIX only)
         self.udp = None                       # engine.udpbridge.UdpBridge (data stream over UDP)
+        self.bcast = None                     # engine.css_bcast.CssBcastPort (one-way CSS text + time code)
         self.session = session or Session()
         self.bridge = EngineBridge(self.session, parent=self)
         self.diag = Diagnostics(self.app.diag, header={"modemgui": __version__,
@@ -129,6 +131,7 @@ class MainWindow(QMainWindow):
             self.panes.append(d)
         self._reset_layout()
 
+        self.io.power_clicked.connect(self._toggle_power)
         self.bridge.status.connect(self.io.on_status)
         self.bridge.levels.connect(self.io.on_levels)
         self.bridge.levels.connect(self.strip.on_levels)
@@ -181,12 +184,14 @@ class MainWindow(QMainWindow):
     def _bridge_counts(self) -> None:
         """The UDP / serial data port moves bytes without the mesh link: count what it carried (the bcast link's
         aired / delivered payload for UDP) into Link Info, and show the carrier's payload rate as the link rate."""
-        br = self.udp or self.serial
+        br = self.udp or self.serial or self.bcast
         if br is None:
             self._br_seen = None
             return
         L = getattr(br, "link", None)
-        if self.udp:
+        if self.bcast:
+            sent, got = br.tx_count, br.rx_count
+        elif self.udp:
             sent, got = L.bcast_bytes if self.app.udp.role == "send" else 0, br.rx_count
         else:
             sent, got = br.tx_count, br.rx_count
@@ -214,6 +219,15 @@ class MainWindow(QMainWindow):
             else:
                 detail = (f"OFDM broadcast listener (from node {self.app.udp.sender_id}): chunks {L.bcast_chunks}, "
                           f"payload {L.bcast_bytes} B, lost {L.lost_frames}, bad {L.rx_errors}")
+        if self.bcast is not None:
+            b = self.bcast
+            if b.send_role:
+                detail = (f"CSS broadcast sender: packets {b.pkts} (text {b.data_pkts}, TIME {b.time_pkts}), "
+                          f"text sent {b.tx_count} B, queued {len(b._txq)} B")
+            else:
+                detail = (f"CSS broadcast listener (from node {self.app.cssbcast.sender_id}): PLL "
+                          f"{'locked' if b.pll_locked else 'searching'}; {b.time_line()}; packets {b.pkts}, "
+                          f"text {b.rx_count} B, lost {b.lost}")
         if m is not None:
             links = ", ".join(f"{k} {v}" for k, v in m.link_states().items()) or "none"
             near = ", ".join(f"{n} ({snr:.0f} dB)" for n, (snr, _) in sorted(m.neighbors.items())) or "none"
@@ -352,6 +366,9 @@ class MainWindow(QMainWindow):
     # -- settings ----------------------------------------------------------
 
     def _open_settings(self, page: str | None = None) -> None:
+        if self.modem_on and page not in ("ham", "diag"):
+            self.statusBar().showMessage("Stop the modem to change its settings (power it off and on again).")
+            return
         dlg = SettingsDialog(self.app, self, page if isinstance(page, str) else None, io=self.io)
         if dlg.exec():
             dlg.apply()
@@ -362,11 +379,47 @@ class MainWindow(QMainWindow):
     def _after_settings(self) -> None:
         self._apply_diag()
         self._show_mode()
+
+    # -- modem power -----------------------------------------------------------
+
+    def _toggle_power(self) -> None:
+        if self.modem_on:
+            self._power_off()
+        else:
+            self._power_on()
+
+    def _power_on(self) -> None:
+        if not self.session.is_open:
+            self.statusBar().showMessage("Open audio first.")
+            return
+        self.modem_on = True
+        self.io.set_powered(True)
+        self._show_mode()
+        self.diag.log("modem powered on")
+        self._restart_link()
+        if self.app.cssbcast.autostart and not (self.udp or self.serial or self.bcast):
+            self._start_bcast()
+        elif self.app.udp.autostart and not self.udp and not self.serial:
+            self._start_udp()
+        elif self.app.serial.autostart and not self.serial and not self.udp:
+            self._start_serial()
+        self.statusBar().showMessage("Modem on: linking with the peer.")
+
+    def _power_off(self) -> None:
+        self.modem_on = False
         if self.serial:
             self._stop_serial()
         if self.udp:
             self._stop_udp()
-        self._restart_link()
+        if self.bcast:
+            self._stop_bcast()
+        if self.link:
+            self.link.stop(); self.link = None
+            self.feed.set_link(None)
+        self.io.set_powered(False)
+        self._show_mode()
+        self.diag.log("modem powered off")
+        self.statusBar().showMessage("Modem off.")
 
     def _send_id_now(self) -> None:
         if not self.session.is_open:
@@ -379,6 +432,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"ID not sent: {e} (Settings > Ident Settings)")
 
     def _open_settings_file(self) -> None:
+        if self.modem_on:
+            self.statusBar().showMessage("Stop the modem to load settings.")
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Open settings", str(Path.home()), "Settings (*.json)")
         if not path:
             return
@@ -447,6 +503,10 @@ class MainWindow(QMainWindow):
             self._start_serial()
 
     def _start_serial(self) -> None:
+        if not self.modem_on:
+            self.serial_action.setChecked(False)
+            self.statusBar().showMessage("Start the modem first.")
+            return
         if not self.session.is_open:
             self.serial_action.setChecked(False)
             self.statusBar().showMessage("Open audio first.")
@@ -489,6 +549,9 @@ class MainWindow(QMainWindow):
     # -- UDP data port (the data-stream alternative to the serial port) -------
 
     def _start_udp(self) -> None:
+        if not self.modem_on:
+            self.statusBar().showMessage("Start the modem first.")
+            return
         from ..engine.udpbridge import UdpBridge
         if self.link:
             self.link.stop(); self.link = None
@@ -515,19 +578,53 @@ class MainWindow(QMainWindow):
             br.stop()
             self.statusBar().showMessage(f"UDP port closed (tx {br.tx_count} B, rx {br.rx_count} B).")
 
+    # -- CSS broadcast port (one-way text + time code on a pty) -----------------
+
+    def _start_bcast(self) -> None:
+        if not self.modem_on:
+            self.statusBar().showMessage("Start the modem first.")
+            return
+        from ..engine.css_bcast import CssBcastPort
+        if self.link:
+            self.link.stop(); self.link = None
+            self.feed.set_link(None)
+        try:
+            br = CssBcastPort(self.session, self.app.css, self.app.cssbcast,
+                              log=lambda m: (self.diag.log("bcast: " + m), _echo("bcast: " + m)))
+            what = br.start()
+        except Exception as e:
+            self.diag.log(f"bcast port failed: {type(e).__name__}: {e}")
+            self.statusBar().showMessage(f"CSS broadcast port: {e}")
+            self._restart_link()
+            return
+        self.bcast = br
+        self.statusBar().showMessage(f"CSS broadcast port open: {what} ({br.link_path}, TIME on {br.ctl_path})")
+        b = self.app.cssbcast
+        self.column.set_mode(f"CSS broadcast, node {self.app.css.node_id}, "
+                             + ("sender (tty in)" if b.role == "send" else f"listener of node {b.sender_id} (tty out)"))
+
+    def _stop_bcast(self) -> None:
+        br, self.bcast = self.bcast, None
+        if br:
+            self._show_mode()
+            br.stop()
+            self.statusBar().showMessage(f"CSS broadcast port closed (tx {br.tx_count} B, rx {br.rx_count} B).")
+
     # -- links -------------------------------------------------------------
 
     def _make_mesh(self) -> MeshNode:
         g = self.app.general
         phy = g.modem if g.modem in ("ofdm_only", "css_only") else \
-            ("css_then_ofdm" if g.modem == "ofdm" else "css_only")
+            ("css_then_ofdm" if g.modem in ("css_promote_ofdm", "ofdm") else "css_only")
         mc = MeshConfig(node_id=g.node_id, phy_mode=phy, beacon=g.topology == "mesh" and g.beacon,
                         beacon_min_s=g.beacon_min_s, beacon_max_s=g.beacon_max_s, first_beacon_s=g.first_beacon_s,
-                        cw_s=g.cw_s, ack_stagger_s=g.ack_stagger_s, ofdm_detect=g.ofdm_detect,
+                        slot_s=g.slot_s, cw_slots=g.cw_slots, cw_max_slots=g.cw_max_slots,
+                        ack_stagger_s=g.ack_stagger_s, ofdm_detect=g.ofdm_detect,
                         airtime_windows=g.airtime_windows, hs_window_s=g.hs_window_s, hs_slots=g.hs_slots,
                         hs_guard_s=g.hs_guard_s, announce_round=g.announce_round,
                         announce_bat_turn_s=g.announce_bat_turn_s, announce_cycle_s=g.announce_cycle_s,
-                        announce_bat_mode=g.announce_bat_mode)
+                        announce_bat_mode=g.announce_bat_mode,
+                        auto_link=g.auto_link and g.blockout_role == "off")   # blockout trials sequence their own links
         mesh = MeshNode(self.session, mc, self.app.css,
                         self.app.ofdm, log=lambda m: (self.diag.log("mesh: " + m), _echo("mesh: " + m)), own_events=False)
         mesh.on_data = self._mesh_rx
@@ -546,14 +643,17 @@ class MainWindow(QMainWindow):
         self.session._emit(OfdmData(len(data), data.decode("utf-8", "replace"), bytes(data)))
 
     def _mesh_event(self, ev) -> None:
+        if self.bcast is not None:
+            self.bcast.handle(ev)
         if self.link is not None:
             self.link.handle(ev)
 
     def _restart_link(self) -> None:
+        self.session.ignore_busy = bool(self.app.general.ignore_busy)   # read by every pre-TX silence check
         if self.link:
             self.link.stop(); self.link = None
             self.feed.set_link(None)
-        if not self.session.is_open or self.serial or self.udp:
+        if not self.modem_on or not self.session.is_open or self.serial or self.udp or self.bcast:
             return
         try:
             link = self._make_mesh()
@@ -655,19 +755,8 @@ class MainWindow(QMainWindow):
                           f"tx={self.io.describe(st.tx, SINK)} rate={self.session.spec.rate}")
             self.diag.log("settings: " + json.dumps(self.app.dump(), default=str))
             self.diag.attach(self.session)
-            self._restart_link()
-            if self.app.udp.autostart and not self.udp and not self.serial:
-                self._start_udp()
-            elif self.app.serial.autostart and not self.serial and not self.udp:
-                self._start_serial()
         elif st.state == "closed":
-            if self.serial:
-                self._stop_serial()
-            if self.udp:
-                self._stop_udp()
-            if self.link:
-                self.link.stop(); self.link = None
-                self.feed.set_link(None)
+            self._power_off()
             self.diag.log("audio closed")
             self.diag.detach()
         elif st.state == "error":

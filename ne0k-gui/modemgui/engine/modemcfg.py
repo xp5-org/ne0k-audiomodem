@@ -57,6 +57,13 @@ class CssConfig(_Config):
                                "Silence between chirps, as a fraction of the symbol.", 0.0, 0.5, step=0.01)
     amplitude: float = F(0.8, "TX amplitude", "Band and timing", "Peak level, 0..1.", 0.01, 1.0, step=0.05)
     chunk_size: int = F(8, "Payload bytes per frame", "Framing and FEC", "", 1, 255)
+    short_frames: bool = F(True, "Short header-only frames", "Framing and FEC",
+                           "Send ACKs and beacons (2-byte packets) as 2-byte frames, and listen for them: "
+                           "15.5 s instead of 23 s at 0.15 s symbols.  Every station must have it on.")
+    crc_bytes: int = F(2, "Frame check bytes", "Framing and FEC",
+                       "4 = CRC-32, 2 = CRC-16.  CRC-16 is 16 chirps (2.4 s at 0.15 s symbols) shorter "
+                       "per frame; the packet header still has to make sense on top.  Every station "
+                       "must use the same value.", 2, 4, step=2)
     diff_encode: bool = F(True, "Differential encoding", "Framing and FEC",
                           "Survives a constant phase offset.")
     rs_t: int = F(0, "Reed-Solomon t", "Framing and FEC", "Correctable bytes per frame, 0 = off.", 0, 32)
@@ -153,11 +160,20 @@ class OfdmConfig(_Config):
 
 @dataclasses.dataclass
 class GeneralConfig(_Config):
-    modem: str = F("css", "Modem", "Mode", "css = control plane only (robust, slow); ofdm = CSS control plane "
-                   "plus an OFDM link brought up per transfer, falling back to CSS data if OFDM fails; "
-                   "ofdm_only = same OFDM upgrade, but a failed transfer stays failed -- no silent CSS "
-                   "fallback (that state machine has its own regression, mesh_fallback_regress.py).",
-                   choices=["css", "ofdm", "ofdm_only"])
+    # settings saved before the mixed mode got its own name called it "ofdm"
+    _MODEM_ALIASES = {"ofdm": "css_promote_ofdm"}
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        if d.get("modem") in cls._MODEM_ALIASES:
+            d = {**d, "modem": cls._MODEM_ALIASES[d["modem"]]}
+        return super().from_dict(d)
+
+    modem: str = F("css", "Modem", "Mode", "css = CSS only: robust, slow.  css_promote_ofdm = mixed: a CSS "
+                   "control plane, beacons and CSS chirps on the air, with an OFDM link brought up per transfer and "
+                   "CSS data as the fallback if OFDM fails.  ofdm_only = OFDM only: no CSS at all, nothing chirps; "
+                   "beacons are OFDM frames.",
+                   choices=["css", "css_promote_ofdm", "ofdm_only"])
     topology: str = F("p2p", "Topology", "Mode", "p2p = one pair of stations; mesh = N stations that discover "
                       "each other with beacons.", choices=["p2p", "mesh"])
     node_id: int = F(1, "Node id", "Addressing", "This station's address, 0..15.", 0, 15)
@@ -165,8 +181,8 @@ class GeneralConfig(_Config):
                      "not configured: it is whoever answers.", 0, 15)
     mesh_dst: int = F(0, "Pinned mesh peer", "Addressing", "Mesh only: the virtual serial port always talks "
                       "to this station instead of whoever is heard strongest; 0 = auto (best neighbour).", 0, 15)
-    beacon: bool = F(True, "Send beacons", "Mesh beacons", "Mesh only: announce this node on the CSS "
-                     "control plane so the others can find it.")
+    beacon: bool = F(True, "Send beacons", "Mesh beacons", "Mesh only: announce this node so the others can find it -- a CSS "
+                     "beacon, or an OFDM beacon frame under ofdm_only.")
     beacon_min_s: float = F(20.0, "Beacon interval min (s)", "Mesh beacons",
                             "The beacon interval follows the measured clock drift of the other nodes "
                             "(faster drift, more often), kept between min and max.", 1.0, 3600.0)
@@ -174,8 +190,20 @@ class GeneralConfig(_Config):
     first_beacon_s: float = F(20.0, "Listen before first beacon (s)", "Mesh beacons",
                               "Stay silent and listen for up to this long (random, plus 1 s per node id) before "
                               "the first beacon, so nodes started together do not collide.", 0.0, 600.0)
-    cw_s: float = F(4.0, "Contention window (s)", "Mesh channel access",
-                    "CSMA/CA: before sending, wait a random time up to this, plus 0.1 s per node id.", 0.0, 60.0)
+    ignore_busy: bool = F(False, "Transmit without waiting for silence", "Transmit",
+                          "Skip the checks that wait for a quiet channel before keying up: mesh carrier sense, OFDM "
+                          "handshake turns and data frames, the announce round.  For a microphone and speaker, where "
+                          "room noise always reads as someone transmitting and the modem would never send.  Protocol "
+                          "holds stay: blockout windows, our own handshake in progress.  With it on, two stations can "
+                          "key over each other.")
+    slot_s: float = F(2.5, "Backoff slot (s)", "Mesh channel access",
+                      "CSMA/CA: before sending, wait a random whole number of these slots, plus 0.1 s per "
+                      "node id.  Must be longer than it takes to hear another node key up (path delay + "
+                      "carrier detect), or two nodes in neighbouring slots still collide.", 0.1, 30.0)
+    cw_slots: int = F(8, "Contention window (slots)", "Mesh channel access",
+                      "Initial number of backoff slots to pick from.", 1, 64)
+    cw_max_slots: int = F(16, "Max contention window (slots)", "Mesh channel access",
+                          "Each unanswered packet doubles the window, up to this; an ACK resets it.", 1, 256)
     ack_stagger_s: float = F(0.5, "ACK stagger per node id (s)", "Mesh channel access",
                              "A node holds its ACK by id x this, so two peers never answer at the same instant.",
                              0.0, 5.0)
@@ -184,6 +212,10 @@ class GeneralConfig(_Config):
     airtime_windows: bool = F(False, "Per-link handshake windows", "Mesh channel access",
                               "Give each link its own wall-clock window for handshakes so two never overlap.  "
                               "Needs both ends' clocks within a second or so.")
+    auto_link: bool = F(True, "Train the link at power-on", "Mesh channel access",
+                        "The modem handshakes (and BAT-trains) with its peer as soon as it is powered on, without "
+                        "waiting for data to send.  The initiator opens the link, the responder listens for it; "
+                        "Role is under OFDM settings.  Off = handshake only when something is sent.")
     announce_round: bool = F(False, "OFDM announce round", "Mesh channel access",
                              "ofdm_only: nodes announce in id order (listen, then speak after the highest lower id), "
                              "late/unheard nodes retry in a catch-up slot, then BAT training runs one initiator at a "
@@ -336,6 +368,31 @@ class UdpConfig(_Config):
                       "with no handshake on the air, so a listener can join at any time.")
     sender_id: int = F(1, "Sender node id", "Receive", "", 0, 15)
 
+
+
+@dataclasses.dataclass
+class CssBcastConfig(_Config):
+    """CSS broadcast port: a one-way text stream with a time code, on the virtual serial port (engine/css_bcast.py).
+    The sender airs what the host writes to its tty as broadcast DATA packets, with a TIME packet every
+    ``time_every`` packets; every listener writes the text to its own tty and keeps the broadcast's clock, which
+    the host reads with ``TIME`` on the control socket.  No ACKs, no handshake: a listener can join at any time.
+    Uses the CSS page's band, symbol and chunk settings.  Use this, the serial port or the UDP port, not two."""
+    autostart: bool = F(False, "Start with audio", "Port", "Open the broadcast port whenever audio is opened.")
+    role: str = F("receive", "Role", "Port", "send = tty in, CSS broadcast out.  receive = CSS in, tty out + clock.",
+                  choices=["send", "receive"])
+    link_path: str = F(str(Path.home() / "bcast0"), "Port path", "Port",
+                       "Symlink to the pty; the control socket (TIME, STATUS) is this path + '.ctl'.")
+    sender_id: int = F(1, "Sender node id", "Receive", "Only packets from this node are taken.", 0, 15)
+    text_bytes: int = F(5, "Text bytes per packet", "Send",
+                        "Each packet is the 2-byte header + a length byte + this much text, cut into CSS chunks.  Longer = less "
+                        "header and preamble overhead, but a lost frame loses the whole packet.", 1, 64)
+    time_every: int = F(3, "TIME every N packets", "Send", "1 = only TIME packets.", 1, 64)
+    gap_s: float = F(1.5, "Gap between packets (s)", "Send",
+                     "Silence after each packet; keep it above the CSS page's 'burst end after quiet' so the "
+                     "listeners' decoders re-arm for the next preamble.", 0.0, 30.0, step=0.1)
+    tx_latency_s: float = F(0.0, "TX latency (s)", "Send",
+                            "Played this much earlier so a TIME packet's last chirp leaves the sink on the second.", 0.0, 5.0,
+                            step=0.05)
 
 PRESETS = {
     "Fast (POC)":   CssConfig(),
