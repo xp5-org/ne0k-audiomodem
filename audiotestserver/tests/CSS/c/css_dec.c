@@ -13,7 +13,6 @@
 #define CONV_MASK ((1 << CONV_K) - 1)
 #define NSTATES   64
 
-#define CRC_BYTES 4
 
 /* Survivor bookkeeping is two bitmaps of NSTATES bits per step. */
 #define SURV_BYTES_PER_STEP  (NSTATES / 8)
@@ -231,18 +230,29 @@ int css_bits_to_bytes(const unsigned char *bits, int n, unsigned char *out)
 
 int css_check_crc(const unsigned char *raw, int nraw, int chunk_size, int *seq)
 {
+    return css_check_crc_n(raw, nraw, chunk_size, 4, seq);
+}
+
+int css_check_crc_n(const unsigned char *raw, int nraw, int chunk_size,
+                    int crc_bytes, int *seq)
+{
     unsigned long want, got;
+    const unsigned char *t;
     int need;
 
-    if (!raw || chunk_size < 0) return -1;
-    need = 1 + chunk_size + CRC_BYTES;
+    if (!raw || chunk_size < 0 || (crc_bytes != 4 && crc_bytes != 2)) return -1;
+    need = 1 + chunk_size + crc_bytes;
     if (nraw < need) return 0;
 
-    want = css_crc32(raw, 1 + chunk_size);
-    got  = ((unsigned long)raw[1 + chunk_size + 0] << 24)
-         | ((unsigned long)raw[1 + chunk_size + 1] << 16)
-         | ((unsigned long)raw[1 + chunk_size + 2] <<  8)
-         |  (unsigned long)raw[1 + chunk_size + 3];
+    t = raw + 1 + chunk_size;
+    if (crc_bytes == 2) {
+        want = (unsigned long)css_crc16(raw, 1 + chunk_size);
+        got  = ((unsigned long)t[0] << 8) | (unsigned long)t[1];
+    } else {
+        want = css_crc32(raw, 1 + chunk_size);
+        got  = ((unsigned long)t[0] << 24) | ((unsigned long)t[1] << 16)
+             | ((unsigned long)t[2] <<  8) |  (unsigned long)t[3];
+    }
     if (got != want) return 0;
     if (seq) *seq = (int)raw[0];
     return 1;

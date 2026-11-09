@@ -52,6 +52,11 @@ struct css_pll {
     double timing_frac, rate_est, wpk_ema; int have_wpk;
     int sync_found, frames_decoded, frames_errored, consec_errors;
     long sym_count, last_resync_sym; int last_resync_soft;
+    int quiet_run;
+    /* phase-step recovery */
+    double step_ref_snr; int step_ref_ok;
+    int step_cand, step_cand_d, step_cand_idx; double step_cand_conf;
+    int step_fix_pending, step_fix_idx; double step_fix_conf;
     int have_snap; double snap_tf; int snap_nr, snap_pe;
     int one_shot;
     int have_bg; double bg_amp_ema; double syndet_bg_ema;
@@ -98,8 +103,9 @@ static size_t blk(size_t *acc, size_t n) { size_t o = *acc; *acc += css_al8(n); 
 
 static int geometry(const css_pll_cfg *c, css_enc_cfg *g)
 {
-    if (css_enc_geometry(g, c->chunk_size, c->rs_t, c->conv_k7 ? 1 : 0,
-                         c->diff_enc ? 1 : 0, c->interleave_rows) != 0) return -1;
+    if (css_enc_geometry_crc(g, c->chunk_size, c->rs_t, c->conv_k7 ? 1 : 0,
+                             c->diff_enc ? 1 : 0, c->interleave_rows,
+                             c->crc_bytes ? c->crc_bytes : 4) != 0) return -1;
     if (g->base_bits != c->base_bits) return -1;
     return 0;
 }
@@ -257,6 +263,8 @@ int css_pll_init(css_pll **pp, void *mem, size_t memlen, const css_pll_cfg *c,
     p->sync_found = 0; p->frames_decoded = 0; p->frames_errored = 0; p->consec_errors = 0;
     p->sym_count = 0; p->timing_err = 0; p->n_read = c->sps_eff; p->acq_left = 0;
     p->last_resync_sym = 0; p->last_resync_soft = 0;
+    p->quiet_run = 0;
+    p->step_ref_ok = 0; p->step_cand = 0; p->step_fix_pending = 0;
     p->terr_n = 0; p->terr_head = 0; p->acqdev_n = 0; p->acqdev_head = 0;
     p->have_snap = 0; p->one_shot = 0;
     p->have_bg = 0; p->bg_amp_ema = 0.0; p->syndet_bg_ema = 0.0;
@@ -379,6 +387,7 @@ static void do_resync(css_pll *p, int reason, int reset_timing)
     fa_clear(p);
     p->have_snap = 0;
     p->one_shot = 0;
+    p->step_ref_ok = 0; p->step_cand = 0; p->step_fix_pending = 0;
     if (reset_timing) {
         p->peak_est = p->expected_peak;
         p->timing_frac = 0.0;
@@ -397,7 +406,8 @@ static int pipeline(css_pll *p, const unsigned char *bits, const double *conf,
                     int *seq, const unsigned char **data, int *rs_err, int *rs_fail)
 {
     const css_pll_cfg *c = &p->c;
-    int n = c->frame_symbols, i, nraw, ne = 0, need = 1 + c->chunk_size + 4, s = 0, ok;
+    int n = c->frame_symbols, i, nraw, ne = 0, crcb = c->crc_bytes ? c->crc_bytes : 4,
+        need = 1 + c->chunk_size + crcb, s = 0, ok;
     const unsigned char *raw;
     *seq = 0; *data = p->rawb; *rs_err = 0; *rs_fail = 0;
     for (i = 0; i < n; i++) p->fc32[i] = (float)conf[i];
@@ -415,7 +425,7 @@ static int pipeline(css_pll *p, const unsigned char *bits, const double *conf,
         else { *rs_err = errc; raw = p->rsout; nraw = got; }
     }
     if (nraw < need) { *data = raw; return 0; }
-    ok = css_check_crc(raw, nraw, c->chunk_size, &s) == 1;
+    ok = css_check_crc_n(raw, nraw, c->chunk_size, crcb, &s) == 1;
     *seq = ok ? s : raw[0];
     *data = raw + 1;
     return ok;
@@ -473,6 +483,18 @@ static double psum_sq(const css_real *a, long n)
     }
 }
 
+/* Pre-sync full-period search: a peak found more than half a period early is
+ * the same chirp phase as one that far late (not yet in the ring); steer the
+ * short way round. */
+static int presync_wrap(const css_pll *p, int e)
+{
+    int P = p->c.sps_eff;
+    if (p->sync_found || !p->c.presync_full_period) return e;
+    if (e < -(P / 2)) e += P;
+    else if (e > P / 2) e -= P;
+    return e;
+}
+
 int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
 {
     const css_pll_cfg *c = &p->c;
@@ -480,6 +502,7 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
     css_pll_sym S;
     int i, n_blanked = 0, whitened = 0, signal_present, abs_ok, tim_snr_ok;
     int clamped_err = 0, gate_q, outlier = 0, wpk_strong = 1;
+    int step_sym = 0;                      /* 1 = step candidate, 2 = confirmed */
     double abs_conf, pll_conf = 0.0, pll_r2 = 0.0, final_conf, rms, msq;
     long abs_start = p->abs_pos;
     float *raw = p->raw;
@@ -586,9 +609,64 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
     }
 
     /* §P: MF decision + IF slope */
-    css_corr_decide(p->corr, p->ring, c->buf_size, p->peak_est,
-                    (p->timing_settled && p->sync_found && p->acq_left == 0)
-                        ? c->post_acq_search_smp : -1, &mf);
+    if (!p->sync_found && c->presync_full_period) {
+        /* one whole symbol period ending at the ring end: every onset phase is
+         * visible, not just the +-search_range around peak_est */
+        int half = c->sps_eff / 2;
+        css_corr_decide(p->corr, p->ring, c->buf_size, c->buf_size - half, half, &mf);
+    } else {
+        css_corr_decide(p->corr, p->ring, c->buf_size, p->peak_est,
+                        (p->timing_settled && p->sync_found && p->acq_left == 0)
+                            ? c->post_acq_search_smp : -1, &mf);
+    }
+    /* §P2: phase-step recovery while synced.  Tracking (settled): the narrow
+     * window lost the chirp (snr drop) -> search +-search_range.  Acquisition:
+     * the +-search_range window already sees it, so a strong peak more than
+     * post_acq_search from expected is the candidate. */
+    if (c->step_recover && p->sync_found && signal_present) {
+        int cand = 0, have_w = 0, tracking = p->timing_settled && p->acq_left == 0;
+        css_corr_out w;
+        if (p->step_ref_ok) {
+            if (tracking && mf.snr_db < p->step_ref_snr - c->step_drop_db) {
+                css_corr_decide(p->corr, p->ring, c->buf_size, p->expected_peak, -1, &w);
+                have_w = 1;
+            } else if (!tracking
+                       && iabs(mf.found_peak - p->expected_peak) > c->post_acq_search_smp) {
+                w = mf;
+                have_w = 1;
+            }
+        }
+        if (have_w) {
+            int d = w.found_peak - p->expected_peak;
+            if (iabs(d) > c->post_acq_search_smp / 2 && fabs(w.conf) >= c->step_min_conf
+                    && w.snr_db >= p->step_ref_snr - c->step_accept_db) {
+                if (p->step_cand && iabs(d - p->step_cand_d) <= c->step_tol_smp) {
+                    ev(p, CSS_EV_PHASE_STEP, d, 1, w.snr_db, mf.snr_db);
+                    mf = w;
+                    step_sym = 2;
+                    p->one_shot = d;
+                    p->peak_est = p->expected_peak;
+                    terr_clear(p);
+                    acqdev_clear(p);
+                    p->step_fix_pending = 1;
+                    p->step_fix_idx = p->step_cand_idx;
+                    p->step_fix_conf = p->step_cand_conf;
+                } else {
+                    ev(p, CSS_EV_PHASE_STEP, d, 0, w.snr_db, mf.snr_db);
+                    cand = 1;
+                    step_sym = 1;
+                    p->step_cand_d = d;
+                    p->step_cand_conf = w.conf;
+                }
+            }
+        }
+        p->step_cand = cand;
+        if (!step_sym) {
+            if (!p->step_ref_ok) { p->step_ref_snr = mf.snr_db; p->step_ref_ok = 1; }
+            else if (mf.snr_db >= p->step_ref_snr - c->step_drop_db)
+                p->step_ref_snr += 0.1 * (mf.snr_db - p->step_ref_snr);
+        }
+    }
     abs_conf = fabs(mf.conf);
     if (c->pll_weight > 0 && signal_present) {
         int s0 = mf.found_peak - c->sps + 1, s1 = mf.found_peak + 1;
@@ -602,9 +680,9 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
     /* §Q: measurement, acquisition peak_est IIR */
     tim_snr_ok = mf.snr_db >= c->timing_min_snr_db;
     abs_ok = abs_conf >= c->min_tim_conf;
-    gate_q = signal_present && abs_ok && tim_snr_ok;
+    gate_q = signal_present && abs_ok && tim_snr_ok && !step_sym;
     if (gate_q) {
-        int raw_err = mf.found_peak - p->expected_peak;
+        int raw_err = presync_wrap(p, mf.found_peak - p->expected_peak);
         int eff = p->timing_settled ? c->max_terr_smp : c->presync_max_terr_smp;
         clamped_err = raw_err < -eff ? -eff : (raw_err > eff ? eff : raw_err);
         if (p->sync_found && (!p->timing_settled || p->acq_left > 0))
@@ -612,7 +690,7 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
                                           + c->tim_track_alpha * (p->expected_peak + clamped_err));
         p->timing_err = clamped_err;
     } else {
-        p->timing_err = mf.found_peak - p->expected_peak;
+        p->timing_err = step_sym ? 0 : presync_wrap(p, mf.found_peak - p->expected_peak);
     }
 
     snr_push(p, mf.snr_db);
@@ -716,6 +794,14 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
     S.signal_present = signal_present; S.n_blanked = n_blanked; S.whitened = whitened;
     if (p->cb.on_symbol) p->cb.on_symbol(p->cb.user, &S);
 
+    /* transmission onset anchors the early-sync guard (decode() onset guard) */
+    if (!p->sync_found && c->onset_guard_silence_syms > 0 && signal_present
+            && p->quiet_run >= c->onset_guard_silence_syms) {
+        p->last_resync_sym = p->sym_count - 2;
+        p->last_resync_soft = 0;
+    }
+    p->quiet_run = signal_present ? 0 : p->quiet_run + 1;
+
     /* §X: preamble detection */
     if (!p->sync_found) {
         double snr_w, score, eff_thr, alt;
@@ -772,6 +858,7 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
         if (acquired) {
             int lag = css_syncdet_best_lag(p->sd);
             p->sync_found = 1;
+            p->step_ref_ok = 0; p->step_cand = 0; p->step_fix_pending = 0;
             p->acq_left = c->timing_acq_symbols;
             p->timing_settled = 0;
             if (iabs(p->timing_err) > c->post_acq_search_smp) {
@@ -802,10 +889,20 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
     }
 
     /* §Y: frame assembly */
+    if (p->step_fix_pending) {
+        /* confirmed step: the candidate symbol is re-decided where its chirp was */
+        if (p->step_fix_idx >= 0 && p->step_fix_idx < p->bs_n) {
+            p->bs_b[p->step_fix_idx] = p->step_fix_conf > 0 ? 1 : 0;
+            p->bs_c[p->step_fix_idx] = p->step_fix_conf;
+        }
+        p->step_fix_pending = 0;
+    }
     p->bs_b[p->bs_n] = final_conf > 0 ? 1 : 0;
     p->bs_c[p->bs_n] = final_conf;
     p->bs_n++;
+    if (step_sym == 1) p->step_cand_idx = p->bs_n - 1;
     if (p->bs_n >= c->frame_symbols) {
+        p->step_cand = 0;
         int fs = c->frame_symbols, k, used_retro = 0, ok, seq, rse, rsf;
         const unsigned char *dat;
         double frame_snr;

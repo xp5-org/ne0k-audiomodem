@@ -52,7 +52,8 @@ class CssEncCfg(ctypes.Structure):
                 ("diff_enc", ctypes.c_int),
                 ("interleave_rows", ctypes.c_int),
                 ("conv_bits", ctypes.c_int),
-                ("frame_symbols", ctypes.c_int)]
+                ("frame_symbols", ctypes.c_int),
+                ("crc_bytes", ctypes.c_int)]
 
     def as_dict(self):
         return {f: getattr(self, f) for f, _ in self._fields_}
@@ -64,8 +65,12 @@ _U8P = ctypes.POINTER(ctypes.c_ubyte)
 def _bind(lib):
     lib.css_enc_geometry.restype = ctypes.c_int
     lib.css_enc_geometry.argtypes = [ctypes.POINTER(CssEncCfg)] + [ctypes.c_int] * 5
+    lib.css_enc_geometry_crc.restype = ctypes.c_int
+    lib.css_enc_geometry_crc.argtypes = [ctypes.POINTER(CssEncCfg)] + [ctypes.c_int] * 6
     lib.css_crc32.restype = ctypes.c_ulong
     lib.css_crc32.argtypes = [_U8P, ctypes.c_int]
+    lib.css_crc16.restype = ctypes.c_uint
+    lib.css_crc16.argtypes = [_U8P, ctypes.c_int]
     lib.css_enc_inner.restype = ctypes.c_int
     lib.css_enc_inner.argtypes = [ctypes.POINTER(CssEncCfg), ctypes.c_int,
                                   _U8P, _U8P]
@@ -130,12 +135,12 @@ def _u8(arr) -> ctypes.Array:
 
 
 def geometry(chunk_size, rs_t, conv_code, diff_enc, interleave_rows,
-             f64=False) -> CssEncCfg:
+             f64=False, crc_bytes=4) -> CssEncCfg:
     lib = require(f64)
     g = CssEncCfg()
-    rc = lib.css_enc_geometry(ctypes.byref(g), chunk_size, rs_t,
-                              1 if conv_code == "k7r12" else 0,
-                              1 if diff_enc else 0, interleave_rows)
+    rc = lib.css_enc_geometry_crc(ctypes.byref(g), chunk_size, rs_t,
+                                  1 if conv_code == "k7r12" else 0,
+                                  1 if diff_enc else 0, interleave_rows, int(crc_bytes))
     if rc != 0:
         raise ValueError(f"css_enc_geometry rc={rc}")
     return g
@@ -147,10 +152,16 @@ def crc32(data: bytes, f64=False) -> int:
     return int(lib.css_crc32(src, len(data))) & 0xFFFFFFFF
 
 
+def crc16(data: bytes, f64=False) -> int:
+    lib = require(f64)
+    src = _u8(data)
+    return int(lib.css_crc16(src, len(data))) & 0xFFFF
+
+
 def enc_inner(g: CssEncCfg, seq: int, data: bytes, f64=False) -> bytes:
     lib = require(f64)
     src = _u8(data)
-    out = (ctypes.c_ubyte * (1 + g.chunk_size + 4))()
+    out = (ctypes.c_ubyte * (1 + g.chunk_size + 4))()     # room for either check
     n = lib.css_enc_inner(ctypes.byref(g), seq, src, out)
     if n < 0:
         raise ValueError(f"css_enc_inner rc={n}")
@@ -247,6 +258,9 @@ def _bind_dec(lib):
     lib.css_check_crc.restype = ctypes.c_int
     lib.css_check_crc.argtypes = [_U8P, ctypes.c_int, ctypes.c_int,
                                   ctypes.POINTER(ctypes.c_int)]
+    lib.css_check_crc_n.restype = ctypes.c_int
+    lib.css_check_crc_n.argtypes = [_U8P, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.POINTER(ctypes.c_int)]
     lib.css_dec_workspace.restype = ctypes.c_size_t
     lib.css_dec_workspace.argtypes = [ctypes.POINTER(CssEncCfg)]
     lib.css_dec_raw.restype = ctypes.c_int
@@ -314,12 +328,12 @@ def bits_to_bytes(bits, f64=False) -> bytes:
     return bytes(out[:n])
 
 
-def check_crc(raw: bytes, chunk_size: int, f64=False):
+def check_crc(raw: bytes, chunk_size: int, f64=False, crc_bytes=4):
     """(ok, seq, data) — the same triple css_fec.check_crc returns."""
     lib = _bind_dec(require(f64))
     src = _u8(raw)
     seq = ctypes.c_int(-1)
-    rc = lib.css_check_crc(src, len(raw), chunk_size, ctypes.byref(seq))
+    rc = lib.css_check_crc_n(src, len(raw), chunk_size, int(crc_bytes), ctypes.byref(seq))
     if rc < 0:
         raise ValueError(f"css_check_crc rc={rc}")
     if rc != 1:

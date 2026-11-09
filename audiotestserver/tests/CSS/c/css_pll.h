@@ -88,6 +88,24 @@ typedef struct {
     double impulse_silence_floor;
     int    whiten_stft_win_max;     /* samples; 0 = no cap                    */
     int    ring_lookahead;          /* resolved; chirp end = buf_size-1-this (<= gap: old layout) */
+    /* pre-sync MF search over one whole symbol period [buf_size-sps_eff, buf_size)
+     * instead of +-search_range, timing error wrapped to +-sps_eff/2
+     * (decode() presync_full_period) */
+    int    presync_full_period;
+    /* first signal symbol after this many silent ones (pre-sync) anchors the
+     * early-sync guard like css_pll_mark_onset(); 0 = off
+     * (decode() onset_guard_silence_syms) */
+    int    onset_guard_silence_syms;
+    /* phase-step recovery while synced (decode() step_recover): settled, the
+     * narrow MF snr dropping step_drop_db under the frame's running snr triggers
+     * a +-search_range search; in acquisition a peak beyond post_acq_search is
+     * the candidate.  A strong chirp more than post_acq_search/2 away that the
+     * next symbol confirms within step_tol_smp is a timing slip (jitter-buffer
+     * insert/drop): step the read by it, decide both symbols there */
+    int    step_recover;
+    double step_drop_db, step_accept_db, step_min_conf;
+    int    step_tol_smp;
+    int    crc_bytes;               /* frame check: 4 = CRC-32, 2 = CRC-16; 0 reads as 4 */
 } css_pll_cfg;
 
 /* One record per symbol, emitted where the reference has finished the timing
@@ -130,7 +148,8 @@ enum {
     CSS_EV_PLL_OUTLIER,         /* a=terr b=median                            */
     CSS_EV_SYNC_SNAP,           /* a=old peak_est b=new                       */
     CSS_EV_IMPULSE_BLANK,       /* a=n b=skipped(0/1) x=thr                   */
-    CSS_EV_NR_CLAMP             /* a=wanted b=nr_max                          */
+    CSS_EV_NR_CLAMP,            /* a=wanted b=nr_max                          */
+    CSS_EV_PHASE_STEP           /* a=step smp b=1 confirmed/0 candidate x=wide snr y=narrow snr */
 };
 enum {   /* CSS_EV_RESYNC reason codes */
     CSS_RS_PPF_RS = 1, CSS_RS_RS_FAIL, CSS_RS_PPF_OK, CSS_RS_PPF_CRC, CSS_RS_CRC_FAIL,

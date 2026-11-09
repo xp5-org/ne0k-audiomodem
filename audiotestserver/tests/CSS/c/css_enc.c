@@ -17,7 +17,6 @@
 #define CONV_TAIL (CONV_K - 1)
 #define CONV_MASK ((1 << CONV_K) - 1)
 
-#define CRC_BYTES 4
 
 /* Population-count parity of a value that never exceeds 7 bits here. */
 static int parity(unsigned int v)
@@ -34,14 +33,24 @@ static int parity(unsigned int v)
 int css_enc_geometry(css_enc_cfg *g, int chunk_size, int rs_t,
                      int conv_code, int diff_enc, int interleave_rows)
 {
+    return css_enc_geometry_crc(g, chunk_size, rs_t, conv_code, diff_enc,
+                                interleave_rows, 4);
+}
+
+int css_enc_geometry_crc(css_enc_cfg *g, int chunk_size, int rs_t,
+                         int conv_code, int diff_enc, int interleave_rows,
+                         int crc_bytes)
+{
     int cols;
 
     if (!g || chunk_size < 1 || rs_t < 0 || interleave_rows < 0) return -1;
     if (conv_code != 0 && conv_code != 1) return -1;
+    if (crc_bytes != 4 && crc_bytes != 2) return -1;
 
     g->chunk_size      = chunk_size;
+    g->crc_bytes       = crc_bytes;
     g->rs_parity       = rs_t * 2;
-    g->base_bits       = (1 + chunk_size + CRC_BYTES + g->rs_parity) * 8;
+    g->base_bits       = (1 + chunk_size + crc_bytes + g->rs_parity) * 8;
     g->conv_code       = conv_code;
     g->diff_enc        = diff_enc ? 1 : 0;
     g->interleave_rows = (interleave_rows > 1) ? interleave_rows : 0;
@@ -80,6 +89,22 @@ unsigned long css_crc32(const unsigned char *buf, int n)
     return (crc ^ 0xFFFFFFFFuL) & 0xFFFFFFFFuL;
 }
 
+unsigned int css_crc16(const unsigned char *buf, int n)
+{
+    unsigned int crc;
+    int i, k;
+
+    if (!buf || n < 0) return 0u;
+    crc = 0xFFFFu;
+    for (i = 0; i < n; i++) {
+        crc ^= (unsigned int)buf[i] << 8;
+        for (k = 0; k < 8; k++)
+            crc = (crc & 0x8000u) ? ((crc << 1) ^ 0x1021u) & 0xFFFFu
+                                  : (crc << 1) & 0xFFFFu;
+    }
+    return crc;
+}
+
 int css_enc_inner(const css_enc_cfg *g, int seq, const unsigned char *data,
                   unsigned char *out)
 {
@@ -92,13 +117,19 @@ int css_enc_inner(const css_enc_cfg *g, int seq, const unsigned char *data,
     for (i = 0; i < g->chunk_size; i++) out[1 + i] = data[i];
     n = 1 + g->chunk_size;
 
-    /* Big-endian on the wire, matching crc.to_bytes(4, "big"). */
+    /* Big-endian on the wire, matching crc.to_bytes(crc_bytes, "big"). */
+    if (g->crc_bytes == 2) {
+        crc = (unsigned long)css_crc16(out, n);
+        out[n + 0] = (unsigned char)((crc >> 8) & 0xFFuL);
+        out[n + 1] = (unsigned char)( crc       & 0xFFuL);
+        return n + 2;
+    }
     crc = css_crc32(out, n);
     out[n + 0] = (unsigned char)((crc >> 24) & 0xFFuL);
     out[n + 1] = (unsigned char)((crc >> 16) & 0xFFuL);
     out[n + 2] = (unsigned char)((crc >>  8) & 0xFFuL);
     out[n + 3] = (unsigned char)( crc        & 0xFFuL);
-    return n + CRC_BYTES;
+    return n + 4;
 }
 
 int css_bytes_to_bits(const unsigned char *bytes, int n, unsigned char *bits)

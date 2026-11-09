@@ -14,7 +14,7 @@
  *
  * Reed-Solomon is not linked here. The chain is
  *
- *     css_enc_inner()  ->  seq | data | crc32
+ *     css_enc_inner()  ->  seq | data | crc (CRC-32, or CRC-16 when crc_bytes=2)
  *     [ rs255_encode() ]   optional, caller's call
  *     css_enc_bits()   ->  bits -> diff -> conv -> interleave
  *
@@ -64,12 +64,15 @@ typedef float  css_phase;
 typedef struct {
     int chunk_size;         /* payload bytes per frame                      */
     int rs_parity;          /* rs_t * 2, or 0                               */
-    int base_bits;          /* (1 + chunk_size + 4 + rs_parity) * 8         */
+    int base_bits;          /* (1 + chunk_size + crc_bytes + rs_parity) * 8 */
     int conv_code;          /* 1 = k7r12 (rate 1/2, K=7), 0 = none          */
     int diff_enc;           /* 1 = differential encode before conv          */
     int interleave_rows;    /* 0 or 1 = disabled, else the block height     */
     int conv_bits;          /* base_bits, or (base_bits + 6) * 2            */
     int frame_symbols;      /* conv_bits, padded up to a whole block        */
+    int crc_bytes;          /* 4 = CRC-32, 2 = CRC-16/CCITT-FALSE.  Last, so a
+                               caller built against the old struct still reads
+                               every field above at the same offset.          */
 } css_enc_cfg;
 
 /* Fills `g` from the four config knobs.  chunk_size >= 1, rs_t >= 0,
@@ -79,6 +82,13 @@ typedef struct {
 int css_enc_geometry(css_enc_cfg *g, int chunk_size, int rs_t,
                      int conv_code, int diff_enc, int interleave_rows);
 
+/* css_enc_geometry with the frame check chosen: crc_bytes 4 (CRC-32, what
+ * css_enc_geometry gives) or 2 (CRC-16).  The short check saves 16 chirps a
+ * frame, 2.4 s at 0.15 s symbols, which is a sixth of a header-only frame. */
+int css_enc_geometry_crc(css_enc_cfg *g, int chunk_size, int rs_t,
+                         int conv_code, int diff_enc, int interleave_rows,
+                         int crc_bytes);
+
 /* CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320, init/final 0xFFFFFFFF),
  * byte-identical to zlib.crc32, which the Python encoder uses.
  *
@@ -87,8 +97,13 @@ int css_enc_geometry(css_enc_cfg *g, int chunk_size, int rs_t,
  * bytes once per frame, where eight shifts a byte is unmeasurable. */
 unsigned long css_crc32(const unsigned char *buf, int n);
 
-/* seq | data[chunk_size] | crc32(seq|data), MSB-first, into `out`.
- * `out` needs 1 + chunk_size + 4 bytes. Returns bytes written, or -1.
+/* CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no final xor),
+ * byte-identical to Python's binascii.crc_hqx(buf, 0xFFFF).  Bitwise for the
+ * same reason as css_crc32. */
+unsigned int css_crc16(const unsigned char *buf, int n);
+
+/* seq | data[chunk_size] | crc(seq|data), MSB-first, into `out`.
+ * `out` needs 1 + chunk_size + g->crc_bytes bytes. Returns bytes written, or -1.
  * `data` shorter than chunk_size must be zero-padded by the caller first, as
  * the Python encoder pads its final short chunk: a frame with fewer chirps
  * than frame_symbols shifts the decoder's CRC window and fails every time. */

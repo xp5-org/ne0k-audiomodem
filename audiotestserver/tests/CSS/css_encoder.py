@@ -268,8 +268,13 @@ def get_bits(byte_val):
     return [(byte_val >> i) & 1 for i in range(7, -1, -1)]
 
 
-def frame_crc(seq, data):
+def frame_crc(seq, data, crc_bytes=CRC_BYTES):
+    """CRC-32 (crc_bytes=4) or CRC-16/CCITT-FALSE (crc_bytes=2) over seq|data, big-endian;
+    the same check css_fec.frame_check makes on receive."""
     payload = bytes([seq]) + data
+    if crc_bytes == 2:
+        import binascii
+        return binascii.crc_hqx(payload, 0xFFFF).to_bytes(2, "big")
     crc = zlib.crc32(payload) & 0xFFFFFFFF
     return crc.to_bytes(4, "big")
 
@@ -290,6 +295,11 @@ def encode(cfg):
     info_path       = Path( cfg.get("info_out",        "css_info.json"))
     result_path     = Path( cfg.get("result_out",      "css_encode_result.json"))
     rs_t            = int(  cfg.get("rs_t",            0))
+    # Frame check: 4 = CRC-32 (default), 2 = CRC-16.  Written into info.json, which every
+    # decoder reads its geometry from, so the receiver follows whatever was sent.
+    crc_bytes       = int(  cfg.get("crc_bytes",       CRC_BYTES))
+    if crc_bytes not in (4, 2):
+        raise ValueError(f"crc_bytes={crc_bytes} (must be 4 or 2)")
     interleave_rows = int(  cfg.get("interleave_rows", 0))
     diff_enc        = bool( cfg.get("diff_encode",     False))
     conv_code       = cfg.get("conv_code", None)
@@ -376,7 +386,7 @@ def encode(cfg):
     rs_parity_bytes = rs_t * 2
 
     # Overhead bits that appear in every frame regardless of chunk_size
-    overhead_bits = (1 + CRC_BYTES + rs_parity_bytes) * 8
+    overhead_bits = (1 + crc_bytes + rs_parity_bytes) * 8
 
     # conv rate denominator: 2 for k7r12 (rate 1/2), 1 for none
     conv_rate = 2 if conv_code == "k7r12" else 1
@@ -397,7 +407,7 @@ def encode(cfg):
     else:
         chunk_size = min(12, max_cs)
 
-    base_bits = (1 + chunk_size + CRC_BYTES + rs_parity_bytes) * 8
+    base_bits = (1 + chunk_size + crc_bytes + rs_parity_bytes) * 8
 
     if conv_code == "k7r12":
         conv_bits = (base_bits + _CONV_TAIL) * 2
@@ -412,7 +422,7 @@ def encode(cfg):
         frame_symbols   = conv_bits
 
     frame_dur = frame_symbols * symbol_dur
-    print(f"symbol_dur={symbol_dur}s  chunk_size={chunk_size}  crc=4B  "
+    print(f"symbol_dur={symbol_dur}s  chunk_size={chunk_size}  crc={crc_bytes}B  "
           f"rs_t={rs_t} (parity={rs_parity_bytes}B)  "
           f"interleave_rows={interleave_rows}  "
           f"training_symbols={training_symbols}  "
@@ -441,7 +451,8 @@ def encode(cfg):
             import css_enc_c
             css_enc_c.require()
             enc_c = css_enc_c
-            enc_g = css_enc_c.geometry(chunk_size, rs_t, conv_code, diff_enc, interleave_rows)
+            enc_g = css_enc_c.geometry(chunk_size, rs_t, conv_code, diff_enc, interleave_rows,
+                                       crc_bytes=crc_bytes)
             print(f"ENC_BACKEND=c frame_symbols={enc_g.frame_symbols}", flush=True)
             up_chirp   = enc_c.chirp(f_min, f_max, symbol_dur, fs)
             down_chirp = enc_c.chirp(f_max, f_min, symbol_dur, fs)
@@ -525,7 +536,7 @@ def encode(cfg):
             chunk          = raw_data[i : i + chunk_size]
             actual_chunk_len = len(chunk)
             # Pad the last (short) chunk to chunk_size with zero bytes so that
-            # every frame has the same structure: seq(1) + data(chunk_size) + crc(4).
+            # every frame has the same structure: seq(1) + data(chunk_size) + crc(crc_bytes).
             # Without this the last frame transmits fewer chirps than frame_symbols
             # and the decoder fills the shortfall with silence bits, shifting the CRC
             # window and causing a guaranteed CRC failure on the last frame.
@@ -543,7 +554,7 @@ def encode(cfg):
                 print(f"encoded frame {num_frames} seq={seq_num} "
                       f"({i + actual_chunk_len}/{len(raw_data)} bytes)", flush=True)
                 continue
-            crc     = frame_crc(seq_num, chunk)
+            crc     = frame_crc(seq_num, chunk, crc_bytes)
 
             inner = bytes([seq_num]) + chunk + crc
             frame = rs_encode_frame(inner, rs_codec)
@@ -599,7 +610,7 @@ def encode(cfg):
         info = {
             "fs": fs, "f_min": f_min, "f_max": f_max,
             "symbol_dur": symbol_dur, "chunk_size": chunk_size,
-            "crc_bytes": CRC_BYTES, "rs_t": rs_t,
+            "crc_bytes": crc_bytes, "rs_t": rs_t,
             "rs_parity_bytes": rs_parity_bytes,
             "interleave_rows": interleave_rows,
             "training_symbols": training_symbols,

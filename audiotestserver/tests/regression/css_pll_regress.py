@@ -80,6 +80,11 @@ def _cases():
     add("pll_015_mesh",       dict(symbol_dur=0.15, f_min=400, f_max=3500, chunk_size=8,
                                    amplitude=0.6), dict(snr_db=15, seed=4))
     add("pll_025_impulses",   dict(symbol_dur=0.25, chunk_size=2), dict(snr_db=20, impulses=25, seed=5))
+    # 2-byte frame check (crc_bytes=2, CRC-16): the GUI mesh default since 2026-11-08
+    add("pll_015_mesh_crc16", dict(symbol_dur=0.15, f_min=400, f_max=3500, chunk_size=8,
+                                   amplitude=0.6, crc_bytes=2), dict(snr_db=15, seed=21))
+    add("pll_015_short_crc16", dict(symbol_dur=0.15, f_min=400, f_max=3500, chunk_size=2,
+                                    amplitude=0.6, crc_bytes=2), dict(snr_db=12, impulses=25, seed=22))
     add("pll_025_hum",        dict(symbol_dur=0.25, chunk_size=2), dict(snr_db=14, hum=0.3, colored=True, seed=6))
     add("pll_025_rs2",        dict(symbol_dur=0.25, chunk_size=4, rs_t=2), dict(snr_db=6, seed=7))
     add("pll_025_k7_il4",     dict(symbol_dur=0.25, chunk_size=2, conv_code="k7r12",
@@ -92,13 +97,48 @@ def _cases():
         dec=dict(mf_longsym=False), msg="1.0s")
     add("pll_020_lowsnr",     dict(symbol_dur=0.20, chunk_size=2), dict(snr_db=3, ppm=-120, seed=12))
     add("pll_025_gain_step",  dict(symbol_dur=0.25, chunk_size=2), dict(snr_db=16, gain_step=0.2, seed=13))
+    # mesh conference (2026-11-08): G.711 leg, onset half a symbol off the read
+    # grid (parity of the pre-sync full-period search + onset guard; synthetic
+    # chirps decode either way, the captured blind-spot frame is in ne0k-gui
+    # tests/test_css_stream.py), and a jitter-buffer insert / drop mid-frame
+    # (phase-step recovery, settled and in acquisition: 4/5 frames without it)
+    mesh = dict(symbol_dur=0.15, f_min=400, f_max=3500, chunk_size=8, amplitude=0.6)
+    add("pll_015_g711_onset", mesh, dict(g711=True, lead_s=1.3 + 0.0787, snr_db=30, seed=14))
+    add("pll_015_g711_slip",  mesh, dict(g711=True, slips=[(9.0, 1026)], snr_db=30, seed=15))
+    add("pll_015_g711_drop",  mesh, dict(g711=True, slips=[(7.6, -1026)], snr_db=24, seed=16))
+    # retro anchor slot count (2026-11-08): the anchor grid dropped the frame's last symbol, so the aligned frame
+    # was never a candidate and a frame-1 chunk starting 0x69-0x6B CRC-16 false-locked at shift -25 (seq 255,
+    # wrong data).  "j" (0x6A) opens frame 1; the broadcast port's TIME payload hit it every second.
+    add("pll_015_anchor_frame1_j", dict(symbol_dur=0.15, f_min=400, f_max=3500, chunk_size=2, amplitude=0.6,
+                                        crc_bytes=2), dict(snr_db=30, seed=23), msg="ABjkLo")
     return C
+
+
+def _g711(x, fs):
+    """fs -> 8 kHz mu-law (G.711) -> fs, numpy only: the SIP conference leg."""
+    k = fs // 8000
+    t = np.arange(191) - 95
+    h = np.sinc(2 * 3600.0 / fs * t) * np.hamming(191)
+    h /= h.sum()
+    y = np.convolve(x, h, mode="same")[::k]
+    mu = 255.0
+    c = np.round(np.sign(y) * np.log1p(mu * np.minimum(np.abs(y), 1.0)) / np.log1p(mu) * 127) / 127
+    y = np.sign(c) * ((1 + mu) ** np.abs(c) - 1) / mu
+    up = np.zeros(len(y) * k)
+    up[::k] = y * k
+    return np.convolve(up, h, mode="same")
 
 
 def _channel(pcm, fs, ch):
     rng = np.random.default_rng(ch.get("seed", 0))
     x = pcm.astype(np.float64)
-    lead = np.zeros(int(fs * 1.3)); tail = np.zeros(int(fs * 2.0))
+    lead = np.zeros(int(fs * ch.get("lead_s", 1.3))); tail = np.zeros(int(fs * 2.0))
+    if ch.get("g711"):
+        x = _g711(x, fs)
+    for at_s, n in ch.get("slips", ()):         # (seconds into the frame, +insert/-drop)
+        i = int(at_s * fs)
+        x = (np.concatenate([x[:i], np.zeros(n), x[i:]]) if n > 0
+             else np.concatenate([x[:i], x[i - n:]]))
     x = np.concatenate([lead, x, tail])
     ppm = ch.get("ppm", 0)
     if ppm:

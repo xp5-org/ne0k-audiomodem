@@ -478,7 +478,7 @@ def assemble_message(decoded_frames, chunk_size=0, message_len=None):
 
 def _frame_pipeline(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
                     base_bits, rs_codec, chunk_size, era_thr=0.0,
-                    frame_snr=0.0, verbose=False):
+                    frame_snr=0.0, verbose=False, crc_bytes=CRC_BYTES):
     """deinterleave → Viterbi → diff → RS → CRC on a frame's bits.
 
     The ground-truth frame-alignment oracle shared by BOTH decoders (the
@@ -496,7 +496,7 @@ def _frame_pipeline(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
                                  diff_ref=diff_ref, base_bits=base_bits,
                                  rs_codec=rs_codec, chunk_size=chunk_size,
                                  era_thr=era_thr, frame_snr=frame_snr,
-                                 verbose=verbose)
+                                 verbose=verbose, crc_bytes=crc_bytes)
     if interleave_rows > 1:
         n_coded = len(fb)
         cols    = n_coded // interleave_rows
@@ -534,7 +534,7 @@ def _frame_pipeline(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
             if verbose:
                 print(f"RS_FAIL snr={frame_snr:.1f}dB err={e}", flush=True)
             raw = b""
-    ok, seq, dat = check_crc(raw, chunk_size)
+    ok, seq, dat = check_crc(raw, chunk_size, crc_bytes)
     return ok, seq, dat, rs_err, rs_fail
 
 
@@ -542,7 +542,8 @@ _DEC_C_GEOM: dict = {}
 
 
 def _frame_pipeline_c(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
-                      base_bits, rs_codec, chunk_size, era_thr, frame_snr, verbose):
+                      base_bits, rs_codec, chunk_size, era_thr, frame_snr, verbose,
+                      crc_bytes=CRC_BYTES):
     """CSS_ENC_BACKEND=c: _frame_pipeline with deinterleave, Viterbi, diff
     decode, bit packing and CRC in libcssenc (css_dec.c).  RS stays on
     rs_decode_frame (RS_BACKEND).  Same mapping css_dec_regress pins
@@ -550,11 +551,12 @@ def _frame_pipeline_c(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
     erasure key below).  Requested but unloadable raises, never falls back.
     """
     import css_enc_c
-    key = (chunk_size, base_bits, conv_code, bool(diff_enc), interleave_rows)
+    key = (chunk_size, base_bits, conv_code, bool(diff_enc), interleave_rows, crc_bytes)
     g = _DEC_C_GEOM.get(key)
     if g is None:
-        rs_t = (base_bits // 8 - chunk_size - 1 - 4) // 2
-        g = css_enc_c.geometry(chunk_size, rs_t, conv_code, diff_enc, interleave_rows)
+        rs_t = (base_bits // 8 - chunk_size - 1 - crc_bytes) // 2
+        g = css_enc_c.geometry(chunk_size, rs_t, conv_code, diff_enc, interleave_rows,
+                               crc_bytes=crc_bytes)
         if g.base_bits != base_bits:
             raise ValueError(f"libcssenc geometry base_bits={g.base_bits} != "
                              f"decoder base_bits={base_bits} (cs={chunk_size})")
@@ -585,9 +587,9 @@ def _frame_pipeline_c(fb, fc, *, interleave_rows, conv_code, diff_enc, diff_ref,
             if verbose:
                 print(f"RS_FAIL snr={frame_snr:.1f}dB err={e}", flush=True)
             raw = b""
-    if len(raw) < 1 + chunk_size + 4:      # short frame: css_fec.check_crc's (False, 0, b"")
+    if len(raw) < 1 + chunk_size + crc_bytes:   # short frame: css_fec.check_crc's (False, 0, b"")
         return False, 0, b"", rs_err, rs_fail
-    ok, seq, dat = css_enc_c.check_crc(raw, chunk_size)
+    ok, seq, dat = css_enc_c.check_crc(raw, chunk_size, crc_bytes=crc_bytes)
     if not ok:                             # css_fec.check_crc still reports seq/data on a miss
         seq, dat = raw[0], bytes(raw[1:1 + chunk_size])
     return ok, seq, dat, rs_err, rs_fail
@@ -683,6 +685,7 @@ def decode_longsym_mf(cfg, stop_event=None):
     P               = len(preamble)
     frame_symbols   = int(conf.get("frame_symbols", conf.get("base_bits", 48)))
     base_bits       = int(conf.get("base_bits", frame_symbols))
+    crc_bytes       = int(conf.get("crc_bytes", CRC_BYTES))
     train_n         = int(conf.get("training_symbols", 0))
     expected_frames = conf.get("frames")
     # Payload length before the encoder padded the final chunk (see
@@ -1001,7 +1004,7 @@ def decode_longsym_mf(cfg, stop_event=None):
         ok, seq, dat, _rs_err, rs_fail = _frame_pipeline(
             fb, fc, interleave_rows=interleave_rows, conv_code=conv_code,
             diff_enc=diff_enc, diff_ref=diff_ref, base_bits=base_bits,
-            rs_codec=rs_codec, chunk_size=chunk_size)
+            rs_codec=rs_codec, chunk_size=chunk_size, crc_bytes=crc_bytes)
         return ok, seq, dat, rs_fail
 
     if _log_audio_interface is not None and hasattr(sd, "query_devices"):
@@ -2247,6 +2250,39 @@ def decode(cfg, stop_event=None):
     # rejecting the winner afterwards (a never-acquirable winner otherwise
     # masks the real preamble until it ages out of the ring).
     syndet_mask_ineligible = bool(cfg.get("syndet_mask_ineligible", True))
+    # Pre-sync MF search over one whole symbol period, [buf_size-sps_eff,
+    # buf_size), instead of +-search_range around peak_est.  The wide window is
+    # only ~half a period (2*search_frac*sps), so a frame whose onset puts its
+    # chirp ends in the other half was invisible: the MF returned edge peaks of
+    # random sign (snr ~3 dB), the acquisition loop random-walked and the
+    # preamble was never found.  Measured on a G.711 conference capture: 3 of
+    # 60 onset phases lost, the live symptom "grid locked, no PLL sync".  The
+    # timing error is wrapped to +-sps_eff/2 so the loop takes the short way.
+    presync_full_period = bool(cfg.get("presync_full_period", True))
+    # A transmission onset (first signal symbol after this many silent ones,
+    # pre-sync) anchors the early-sync guard like a hard resync: no window may
+    # end before training + preamble symbols have been heard.  The full-period
+    # search sees a burst's first chirp, and [silence, training] onset windows
+    # then scored 0.45 against the Barker tail and false-locked.  0 = off.
+    onset_guard_silence_syms = int(cfg.get("onset_guard_silence_syms", 2))
+    # Phase-step recovery while synced.  A jitter buffer that inserts or
+    # drops a packet's worth of audio mid-frame (measured on the SIP conference:
+    # +1026 smp, 21.4 ms) moves every later chirp outside the +-post_acq_search
+    # window: the narrow MF decides residue (31 -> 6 dB) and, with no FEC, the
+    # frame is lost.  Settled: when the narrow snr drops step_drop_db under
+    # the frame's running snr, search +-search_range; in acquisition the
+    # +-search_range window already sees a slipped chirp, so a peak more than
+    # post_acq_search from expected is checked directly.  A strong chirp (snr within
+    # step_accept_db of the running value, |conf| >= step_min_conf) more than
+    # post_acq_search/2 away is a step CANDIDATE, kept out of the timing loop.
+    # If the next symbol finds it again within step_tol_smp the step is
+    # confirmed: both symbols are decided at the stepped position and the next
+    # read takes the step as a one-shot correction (timing stays settled).  A
+    # one-symbol impulse never confirms, so it cannot move the timebase.
+    step_recover   = bool(cfg.get("step_recover", True))
+    step_drop_db   = float(cfg.get("step_drop_db", 10.0))
+    step_accept_db = float(cfg.get("step_accept_db", 6.0))
+    step_min_conf  = float(cfg.get("step_min_conf", 0.5))
 
     # -- Syndet noise-immunity parameters ------------------------------------
     # SNR gate: symbols with snr_db < syndet_min_snr_db are zeroed before
@@ -2401,6 +2437,7 @@ def decode(cfg, stop_event=None):
     # are unchanged by the look-ahead.
     _fa_delay     = ring_lookahead - gap_samps
     expected_peak = buf_size - ring_lookahead - 1
+    step_tol_smp = int(cfg.get("step_tol_smp", max(16, post_acq_search_smp // 2)))
     peak_est      = expected_peak
     timing_frac   = 0.0
     timing_settled = False
@@ -2494,6 +2531,21 @@ def decode(cfg, stop_event=None):
     _last_micsn_log  = 0.0 # wall time of the last MIC_SN line (throttled ~1 Hz)
     _last_resync_sym = 0   # sym_count at the most recent resync (or 0 at start)
     _last_resync_soft = False  # True if last resync was a soft re-arm (preamble imminent)
+    _quiet_run = 0         # consecutive symbols without signal (onset guard)
+    _step_ref_snr = None   # running tracked-symbol snr (phase-step recovery)
+    _step_cand = None      # (offset, wide conf, bit_stream index) awaiting confirmation
+    _step_fix = None       # (bit_stream index, conf) to re-decide at the next append
+
+    def _presync_wrap(e):
+        """Pre-sync full-period search: a peak more than half a period early is the
+        same chirp phase as one that far late (not yet in the ring)."""
+        if sync_found or not presync_full_period:
+            return e
+        if e < -(sps_eff // 2):
+            return e + sps_eff
+        if e > sps_eff // 2:
+            return e - sps_eff
+        return e
     _terr_buf      = deque(maxlen=timing_median_n)  # median filter for echo rejection
     _frame_audio     = []   # AGC-processed audio chunks collected during frame
     _fa_nbytes       = 0    # running byte count for _frame_audio (avoids re-summing)
@@ -2559,6 +2611,7 @@ def decode(cfg, stop_event=None):
         nonlocal sync_found, bit_stream, consec_errors, timing_settled
         nonlocal peak_est, timing_frac, n_read, _acq_syms_left, _last_resync_sym
         nonlocal _last_resync_soft
+        nonlocal _step_ref_snr, _step_cand, _step_fix
         nonlocal _timing_snapshot, _fa_nbytes, _one_shot_correction, rate_est_smp
         if _trace is not None:
             _trace.append({"event": "RESYNC", "sym": sym_count,
@@ -2578,6 +2631,7 @@ def decode(cfg, stop_event=None):
         _fa_nbytes           = 0
         _timing_snapshot     = None
         _one_shot_correction = 0
+        _step_ref_snr, _step_cand, _step_fix = None, None, None
         if reset_timing:
             peak_est     = expected_peak
             timing_frac  = 0.0
@@ -2610,7 +2664,7 @@ def decode(cfg, stop_event=None):
             fb, fc, interleave_rows=interleave_rows, conv_code=conv_code,
             diff_enc=diff_enc, diff_ref=sync_word[-1], base_bits=base_bits,
             rs_codec=rs_codec, chunk_size=chunk_size, era_thr=era_thr,
-            frame_snr=frame_snr, verbose=True)
+            frame_snr=frame_snr, verbose=True, crc_bytes=crc_bytes)
 
     # ── Deferred anchor re-decode state ──────────────────────────────────────
     # A cold-start mis-aligned first frame "completes" before its payload tail
@@ -2950,15 +3004,68 @@ def decode(cfg, stop_event=None):
                     _fa_nbytes += agc_audio.nbytes
 
                 correlator.verbose = (sym_count in _verbose_syms)
-                bit, confidence, found_peak, snr_db, winner_pk = (
-                    correlator.symbol_decision(
-                        ring, peak_est,
-                        search_range_override=(
-                            post_acq_search_smp
-                            if (timing_settled and sync_found and _acq_syms_left == 0)
-                            else None
-                        )
-                    ))
+                if presync_full_period and not sync_found:
+                    _half = sps_eff // 2
+                    bit, confidence, found_peak, snr_db, winner_pk = (
+                        correlator.symbol_decision(ring, buf_size - _half,
+                                                   search_range_override=_half))
+                else:
+                    bit, confidence, found_peak, snr_db, winner_pk = (
+                        correlator.symbol_decision(
+                            ring, peak_est,
+                            search_range_override=(
+                                post_acq_search_smp
+                                if (timing_settled and sync_found and _acq_syms_left == 0)
+                                else None
+                            )
+                        ))
+
+                # ── Phase-step recovery while synced (see step_recover) ──────
+                # Tracking (settled): the narrow window lost the chirp (snr
+                # drop) -> search +-search_range.  Acquisition: the
+                # +-search_range window already sees it, so a strong peak more
+                # than post_acq_search from expected is the candidate.
+                _step_sym = 0          # 1 = candidate, 2 = confirmed
+                if step_recover and sync_found and signal_present:
+                    _new_cand = None
+                    _tracking = timing_settled and _acq_syms_left == 0
+                    _w = None
+                    if _step_ref_snr is not None:
+                        if _tracking and snr_db < _step_ref_snr - step_drop_db:
+                            _w = correlator.symbol_decision(ring, expected_peak)
+                        elif (not _tracking
+                                and abs(found_peak - expected_peak) > post_acq_search_smp):
+                            _w = (bit, confidence, found_peak, snr_db, winner_pk)
+                    if _w is not None:
+                        w_bit, w_conf, w_peak, w_snr, w_pk = _w
+                        _d = int(w_peak) - expected_peak
+                        if (abs(_d) > post_acq_search_smp // 2
+                                and abs(w_conf) >= step_min_conf
+                                and w_snr >= _step_ref_snr - step_accept_db):
+                            if (_step_cand is not None
+                                    and abs(_d - _step_cand[0]) <= step_tol_smp):
+                                print(f"PHASE_STEP sym={sym_count} step={_d:+d} confirmed "
+                                      f"wide_snr={w_snr:.1f}dB narrow_snr={snr_db:.1f}dB",
+                                      flush=True)
+                                bit, confidence, found_peak, snr_db, winner_pk = _w
+                                _step_sym = 2
+                                _one_shot_correction = _d
+                                peak_est = expected_peak
+                                _terr_buf.clear()
+                                _acq_nread_dev.clear()
+                                _step_fix = (_step_cand[2], _step_cand[1])
+                            else:
+                                print(f"PHASE_STEP sym={sym_count} step={_d:+d} candidate "
+                                      f"wide_snr={w_snr:.1f}dB narrow_snr={snr_db:.1f}dB",
+                                      flush=True)
+                                _step_sym = 1
+                                _new_cand = (_d, float(w_conf), -1)
+                    _step_cand = _new_cand
+                    if not _step_sym:
+                        if _step_ref_snr is None:
+                            _step_ref_snr = float(snr_db)
+                        elif snr_db >= _step_ref_snr - step_drop_db:
+                            _step_ref_snr += 0.1 * (float(snr_db) - _step_ref_snr)
 
                 abs_conf = abs(confidence)
 
@@ -3054,8 +3161,8 @@ def decode(cfg, stop_event=None):
                 # removed so re-enabling it later is a one-line change.
                 tim_snr_ok = snr_db >= timing_min_snr_db
                 if (signal_present and abs_conf >= min_tim_conf and tim_snr_ok
-                        and pll_slope_ok):
-                    raw_err = found_peak - expected_peak
+                        and pll_slope_ok and not _step_sym):
+                    raw_err = _presync_wrap(found_peak - expected_peak)
                     eff_max_terr = max_terr_smp if timing_settled else presync_max_terr_smp
                     clamped_err = int(np.clip(raw_err, -eff_max_terr, eff_max_terr))
                     # peak_est: IIR update ONLY while timing has not settled.
@@ -3129,7 +3236,7 @@ def decode(cfg, stop_event=None):
                     # measurements move peak_est.
                     timing_err = clamped_err
                 else:
-                    timing_err = found_peak - expected_peak
+                    timing_err = 0 if _step_sym else _presync_wrap(found_peak - expected_peak)
 
                 # ── FRAME_PHASE diagnostic (once per frame) ──────────
                 # _acq_syms_left == timing_acq_symbols is true for exactly
@@ -3572,6 +3679,11 @@ def decode(cfg, stop_event=None):
                         "wpk_strong": int(bool(_wpk_strong)),
                         "signal_present": int(bool(signal_present)),
                         "whitened": int(_whiten_fir is not None)})
+                if (not sync_found and onset_guard_silence_syms > 0 and signal_present
+                        and _quiet_run >= onset_guard_silence_syms):
+                    _last_resync_sym = sym_count - 2     # css_pll_mark_onset(), ahead 0
+                    _last_resync_soft = False
+                _quiet_run = 0 if signal_present else _quiet_run + 1
                 if not sync_found:
                     tim_flush_thr = int(cfg.get("syndet_flush_terr", sps // 2))
                     if abs(timing_err) <= tim_flush_thr:
@@ -3794,6 +3906,7 @@ def decode(cfg, stop_event=None):
                         # fragments of a previous acquisition.
                         _terr_buf.clear()
                         _acq_nread_dev.clear()
+                        _step_ref_snr, _step_cand, _step_fix = None, None, None
                         if lag > 0:
                             avail      = len(pre_sync_buf)
                             take       = min(lag, avail)
@@ -3829,10 +3942,19 @@ def decode(cfg, stop_event=None):
                               f"bg={_syndet_bg_ema:.3f}) "
                               f"snr={snr_db:.1f}dB conf={confidence:+.2f}", flush=True)
                 else:
+                    if _step_fix is not None:
+                        # confirmed step: re-decide the candidate symbol there
+                        _fi, _fc = _step_fix
+                        if 0 <= _fi < len(bit_stream):
+                            bit_stream[_fi] = (1 if _fc > 0 else 0, _fc)
+                        _step_fix = None
                     final_bit  = 1 if final_conf > 0 else 0
                     bit_stream.append((final_bit, final_conf))
+                    if _step_sym == 1:
+                        _step_cand = (_step_cand[0], _step_cand[1], len(bit_stream) - 1)
 
                     if len(bit_stream) >= frame_symbols:
+                        _step_cand = None
                         frame_items = bit_stream[:frame_symbols]
                         bit_stream  = bit_stream[frame_symbols:]
 

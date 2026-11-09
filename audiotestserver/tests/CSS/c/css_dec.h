@@ -102,6 +102,11 @@ int css_bits_to_bytes(const unsigned char *bits, int n, unsigned char *out);
 int css_check_crc(const unsigned char *raw, int nraw, int chunk_size,
                   int *seq);
 
+/* css_check_crc for a frame sent with crc_bytes 4 (CRC-32) or 2 (CRC-16,
+ * css_crc16).  `raw` must hold 1 + chunk_size + crc_bytes bytes. */
+int css_check_crc_n(const unsigned char *raw, int nraw, int chunk_size,
+                    int crc_bytes, int *seq);
+
 /* deinterleave -> viterbi -> diff -> bytes, the receive bit pipeline.
  *
  * Mirrors css_decoder._frame_pipeline up to (not including) Reed-Solomon.

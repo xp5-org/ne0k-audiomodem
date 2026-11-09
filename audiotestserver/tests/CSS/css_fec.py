@@ -25,6 +25,7 @@ Contents:
     get_bytes_from_bits(), check_crc()
 """
 
+import binascii
 import zlib
 
 import numpy as np
@@ -326,12 +327,26 @@ def get_bytes_from_bits(bit_list):
     return bytes(out)
 
 
-def check_crc(raw_bytes, chunk_size):
-    need = 1 + chunk_size + CRC_BYTES
+CRC_CHOICES = (4, 2)
+
+
+def frame_check(payload, crc_bytes=CRC_BYTES):
+    """The frame check over seq|data: CRC-32 (zlib, crc_bytes=4) or CRC-16/CCITT-FALSE
+    (binascii.crc_hqx with init 0xFFFF, crc_bytes=2), big-endian.  The 2-byte check saves
+    16 chirps a frame; css_enc.c's css_crc16 is byte-identical."""
+    if crc_bytes == 2:
+        return binascii.crc_hqx(bytes(payload), 0xFFFF).to_bytes(2, "big")
+    if crc_bytes == 4:
+        return (zlib.crc32(bytes(payload)) & 0xFFFFFFFF).to_bytes(4, "big")
+    raise ValueError(f"crc_bytes={crc_bytes!r} not in {CRC_CHOICES}")
+
+
+def check_crc(raw_bytes, chunk_size, crc_bytes=CRC_BYTES):
+    need = 1 + chunk_size + crc_bytes
     if len(raw_bytes) < need:
         return False, 0, b""
     seq      = raw_bytes[0]
     data     = raw_bytes[1 : 1 + chunk_size]
     received = raw_bytes[1 + chunk_size : need]
-    expected = (zlib.crc32(bytes([seq]) + data) & 0xFFFFFFFF).to_bytes(4, "big")
+    expected = frame_check(bytes([seq]) + data, crc_bytes)
     return received == expected, seq, data

@@ -327,7 +327,10 @@ int css_retro_anchor_prepare(css_retro *r, const float *audio, long N,
     if (P < 1) P = 1;
     coarse = fold_t0(r, N, P);
     if (coarse < 0) return -1;
-    M = (N - coarse) / P;
+    /* slots whose MF peak lies in the buffer (coarse + m*P <= N-1), not (N - coarse) / P: the anchor history
+     * ends ring_lookahead past the frame's last peak, so that dropped the frame's last symbol and shift 0 never
+     * held the aligned frame (css_retro.py retro_offset_candidates, 2026-11-08) */
+    M = N > coarse ? (N - 1 - coarse) / P + 1 : 0;
     if (M < fsym) return -1;
     if (M > grid_cap(r->nmax, sps)) return -1;
     for (m = 0; m < M; m++) {

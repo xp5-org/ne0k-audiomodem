@@ -298,7 +298,7 @@ def offline_decode(samples, fs, info_path, cfg, verbose=False):
                         n_read = next_n_read
                         continue
 
-                ok, seq_num, data = check_crc(raw_bytes, chunk_size)
+                ok, seq_num, data = check_crc(raw_bytes, chunk_size, crc_bytes_n)
                 if ok:
                     try:
                         msg   = data.decode("utf-8", errors="strict")

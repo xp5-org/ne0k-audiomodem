@@ -369,7 +369,13 @@ def retro_offset_candidates(anchor_audio, up_ref, down_ref, sps, sps_eff,
     folded    = combined[:usable].reshape(-1, sps_eff_d).sum(axis=0)
     coarse_t0 = int(np.argmax(folded))
 
-    M = (n_audio - coarse_t0) // sps_eff_d   # total symbol slots in buffer
+    # Symbol slots whose MF peak lies in the buffer: peaks at coarse_t0 + m*sps_eff_d <= n_audio-1.  NOT
+    # (n_audio - coarse_t0) // sps_eff_d, which also demands a whole symbol period AFTER the last peak: the
+    # anchor history ends ring_lookahead (< sps_eff) past the frame's last chirp-end peak, so that dropped the
+    # frame's last symbol, shift 0 sat one symbol early and the aligned frame was never a candidate -- every
+    # in-frame anchor search then ran all ~2*max_shift windows and CRC-16 false-passed on some payloads
+    # (frame 1 starting 0x69-0x6B at 0.15 s / chunk 2 locked at shift -25 and emitted seq 255; 2026-11-08).
+    M = (n_audio - 1 - coarse_t0) // sps_eff_d + 1 if n_audio > coarse_t0 else 0
     if M < frame_symbols:
         return
 

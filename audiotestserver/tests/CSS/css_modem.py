@@ -60,6 +60,13 @@ TYPE_BLOCKOUT_END = 0x8   # "the window is over, resume" — broadcast by
                           # whichever participant finished the transfer;
                           # lets bystanders resume EARLY instead of waiting
                           # out the full announced duration.
+TYPE_TIME         = 0x9   # broadcast time code: payload = u32 big-endian UTC
+                          # seconds at the instant the packet's LAST CHIRP
+                          # ends at the sender (the sender schedules the
+                          # frame so that lands on the whole second).  A
+                          # listener stamps its own clock when the last frame
+                          # decodes; the difference is its offset to the
+                          # broadcast clock (path delay not removed).
 
 TYPE_NAMES = {
     TYPE_BEACON:       "BEACON",
@@ -70,6 +77,7 @@ TYPE_NAMES = {
     TYPE_OFDM_HS_REQ:  "OFDM_HS_REQ",
     TYPE_BLOCKOUT_REQ: "BLOCKOUT_REQ",
     TYPE_BLOCKOUT_END: "BLOCKOUT_END",
+    TYPE_TIME:         "TIME",
 }
 
 # ── Field ranges ─────────────────────────────────────────────────────────────
@@ -196,6 +204,17 @@ def unpack_blockout_req_payload(payload: bytes) -> tuple[int, float]:
 # (~380 s at 44.1 kHz) — far more than any realistic turnaround.
 TURNAROUND_BYTES = 3
 _TURN_MAX = (1 << (8 * TURNAROUND_BYTES)) - 1
+
+
+def pack_time_payload(utc_s: int) -> bytes:
+    """TIME payload: whole UTC seconds, u32 big-endian (good to 2106)."""
+    return int(utc_s).to_bytes(4, "big")
+
+
+def unpack_time_payload(payload: bytes) -> int:
+    if len(payload) < 4:
+        raise ModemError(f"TIME payload too short: {len(payload)}B < 4B")
+    return int.from_bytes(payload[:4], "big")
 
 
 def pack_range_reply_payload(turnaround_samples: int) -> bytes:

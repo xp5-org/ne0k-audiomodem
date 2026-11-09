@@ -44,7 +44,7 @@ EVENT_NAMES = {
     1: "SYNC_ACQUIRED", 2: "SYNC_TOO_EARLY", 3: "SYNC_STALE_REJECT", 4: "RESYNC",
     5: "RETRO_GATE", 6: "RETRO_SYNC", 7: "RETRO_ANCHOR", 8: "SNAPSHOT_RESTORE",
     9: "FRAME_ERROR", 10: "PLL_OUTLIER", 11: "SYNC_SNAP", 12: "IMPULSE_BLANK",
-    13: "NR_CLAMP",
+    13: "NR_CLAMP", 14: "PHASE_STEP",
 }
 SOURCES = {0: "stream", 1: "retro", 2: "retro_deferred"}
 
@@ -107,6 +107,13 @@ class Cfg(ctypes.Structure):
         ("impulse_silence_floor", ctypes.c_double),
         ("whiten_stft_win_max", ctypes.c_int),
         ("ring_lookahead", ctypes.c_int),
+        ("presync_full_period", ctypes.c_int),
+        ("onset_guard_silence_syms", ctypes.c_int),
+        ("step_recover", ctypes.c_int),
+        ("step_drop_db", ctypes.c_double), ("step_accept_db", ctypes.c_double),
+        ("step_min_conf", ctypes.c_double),
+        ("step_tol_smp", ctypes.c_int),
+        ("crc_bytes", ctypes.c_int),
     ]
 
 
@@ -358,7 +365,7 @@ def build_cfg(cfg: dict, conf: dict) -> tuple[Cfg, dict]:
     c.conv_k7 = 1 if conv_code == "k7r12" else 0
     c.diff_enc = int(diff_enc)
     c.rs_enabled = 1 if rs_codec is not None else 0
-    c.base_bits = base_bits; c.frame_symbols = frame_symbols
+    c.base_bits = base_bits; c.frame_symbols = frame_symbols; c.crc_bytes = crc_bytes
     c.preamble_per_frame = int(preamble_per_frame)
     c.n_preamble = _n_preamble
     for i, b in enumerate(sync_word):
@@ -384,6 +391,13 @@ def build_cfg(cfg: dict, conf: dict) -> tuple[Cfg, dict]:
     _rl = int(cfg.get("ring_lookahead", -1))
     _rl = max(gap_samps, _sr) if _rl < 0 else max(gap_samps, _rl)
     c.ring_lookahead = min(_rl, max(gap_samps, buf_size - 1 - sps - _sr))
+    c.presync_full_period = int(bool(cfg.get("presync_full_period", True)))
+    c.onset_guard_silence_syms = int(cfg.get("onset_guard_silence_syms", 2))
+    c.step_recover = int(bool(cfg.get("step_recover", True)))
+    c.step_drop_db = float(cfg.get("step_drop_db", 10.0))
+    c.step_accept_db = float(cfg.get("step_accept_db", 6.0))
+    c.step_min_conf = float(cfg.get("step_min_conf", 0.5))
+    c.step_tol_smp = int(cfg.get("step_tol_smp", max(16, post_acq_search_smp // 2)))
     extras.update(fs=fs, dur=dur, sps=sps, sps_eff=sps_eff, chunk_size=chunk_size,
                   frame_symbols=frame_symbols, f_min=f_min, f_max=f_max,
                   rs_t=rs_t, gap_samps=gap_samps, alpha=alpha,
