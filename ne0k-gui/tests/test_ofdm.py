@@ -292,26 +292,32 @@ def test_serial_bridge_over_oneway(tmp_path):
 
 
 def test_full_duplex_both_ends_talk_at_once(made):
+    """fdd: disjoint halves of the band, and on each its own continuous carrier with the ec sliding window (no
+    stop-and-wait: the carrier stays up between frames and ACKs ride the stream)."""
+    import time
     a, b = _mk_pair(Registry(), made, "fd", mode="full")
     assert a.wait_up(120) and b.wait_up(30), (a.fail_reason, b.fail_reason)
     # disjoint halves of the band, initiator low
     assert a._tx_band == b._rx_band and b._tx_band == a._rx_band
     assert a._tx_band[1] < b._tx_band[0]
+    assert a.capacity == a.cfg.chunk_bytes - 6                  # one stream chunk per frame
+    n0, m0 = a.tx_frames, b.tx_frames
+    time.sleep(4.0)                                             # idle: filler chunks keep both carriers up
+    assert a.tx_frames - n0 >= 4 and b.tx_frames - m0 >= 4
     pa, pb = b"from A \x00\xff" * 4, b"from B " * 9
     res = {}
     ta = threading.Thread(target=lambda: res.setdefault("a", a.send(pa)))
     tb = threading.Thread(target=lambda: res.setdefault("b", b.send(pb)))
     ta.start(); tb.start(); ta.join(120); tb.join(120)
     assert res == {"a": True, "b": True}
-    assert b.got == [pa] and a.got == [pb]
-    assert a.retry_count == 0 and b.retry_count == 0
-    # lost data frame: resent after ack_wait_s, delivered once
-    seen = []
+    assert b"".join(b.got) == pa and b"".join(a.got) == pb
+    # lost data frame: resent, delivered once
+    seen, r0, k0 = [], a.retry_count, len(b"".join(b.got))
     b.rx_filter = lambda f: bool(seen.append(f["seq"]) or len(seen) != 1) if f["len"] else True
     a.cfg.ack_wait_s = 6.0
     assert a.send(b"again")
     b.rx_filter = None
-    assert b.got[-1] == b"again" and b.got.count(b"again") == 1 and a.retry_count == 1
+    assert b"".join(b.got)[k0:] == b"again" and a.retry_count >= r0 + 1
 
 
 def test_full_duplex_c_engine_both_ends_talk_at_once(made):

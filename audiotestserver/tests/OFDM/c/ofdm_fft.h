@@ -90,6 +90,23 @@ void ofdm_rfft(ofdm_fft *f, const ofdm_real *x, ofdm_cpx *X);
 /* X[n/2+1] half spectrum -> x[n] real, scaled like numpy.fft.irfft. */
 void ofdm_irfft(ofdm_fft *f, const ofdm_cpx *X, ofdm_real *x);
 
+/* ---- full complex transform, for complex-baseband (I/Q) OFDM; see ofdm_cx.h.
+ * Additive: the real transform above is untouched.  Same radix-2 core, same
+ * precision switch, same caller-memory contract.  In place, natural order:
+ * bin k at a[k], negative frequencies at a[n-k] (numpy.fft order). */
+typedef struct {
+    int       n;       /* complex transform length (power of two >= 4) */
+    ofdm_cpx *tw;      /* n/2 twiddles e^{-2*pi*i*k/n}                  */
+} ofdm_cfft;
+
+size_t ofdm_cfft_workspace(int n);
+/* Returns 0 ok, -1 n not a power of two >= 4 or null, -2 memlen too small. */
+int  ofdm_cfft_init(ofdm_cfft *f, int n, void *mem, size_t memlen);
+/* Forward, unscaled (numpy.fft.fft). */
+void ofdm_cfft_fwd(const ofdm_cfft *f, ofdm_cpx *a);
+/* Inverse, scaled by 1/n (numpy.fft.ifft). */
+void ofdm_cfft_inv(const ofdm_cfft *f, ofdm_cpx *a);
+
 #ifdef __cplusplus
 }
 #endif

@@ -6,6 +6,9 @@
 ``loop:<name>``         a named in-memory bus; whatever a ``loop:x`` SINK plays is
                         what a ``loop:x`` SOURCE hears.  Two pipes in one process
                         (or a test) can talk through it with no audio stack.
+``hyb:<line>/<node>``   a 2-wire line with a poor hybrid: the source hears the OTHER node's sink plus an
+                        echo of its OWN sink (gain 0.7, ~2 ms plus the pacing delay, a short smear) --
+                        what a same-band full-duplex modem's echo canceller (duplex ec) is for.
 ``null:``               a source of silence / a sink that discards.
 
 Options after ``#`` on a file address, comma separated:
@@ -351,6 +354,87 @@ class MixConnector(Connector):
         return _PumpSink(spec, lambda x: m.put(node, x))
 
 
+class _Hybrid(_Mix):
+    """_Mix plus a near-end echo: every node also hears its own sink through a fixed echo path.  The echo runs
+    as a continuous FIFO (the sink delivers silence too), so its delay is fixed for the whole run, like a real
+    hybrid.  It is prefilled with DELAY + PREFILL_BLOCKS blocks so the separately paced sink and source never run
+    it dry: an underrun would shift the echo for good (a slip), which a frozen canceller cannot follow."""
+
+    ECHO = np.array([0.7, 0.0, -0.25, 0.1, 0.0, 0.05], np.float32)
+    DELAY = 96                                     # 2 ms, plus PREFILL_BLOCKS pacing blocks
+    PREFILL_BLOCKS = 4
+
+    def __init__(self, rate: int) -> None:
+        super().__init__(rate)
+        self.echo: dict[str, deque] = {}
+        self.echo_n: dict[str, int] = {}
+        self.tail: dict[str, np.ndarray] = {}
+
+    def join(self, node: str) -> None:
+        super().join(node)
+        with self.lock:
+            if node not in self.echo:
+                pre = self.DELAY + self.PREFILL_BLOCKS * 1024
+                self.echo[node] = deque([np.zeros(pre, np.float32)])
+                self.echo_n[node] = pre
+                self.tail[node] = np.zeros(len(self.ECHO) - 1, np.float32)
+
+    def put(self, tx: str, x: np.ndarray) -> None:
+        super().put(tx, x)
+        with self.lock:
+            z = np.concatenate([self.tail[tx], x])
+            e = np.convolve(z, self.ECHO, mode="valid").astype(np.float32)
+            self.tail[tx] = z[len(z) - (len(self.ECHO) - 1):]
+            self.echo[tx].append(e)
+            self.echo_n[tx] += len(e)
+
+    def get(self, ln: str, n: int) -> np.ndarray:
+        out = super().get(ln, n)
+        with self.lock:
+            q, got = self.echo[ln], 0
+            while got < n and q:
+                head = q[0]
+                k = min(n - got, len(head))
+                out[got:got + k] += head[:k]
+                got += k
+                if k == len(head):
+                    q.popleft()
+                else:
+                    q[0] = head[k:]
+            self.echo_n[ln] -= got
+        return out
+
+
+_HYBS: dict[str, _Hybrid] = {}
+
+
+def _hyb(dev_id: str, rate: int) -> tuple[_Hybrid, str]:
+    net, _, node = (dev_id or "line/a").partition("/")
+    with _BUSES_LOCK:
+        m = _HYBS.setdefault(net, _Hybrid(rate))
+    m.join(node or "a")
+    return m, node or "a"
+
+
+class HybridConnector(Connector):
+    name = "hyb"
+    description = ("2-wire line 'hyb:<line>/<node>': the source hears every OTHER node's sink plus an echo of "
+                   "its own (a poor hybrid), for same-band full duplex with an echo canceller")
+
+    def list_devices(self) -> list[DeviceInfo]:
+        with _BUSES_LOCK:
+            names = sorted(_HYBS) or ["line"]
+        return [DeviceInfo(self.name, f"{n}/a", f"hybrid {n}", k) for n in names for k in (SOURCE, SINK)]
+
+    def open_source(self, dev_id, spec):
+        m, node = _hyb(dev_id, spec.rate)
+        return _PumpSource(spec, lambda n: m.get(node, n))
+
+    def open_sink(self, dev_id, spec):
+        m, node = _hyb(dev_id, spec.rate)
+        return _PumpSink(spec, lambda x: m.put(node, x))
+
+
 class NullConnector(Connector):
     name = "null"
     description = "Silence in, discard out"
@@ -365,4 +449,4 @@ class NullConnector(Connector):
         return _PumpSink(spec, lambda x: None)
 
 
-CONNECTORS = [FileConnector, LoopConnector, MixConnector, NullConnector]
+CONNECTORS = [FileConnector, LoopConnector, MixConnector, HybridConnector, NullConnector]

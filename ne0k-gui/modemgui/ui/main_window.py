@@ -650,6 +650,7 @@ class MainWindow(QMainWindow):
 
     def _restart_link(self) -> None:
         self.session.ignore_busy = bool(self.app.general.ignore_busy)   # read by every pre-TX silence check
+        self.session.keyup_tone = self.app.ofdm.channel != "line"       # read by ofdm_link.keyup() on every burst
         if self.link:
             self.link.stop(); self.link = None
             self.feed.set_link(None)

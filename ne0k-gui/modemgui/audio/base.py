@@ -3,11 +3,15 @@
 """Connector API: the one interface every audio endpoint implements.
 
 The modems work on REAL, MONO, float32 audio at a fixed sample rate.  Anything
-that is not that (a stereo sound card, a PulseAudio sink, a PlutoSDR delivering
-complex baseband) is adapted INSIDE its connector, so nothing above this layer
-needs to know what is physically underneath.  For an SDR that means the
-connector owns the (de)modulation -- e.g. SSB/NFM -- and presents an audio-like
-stream.
+that is not that (a stereo sound card, a PulseAudio sink) is adapted INSIDE its
+connector, so nothing above this layer needs to know what is physically
+underneath.
+
+The one exception is an I/Q session (``StreamSpec.iq``): blocks are then COMPLEX64
+baseband, one value per complex sample, for the complex OFDM modem
+(engine/ofdm_cx.py) on an SDR or the GNU Radio medium (the ``iq:`` connector).
+An audio connector refuses an I/Q spec and the ``iq:`` connector refuses a real
+one, so the two kinds can never be mixed up on one pipe.
 
 Direction and ownership:
   * a Source PUSHES blocks to a callback from its own thread;
@@ -39,6 +43,7 @@ class AudioError(RuntimeError):
 class StreamSpec:
     rate: int = 48000      # Hz; the connector asks the OS/device for exactly this
     block: int = 1024      # samples per callback (a hint; sinks may be exact)
+    iq: bool = False       # complex64 baseband blocks instead of real float32 audio
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +96,7 @@ class Connector(abc.ABC):
 
     name: str = ""           # address prefix; unique
     description: str = ""
+    iq: bool = False         # True: carries complex baseband (StreamSpec.iq), never audio
 
     def available(self) -> tuple[bool, str]:
         """(usable on this host, reason if not).  Must be cheap and never raise."""
@@ -104,6 +110,22 @@ class Connector(abc.ABC):
 
     @abc.abstractmethod
     def open_sink(self, dev_id: str, spec: StreamSpec) -> Sink: ...
+
+
+def as_iq_c64(x: np.ndarray) -> np.ndarray:
+    """Normalise to contiguous complex64: complex input as is, (n, 2) real as I,Q columns,
+    1-D real as I with Q = 0."""
+    x = np.asarray(x)
+    if x.ndim == 2 and x.shape[1] == 2 and not np.iscomplexobj(x):
+        x = x[:, 0] + 1j * x[:, 1]
+    if x.dtype != np.complex64:
+        x = x.astype(np.complex64)
+    return np.ascontiguousarray(x.reshape(-1))
+
+
+def as_block(x: np.ndarray, iq: bool) -> np.ndarray:
+    """The pipe's block normaliser: complex64 for an I/Q stream, mono float32 otherwise."""
+    return as_iq_c64(x) if iq else as_mono_f32(x)
 
 
 def as_mono_f32(x: np.ndarray) -> np.ndarray:

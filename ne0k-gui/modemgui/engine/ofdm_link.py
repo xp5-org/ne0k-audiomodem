@@ -55,9 +55,10 @@ Two phases:
   the low half and the responder on the high one, and BOTH may be on the air at once.  Each
   half is its own carrier set (own preamble, CE and sync symbols), so its BAT is the full-band
   table re-indexed onto the sub-band's data bins.  The receiver low/high-passes away its own
-  band first (``ofdm_fdd.rx_filter``).  ARQ is stop-and-wait per frame as in ``half`` but with
-  no windows: a frame is ACKed at once by a pure-ACK frame on the ACKer's own half (or by the
-  ``ack`` field of any data frame), and resent after ``ack_wait_s``.
+  band first (``ofdm_fdd.rx_filter``).  The data plane is the same continuous carrier and sliding
+  window as ``ec`` (see "full duplex, echo cancelled" below; logged with an ``fdd`` prefix): each
+  end keeps its carrier up on its own half, one chunk after another, and ACKs ride the stream.
+  (The C engine, backend ``cdx``, still runs fdd stop-and-wait per frame.)
 
 * ``arq``    -- one-way data WITH acknowledgement and no windows: only ``cfg.sender`` sends data,
   the listener answers every frame with a pure-ACK frame on the same (full) band, the sender
@@ -94,6 +95,7 @@ BCAST_HDR = 2                       # bcast chunk length prefix
 BCAST_IDLE_S = 10.0                 # bcast sender: unkey after this long with nothing queued
 BCAST_BACKLOG_S = 20.0              # bcast sender: older queued bytes beyond this much air time are dropped
 BCAST_LOG_S = 10.0                  # bcast: one progress line per this long
+EC_LOG_S = 10.0                     # duplex ec stream: one progress line per this long
 _TESTS = Path(os.environ.get("MODEMGUI_TESTS_DIR",
                              Path(__file__).resolve().parents[3] / "audiotestserver" / "tests"))
 _dsp_lock = threading.Lock()        # redirect_stdout is process-global: one DSP call at a time
@@ -111,8 +113,12 @@ def _imports():
 
 
 
-KEYUP_LEAD_S = 2.0       # sacrificial lead-in after the air has been quiet: an RTP/SIP leg (jitter buffer, talkspurt
-KEYUP_IDLE_S = 4.0       # restart) re-times the first ~1.5 s of a burst; a frame that starts there loses its sync
+KEYUP_LEAD_S = 2.0       # sacrificial lead-in on every key-up (channel=radio): the transmitter's PTT attack, the far
+                         # squelch / PL decode, and an RTP/SIP leg (jitter buffer, talkspurt restart) all eat the first
+                         # ~1.5 s of a burst; a frame that starts there loses its sync
+KEYUP_IDLE_S = 0.0       # was 4.0: a station that keyed again 1.2-4 s after its own last burst (the short ACK right
+                         # after a DATA) went out with no lead tone at all.  OWN_GAP_S below means every burst is a
+                         # new key-up (the PTT dropped between them), so on a radio each one gets its lead.
 OWN_GAP_S = 1.2          # least quiet between two of OUR bursts.  Our own TX is muted in our capture, so carrier
                          # sense alone let one node key back to back (its ACK, then its DATA 0.9 s later); the
                          # receivers' gate (mesh_rx: 0.8 s closes, 0.7 s splits) then saw ONE burst and lost the 2nd
@@ -134,8 +140,13 @@ def keyup(session, audio: np.ndarray, fs: int, lead_s: float | None = None, idle
     """Prefix ``audio`` with a steady tone when this session has not transmitted for ``idle_s``, like a radio's
     key-up preamble, so a re-timed burst start lands on throw-away audio.  Waits until our previous burst ended
     ``OWN_GAP_S`` ago (so receivers see two bursts), and marks the transmit end time.  The wait and the mark are
-    one step: two threads of one station (an ACK, a DATA) queue their bursts a gap apart, never back to back."""
+    one step: two threads of one station (an ACK, a DATA) queue their bursts a gap apart, never back to back.
+
+    ``session.keyup_tone`` False (OfdmConfig.channel = line: SIP / dialup / fax-modem audio, no PTT, no PL) drops
+    the lead tone; the OWN_GAP_S spacing and the transmit-end mark stay, the receivers' burst gate needs them."""
     lead = KEYUP_LEAD_S if lead_s is None else lead_s
+    if not getattr(session, "keyup_tone", True):
+        lead = 0.0
     idle = KEYUP_IDLE_S if idle_s is None else idle_s
     with _keyup_lock(session):
         while True:
@@ -336,6 +347,15 @@ class OfdmLink:
         self._tx_band = self._rx_band = self._band      # sub-bands once up in full mode
         self._filt = None                               # (far_cfg, my_cfg) in full mode
         self._cdx = None                                # C duplex engine (backend "cdx", mode full)
+        self._ec = None                                 # echo canceller (mode full, duplex ec)
+        # duplex ec sliding window: frames queued by send(), not yet numbered / numbered and unacked (oldest first) /
+        # peer frames kept past a gap {seq: (data, t)}; round trip estimate for the resend timer
+        self._ec_q: collections.deque = collections.deque()
+        self._ec_win: dict = {}
+        self._ec_rxbuf: dict = {}
+        self._ec_srtt = self._ec_rttvar = None
+        self.ec_acked_bytes = self.ec_rx_bytes = 0
+        self._ec_duty_mine = 1.0
         self._cdx_base = None                           # capture index the engine's sample 0 sits at
         self._cdx_box = None                            # {"evt", "ok"} of the send in progress
         self._send_lock = threading.Lock()
@@ -362,6 +382,12 @@ class OfdmLink:
         self.log("ofdm phy: " + ", ".join(f"{k}={v}" for k, v in apply_phy(self.cfg).items()))
         self.log("ofdm config: " + ", ".join(f"{k}={v}" for k, v in self.cfg.to_dict().items()))
         self._stop.clear()
+        if self.cfg.mode == "full" and self.cfg.duplex == "ec":
+            from .ofdm_ec import EchoCanceller
+            self._ec = EchoCanceller(self.cfg.fs, taps=max(1, self.cfg.ec_taps))
+            hooks = getattr(pipe, "tx_onset_hooks", None)
+            if hooks is not None:
+                hooks.append(self._ec.add_ref)       # our own audio on the RX timebase: the canceller's reference
         self._tap = pipe.subscribe(2048)
         self._set_state("handshake")
         for fn, name in ((self._collect, "ofdm-cap"), (self._run, "ofdm-link")):
@@ -383,6 +409,9 @@ class OfdmLink:
         self._cdx = None
         self._cdx_base = None
         pipe = self.session.pipe
+        if self._ec is not None and pipe is not None:
+            with contextlib.suppress(ValueError, AttributeError):
+                pipe.tx_onset_hooks.remove(self._ec.add_ref)
         if self._tap and pipe:
             pipe.unsubscribe(self._tap)
         self._tap = None
@@ -429,8 +458,16 @@ class OfdmLink:
             if b is None:
                 continue
             x = b.samples
-            if b.tx_active and not (self.cfg.hear_own or self.cfg.mode == "full"):
-                x = np.zeros_like(x)             # never decode our own transmission
+            ec = self._ec
+            if ec is not None:
+                ec.add_raw(b.index, x)               # training data: the echo of our own probe
+                if ec.on and self.up:
+                    x = ec.cancel(b.index, x)
+            # never decode our own transmission: mute it, except in full duplex once the far end can talk over it
+            # (fdd: the own-band filter removes it; ec: the canceller, trained at the end of the handshake)
+            full_rx = self.cfg.mode == "full" and (ec is None or self.up)
+            if b.tx_active and not (self.cfg.hear_own or full_rx):
+                x = np.zeros_like(x)
             self._cap.add(x)
             if self._cdx is not None:
                 self._cdx_rx(x)
@@ -522,8 +559,8 @@ class OfdmLink:
                 return
 
     def _play(self, audio: np.ndarray, what: str, ident: bool = False) -> float:
-        if what.startswith(("DATA", "STREAM")):
-            self._defer_for_air()
+        if what.startswith(("DATA", "STREAM")) and self.cfg.mode != "full":
+            self._defer_for_air()                # full duplex: our sub-band is ours alone, the peer is always "on air"
         audio = keyup(self.session, audio, self.cfg.fs)
         air = len(audio) / self.cfg.fs
         now = time.monotonic()
@@ -558,6 +595,8 @@ class OfdmLink:
                     self._windows()
                 elif m == "full" and self._cdx is not None:
                     self._run_cdx()
+                elif m == "full":
+                    self._run_ec()               # ec and fdd: the windowed continuous carrier
                 elif m == "arq" and self.shared_rx:
                     self._stop.wait()            # frames arrive through deliver(); TX runs on the caller's thread
                 elif m in ("full", "arq"):
@@ -647,9 +686,13 @@ class OfdmLink:
         m = c.mode
         if m == "full":
             self._setup_duplex(H)
-            if c.backend == "cdx":
+            if c.backend == "cdx" and c.duplex == "ec":
+                self.log("c engine: its data plane is fdd only (own-band filter); duplex ec runs the python one")
+            elif c.backend == "cdx":
                 self._start_cdx()
-        self.capacity = (self._capacity(H) if m == "half" else 255 - HDR if m in ("oneway", "full", "arq")
+        self.capacity = (self._capacity(H) if m == "half"
+                         else c.chunk_bytes - HDR if m == "full" and self._cdx is None
+                         else 255 - HDR if m in ("oneway", "full", "arq")
                          else c.chunk_bytes - BCAST_HDR if m == "bcast" else MAX_CHUNKS * c.chunk_bytes - 6)
         now_m = time.monotonic()
         self._ev("lock", now_m, now_m, how)
@@ -1059,14 +1102,15 @@ class OfdmLink:
                     self._oneway_rx(H, a, b)
                 scan = b
 
-    def _decode_from(self, H, i0: int, i1: int | None):
-        """(base index, stats, chunks) for the capture slice [i0, i1)."""
+    def _decode_from(self, H, i0: int, i1: int | None, raw_retry: bool = True):
+        """(base index, stats, chunks) for the capture slice [i0, i1).  raw_retry=False: the stream listeners, whose
+        chunk counters never start at 0 and whose raw capture holds our own fdd carrier."""
         c = self.cfg
         base = max(i0, self._cap._start)
         dem = H_dem(H, c, self._rx_bat, self._rx_band)
         with _quiet():
             stats, chunks = dem.decode_samples(self._rx_get(i0, i1))
-            if self._filt and sorted(chunks) != list(range(len(chunks))) or (self._filt and not chunks):
+            if raw_retry and self._filt and (sorted(chunks) != list(range(len(chunks))) or not chunks):
                 # the filter's ringing can cost the first frame; clean audio decodes unfiltered
                 st2, ch2 = dem.decode_samples(self._rx_get(i0, i1, raw=True))
                 if len(ch2) > len(chunks):
@@ -1191,8 +1235,33 @@ class OfdmLink:
         body = len(piece).to_bytes(BCAST_HDR, "big") + piece
         body += b"\0" * (c.chunk_bytes - len(body))
         with _quiet():
-            audio = H.make_data_audio(c.fs, body, bat, band, c.chunk_bytes, seq0=seq, gap=gap)
+            audio = self._bcast_cmod_encode(H, body, seq, bat, band, gap)
+            if audio is None:
+                audio = H.make_data_audio(c.fs, body, bat, band, c.chunk_bytes, seq0=seq, gap=gap)
             return H.scale_hs_tx(audio, c.amplitude, c.fs, is_probe=False, band=band)[0]
+
+    def _bcast_cmod_encode(self, H, body: bytes, seq: int, bat, band, gap: bool):
+        """The chunk on the C modulator (ofdm_mod_encode_ex: the same samples as make_data_audio, graded by
+        ofdm_mod_regress), one per (bat, band); None -> the caller encodes in numpy.  A library that is missing or
+        lacks encode_ex is logged once and the broadcast stays on numpy for the rest of the link."""
+        if getattr(self, "_bcast_cmod_off", False):
+            return None
+        c = self.cfg
+        key = (np.asarray(bat, dtype=np.int32).tobytes(), None if band is None else tuple(np.asarray(band).tolist()))
+        cache = self.__dict__.setdefault("_bcast_cmods", {})
+        try:
+            mod = cache.get(key)
+            if mod is None:
+                from .ofdm_cmod import CMod
+                mod = cache[key] = CMod(H.hs_data_cfg(c.fs, band, c.chunk_bytes), bat)
+                if len(cache) == 1:
+                    self.log("bcast encoder: c (libofdm ofdm_mod_encode_ex)")
+            with self.__dict__.setdefault("_bcast_cmod_lock", threading.Lock()):
+                return mod.encode(body, seq, gap)
+        except Exception as e:                       # NativeError, OSError: no/stale/foreign library
+            self._bcast_cmod_off = True
+            self.log(f"bcast encoder: numpy ({e})")
+            return None
 
     def _bcast_rate(self, H, bat, band) -> tuple[int, float]:
         """(samples per chunk, payload bytes/s while keyed) of a carrier modulated with ``bat``."""
@@ -1284,9 +1353,10 @@ class OfdmLink:
             if now - st["t_poll"] < c.stream_poll_s:
                 continue
             st["t_poll"] = now
-            base, stats, chunks = self._decode_from(H, st["frm"] - int(0.2 * fs), None)
+            base, stats, chunks = self._decode_from(H, st["frm"] - int(0.2 * fs), None, raw_retry=False)
             evm = {s["seq"]: s.get("evm_pct", 0.0) for s in stats if s.get("seq") in chunks}
             got = sorted((base + int(s["frame_start"]), s["seq"]) for s in stats if s.get("seq") in chunks)
+            got = self._ec_fill(H, got, chunks, evm)
             for start, seq in got:
                 if st["last"] is None:
                     self.log(f"bcast lock at seq={seq}")
@@ -1344,13 +1414,109 @@ class OfdmLink:
         by_bin = dict(zip(self._data_bins(full_cfg), (int(b) for b in full_bat)))
         return np.array([by_bin.get(b, 1) for b in self._data_bins(sub_cfg)], dtype=np.int32)
 
+    def _bits_dl_frac(self, full: dict, plan_fn) -> tuple[float, int, int]:
+        """duplex_split=bits: the Hz share (for ``plan_duplex_bands``) that gives the responder ``dl_frac`` of the
+        capacity.  ul = the initiator's TX table, dl = the responder's: both ends hold both after the exchange, so
+        both compute the same split.  Returns (hz share, ul bits, dl bits); (cfg share, 0, 0) without usable tables."""
+        c = self.cfg
+        ul_bat, dl_bat = ((self._tx_bat, self._rx_bat) if self.role == "initiator"
+                          else (self._rx_bat, self._tx_bat))
+        hz = np.array(self._data_bins(full), np.float64) * c.fs / full["n_fft"]
+        ul_bat, dl_bat = np.asarray(ul_bat, np.int64), np.asarray(dl_bat, np.int64)
+        if len(ul_bat) != len(hz) or len(dl_bat) != len(hz) or not (ul_bat.sum() and dl_bat.sum()):
+            return self._share(), 0, 0
+        lo, hi, guard = float(c.freq_lo), float(c.freq_hi), float(c.duplex_guard_hz)
+        usable = hi - lo - guard
+        min_bw = plan_fn(0.5)["min_bw_hz"]
+        step = c.fs / full["n_fft"]
+        best = None
+        ul_bw = min_bw
+        while ul_bw <= usable - min_bw + 1e-9:
+            edge = lo + ul_bw
+            ub = int(ul_bat[hz <= edge].sum())
+            db = int(dl_bat[hz >= edge + guard].sum())
+            if ub + db:
+                err = abs(db / (ub + db) - self._share())
+                if best is None or err < best[0] - 1e-9:
+                    best = (err, ul_bw, ub, db)
+            ul_bw += step
+        if best is None:
+            return self._share(), 0, 0
+        _, ul_bw, ub, db = best
+        return (usable - ul_bw) / usable, ub, db
+
+    @staticmethod
+    def _ec_duty(rate_i: float, rate_r: float, dl_frac: float, strict: bool = False) -> tuple[float, float]:
+        """duplex ec: (duty_initiator, duty_responder) -- the fraction of its chunks in which each end may carry a
+        data frame (fillers, which still carry its ACKs, fill the rest; a credit of ``duty`` per chunk, spent 1 per
+        data chunk, so 0.11 = about 1 chunk in 9).  ``rate_*`` = payload bytes/s of each direction's carrier at
+        the rate its own BAT measured.  Not strict (``dl_frac``) and 0.5 = no cap (V.34: each direction runs what
+        its line supports); otherwise the end over its share is held to it: share = duty*mine / (other +
+        duty*mine).  ``strict`` (the share came from ``ratio``) enforces 50/50 as well, holding the faster
+        direction to the slower one's rate.
+
+        The cap is deliberately NOT a trimmed BAT: zero-bit carriers (a table trimmed to ~half its bits) made
+        back-to-back chunks undecodable 1 time in 3 even on a clean loop (2026-11-13), so the PHY keeps its
+        measured tables and the share is enforced by the link."""
+        if rate_i <= 0 or rate_r <= 0 or (abs(dl_frac - 0.5) < 1e-9 and not strict):
+            return 1.0, 1.0
+        # the responder's share at full duty on both ends; whoever is over its share gets capped
+        free = rate_r / (rate_i + rate_r)
+        if abs(free - dl_frac) < 1e-9:
+            return 1.0, 1.0
+        capped_r = free > dl_frac
+        f = dl_frac if capped_r else 1.0 - dl_frac
+        mine, other = (rate_r, rate_i) if capped_r else (rate_i, rate_r)
+        duty = min(1.0, f * other / ((1.0 - f) * mine))
+        return (1.0, duty) if capped_r else (duty, 1.0)
+
+    def _share(self) -> float:
+        return self.cfg.responder_share()[0]
+
+    def _setup_ec(self, H) -> None:
+        """duplex ec: the whole band both ways, each direction on the table measured for it; the canceller trains
+        on the echo of our own probe (the longest thing we played in the handshake, the far end listening)."""
+        c = self.cfg
+        initiator = self.role == "initiator"
+        full = H.hs_data_cfg(c.fs, self._band, c.chunk_bytes)
+        self._tx_band = self._rx_band = self._band
+        self._filt = None
+        self._dup_cfgs = (full, full)
+        # payload bytes/s of each direction's continuous carrier, from the chunk length its table gives
+        r_tx = (c.chunk_bytes - HDR) * c.fs / len(self._ec_chunk_audio(H, b"", 0))
+        r_rx = (c.chunk_bytes - HDR) * c.fs / len(self._ec_chunk_audio(H, b"", 0, bat=self._rx_bat))
+        rate_i, rate_r = (r_tx, r_rx) if initiator else (r_rx, r_tx)
+        d_i, d_r = self._ec_duty(rate_i, rate_r, *c.responder_share())
+        self._ec_duty_mine = d_i if initiator else d_r
+        share = rate_r * d_r / (rate_i * d_i + rate_r * d_r)
+        st = (self._ec.train() if self._ec is not None and c.ec_taps > 0
+              else {"on": False, "why": "ec_taps=0"})
+        if self._ec is not None and c.ec_taps <= 0:
+            self._ec.on = False
+        self.plan = {"duplex": "ec", "echo": st, "duty": (d_i, d_r), "rates": (rate_i, rate_r), "share": share}
+        echo = (f"canceller on: delay {st['delay_ms']} ms, {st['taps']} taps, training ERLE {st['erle_db']} dB, "
+                f"corr {st['corr']}" if st.get("on") else f"canceller off ({st.get('why')}"
+                + (f", corr {st['corr']}" if "corr" in st else "") + ")")
+        self.log(f"duplex tx {self._band[0]:.0f}-{self._band[1]:.0f} Hz rx {self._band[0]:.0f}-{self._band[1]:.0f} Hz"
+                 f" tx_bits={int(np.asarray(self._tx_bat).sum())} rx_bits={int(np.asarray(self._rx_bat).sum())}"
+                 f" (ec: {echo}; data duty initiator {d_i:.2f} responder {d_r:.2f}, window {c.ec_window}, carriers {rate_i * 8:.0f}/"
+                 f"{rate_r * 8:.0f} bit/s, responder share {share:.2f})")
+
     def _setup_duplex(self, H) -> None:
+        if self.cfg.duplex == "ec":
+            self._setup_ec(H)
+            return
         from ofdm_fdd import plan_duplex_bands
         c = self.cfg
         full = H.hs_data_cfg(c.fs, self._band, c.chunk_bytes)
-        plan = self.plan = plan_duplex_bands(c.freq_lo, c.freq_hi, c.dl_frac, c.duplex_guard_hz,
-                                             full["n_fft"], full["cp_ratio"], c.fs,
-                                             full["pilot_spacing"], 100.0, "high")
+        plan_fn = lambda frac: plan_duplex_bands(c.freq_lo, c.freq_hi, frac, c.duplex_guard_hz,
+                                                 full["n_fft"], full["cp_ratio"], c.fs,
+                                                 full["pilot_spacing"], 100.0, "high")
+        frac, ub, db = (self._bits_dl_frac(full, plan_fn) if c.duplex_split == "bits" else (self._share(), 0, 0))
+        plan = self.plan = plan_fn(frac)
+        if ub + db:
+            self.log(f"duplex split by bits: responder share {self._share():.2f} of {ub + db} bits/symbol "
+                     f"(initiator {ub}, responder {db}) -> {plan['dl_frac_actual']:.2f} of the band in Hz")
         ul, dl = tuple(plan["ul_hz"]), tuple(plan["dl_hz"])
         mine, far = (ul, dl) if self.role == "initiator" else (dl, ul)
         mc, fc = H.hs_data_cfg(c.fs, mine, c.chunk_bytes), H.hs_data_cfg(c.fs, far, c.chunk_bytes)
@@ -1360,6 +1526,7 @@ class OfdmLink:
         self._filt = (fc, mc)
         self._dup_cfgs = (mc, fc)
         self.log(f"duplex tx {mine[0]:.0f}-{mine[1]:.0f} Hz rx {far[0]:.0f}-{far[1]:.0f} Hz"
+                 f" tx_bits={int(self._tx_bat.sum())} rx_bits={int(self._rx_bat.sum())}"
                  + (f" (harmonics overlap: {plan['harmonic_overlap']})"
                     if plan["harmonic_overlap"] else ""))
 
@@ -1446,6 +1613,332 @@ class OfdmLink:
                        else f"ACK ack={ack}", ident=True)
             self.last_activity = time.monotonic()
             self._stop.wait(self.cfg.gap_s)        # quiet so our bursts never run together
+
+    # -- full duplex, echo cancelled: a continuous carrier (V.34 style) ------------------------------------------
+    #
+    # A line has no airtime to save and a receiver that re-acquires every burst loses lock in between, so once up
+    # each end keeps its carrier on for good: one chunk queued ahead of the sink at all times, no keyup, no gap, no
+    # unkey.  Every chunk is one frame [src|dst, seq, ack, len, crc] on its own preamble with a running 16-bit chunk
+    # counter; it carries the in-flight DATA when that is due (first send, or a resend after ack_wait_s), else a
+    # filler (len 0).  Every chunk carries our current ack, so ACKs ride the stream: there are no ACK bursts.
+
+    @property
+    def _tag(self) -> str:
+        """Log prefix of the continuous-carrier data plane: 'ec' (echo cancelled) or 'fdd' (band split)."""
+        return "ec" if self.cfg.duplex == "ec" else "fdd"
+
+    def _ec_chunk_audio(self, H, body: bytes, cseq: int, bat=None, band=None) -> np.ndarray:
+        """One stream chunk on our tx band, or (bat=, band=) the peer's, to size what we receive."""
+        c = self.cfg
+        body = body + b"\0" * (c.chunk_bytes - len(body))
+        bat = self._tx_bat if bat is None else bat
+        band = self._tx_band if band is None else band
+        with _quiet():
+            audio = H.make_data_audio(c.fs, body, bat, band, c.chunk_bytes, seq0=cseq, gap=False)
+            return H.scale_hs_tx(audio, c.amplitude, c.fs, is_probe=False, band=band)[0]
+
+    def _far_busy(self, look_s: float) -> bool:
+        """The peer's carrier is on the line.  fdd: judged on the own-band-filtered capture, since our own carrier
+        is always there in the raw one."""
+        if not self._filt:
+            return self._air_busy(look_s)
+        if getattr(self.session, "ignore_busy", False):
+            return False
+        x = self._rx_get(self._cap.n - int(look_s * self.cfg.fs))
+        return len(x) > 0 and float(np.sqrt(np.mean(x * x))) > self._thr()
+
+    def _run_ec(self) -> None:
+        t = threading.Thread(target=self._ec_tx, name="ofdm-ec-tx", daemon=True)
+        t.start()
+        self._threads.append(t)
+        self._ec_listen()
+
+    # Sliding window (LAPM style, k = ec_window): send() queues its pieces and returns once all are acked; the TX
+    # loop numbers queued pieces into the window while it has room and puts one data frame per chunk on the air,
+    # subject to the duty credit.  ack = the next seq the peer wants (cumulative); the peer keeps frames that land
+    # past a gap.  The stream is FIFO, so only the OLDEST unacked frame can be missing for real: it alone has a
+    # resend timer (srtt + 4 rttvar, Karn's rule, at most ack_wait_s); an ack that moves but stops short of what we
+    # sent before that resend names the next hole, which then goes out at once.
+
+    def _ec_rto(self) -> float:
+        c = self.cfg
+        if self._ec_srtt is None:
+            return c.ack_wait_s
+        # floor: both ends decode once per stream_poll_s, so an ack can lag a poll at each end
+        return min(c.ack_wait_s, max(2.0 * c.stream_poll_s, self._ec_srtt + 4.0 * self._ec_rttvar))
+
+    def _ec_pick_locked(self, now: float, t_end: float):
+        """Number queued pieces into the window and pick the frame this chunk carries (or None).  Fails the oldest
+        frame once it has used up its retries."""
+        c = self.cfg
+        while self._ec_q and len(self._ec_win) < max(1, c.ec_window):
+            f = self._ec_q.popleft()
+            f["seq"], self._tx_seq = self._tx_seq, (self._tx_seq + 1) & 0xFF
+            self._ec_win[f["seq"]] = f
+        if not self._ec_win:
+            return None
+        old = next(iter(self._ec_win.values()))
+        if old["sent"] is not None and now >= old["sent"] + self._ec_rto():
+            if old["sends"] > c.retries:
+                del self._ec_win[old["seq"]]
+                self.fail_count += 1
+                self._ev("fail", now, now, f"seq={old['seq']}: no ACK after {c.retries} retries")
+                self.log(f"{self._tag}: seq={old['seq']} failed after {c.retries} retries")
+                old["box"]["ok"] = False
+                old["box"]["evt"].set()
+                return self._ec_pick_locked(now, t_end)
+            pick = old
+        else:
+            pick = next((f for f in self._ec_win.values() if f["sent"] is None), None)
+        if pick is not None:
+            pick["sends"] += 1
+            pick["sent"] = t_end                     # on the air until then; its ACK clock starts there
+        return pick
+
+    def _ec_acked_locked(self, ack: int, now: float) -> None:
+        done = [s for s in self._ec_win if 1 <= ((ack - s) & 0xFF) <= 128]
+        # one RTT sample per ack, from the OLDEST frame it covers (the peer decodes and acks in jumps, one per
+        # stream poll, so the newest frame of a jump under-reads the round trip by up to a poll and a timer built on
+        # it fires early), and only when nothing it covers was resent: a resent frame's ack is ambiguous (Karn) and
+        # the frames behind a hole were held by it, not by the line
+        clean = done and all(self._ec_win[s]["sends"] == 1 for s in done)
+        for seq in done:
+            f = self._ec_win.pop(seq)
+            if clean and seq == done[0] and f["sent"] is not None:
+                r = max(0.0, now - f["sent"])
+                if self._ec_srtt is None:
+                    self._ec_srtt, self._ec_rttvar = r, r / 2
+                else:
+                    self._ec_rttvar = 0.75 * self._ec_rttvar + 0.25 * abs(self._ec_srtt - r)
+                    self._ec_srtt = 0.875 * self._ec_srtt + 0.125 * r
+            self.ec_acked_bytes += len(f["data"])
+            self._ev("ack", now, now, f"seq={seq}")
+            box = f["box"]
+            box["left"] -= 1
+            if box["left"] <= 0:
+                box["evt"].set()
+
+    def _on_frame_ec(self, seq: int, ack: int, data: bytes) -> None:
+        """A chunk from the peer's stream: its ack clears our window, its data goes into the receive window."""
+        c, now, out = self.cfg, time.monotonic(), []
+        with self._lock:
+            self._ec_acked_locked(ack, now)
+            if data:
+                d = (seq - self._rx_next) & 0xFF
+                if d >= 128:
+                    pass                                                # a resend of what we already have
+                elif d == 0:
+                    out.append(data)
+                    self._rx_next = (seq + 1) & 0xFF
+                elif seq not in self._ec_rxbuf:
+                    self._ec_rxbuf[seq] = (data, now)
+            # a hole the sender gave up on (it failed that frame): skip it rather than hold the rest for good
+            skip_s = (c.retries + 2) * c.ack_wait_s
+            if self._ec_rxbuf and self._rx_next not in self._ec_rxbuf:
+                oldest = min(t for _, t in self._ec_rxbuf.values())
+                if now - oldest > skip_s:
+                    nxt = min(self._ec_rxbuf, key=lambda s: (s - self._rx_next) & 0xFF)
+                    self.log(f"{self._tag} rx: gap {self._rx_next}..{(nxt - 1) & 0xFF} never filled, skipped")
+                    self._rx_next = nxt
+            while self._rx_next in self._ec_rxbuf:
+                out.append(self._ec_rxbuf.pop(self._rx_next)[0])
+                self._rx_next = (self._rx_next + 1) & 0xFF
+            for s_ in [s_ for s_ in self._ec_rxbuf if ((s_ - self._rx_next) & 0xFF) >= 128]:
+                del self._ec_rxbuf[s_]
+            self.ec_rx_bytes += sum(len(x) for x in out)
+        if self.on_data:
+            for x in out:
+                self.on_data(x)
+
+    def _ec_tx(self) -> None:
+        H, _ = _imports()
+        c, pipe, fs = self.cfg, self.session.pipe, self.cfg.fs
+        n_one = len(self._ec_chunk_audio(H, b"", 0))
+        self.phy_bps = (c.chunk_bytes - HDR) * 8 * fs / n_one
+        self.log(f"{self._tag} carrier up: continuous, {n_one / fs:.2f} s per {c.chunk_bytes} B chunk, "
+                 f"{self.phy_bps:.0f} bit/s payload, window {c.ec_window}")
+        cseq, t_log = 0, time.monotonic()
+        duty = min(1.0, max(1e-3, self._ec_duty_mine))
+        credit = 1.0
+        tot = dict(chunks=0, data=0, fill=0, resend=0, underrun=0)
+        if duty < 1.0:
+            self.log(f"{self._tag} data duty: {duty:.2f} of chunks may carry data (responder share {self._share():.2f})")
+        try:
+            while not self._stop.is_set():
+                pending = pipe.tx_pending
+                if pending > n_one // 2:                       # one chunk ahead is enough
+                    self._stop.wait(min(0.05, (pending - n_one // 2) / fs))
+                    continue
+                if pending == 0 and tot["chunks"]:
+                    tot["underrun"] += 1                         # the carrier broke: we were late
+                now = time.monotonic()
+                t0 = now + pending / fs
+                credit = min(1.0, credit + duty)
+                with self._lock:
+                    nxt, last = self._rx_next, (self._tx_seq - 1) & 0xFF
+                    send = self._ec_pick_locked(now, t0 + n_one / fs) if credit >= 1.0 - 1e-9 else None
+                    self._owe_ack = False
+                    inflight = len(self._ec_win)
+                if send is not None:
+                    credit -= 1.0
+                    body = self._pack(send["seq"], nxt, send["data"])
+                    what = f"DATA seq={send['seq']} ack={nxt} {len(send['data'])}B"
+                    tot["data"] += 1
+                    if send["sends"] > 1:
+                        tot["resend"] += 1
+                        self.retry_count += 1
+                        self._ev("retry", now, now, f"seq={send['seq']} attempt {send['sends'] - 1}")
+                        if self.on_retry:
+                            self.on_retry(send["sends"] - 1)
+                else:
+                    body = self._pack(last, nxt, b"")
+                    tot["fill"] += 1
+                audio = self._ec_chunk_audio(H, body, cseq)
+                self.session._keyup_end = t0 + len(audio) / fs
+                self.session.play(audio, ident=False)
+                self.tx_frames += 1
+                tot["chunks"] += 1
+                if send is not None:
+                    self._ev("tx", t0, t0 + len(audio) / fs, what)
+                    self.log(f"tx {what} (stream chunk {cseq}, {len(audio) / fs:.2f}s, {inflight} in flight)")
+                cseq = (cseq + 1) & 0xFFFF
+                if now - t_log >= EC_LOG_S:
+                    t_log = now
+                    self.log(f"{self._tag} tx: chunks={tot['chunks']} data={tot['data']} filler={tot['fill']} "
+                             f"resends={tot['resend']} underruns={tot['underrun']} acked_bytes={self.ec_acked_bytes} "
+                             f"in_flight={inflight} queued={len(self._ec_q)} rto={self._ec_rto():.1f}")
+        finally:
+            self.log(f"{self._tag} carrier down: chunks={tot['chunks']} data={tot['data']} filler={tot['fill']} "
+                     f"resends={tot['resend']} underruns={tot['underrun']} acked_bytes={self.ec_acked_bytes}")
+            with self._lock:
+                left = list(self._ec_win.values()) + list(self._ec_q)
+                self._ec_win.clear(); self._ec_q.clear()
+            for f in left:
+                f["box"]["ok"] = False
+                f["box"]["evt"].set()
+
+    def _send_ec(self, data: bytes) -> bool:
+        """Queue the pieces for the window and wait until the peer has acked all of them (False as soon as one
+        fails after its retries, or the link stops).  Several callers may send at once; their pieces interleave
+        in the window, each caller's in order."""
+        c = self.cfg
+        if not self._up.wait(c.hs_timeout_s):
+            return False
+        room = c.chunk_bytes - HDR
+        pieces = [data[i:i + room] for i in range(0, len(data), room)]
+        if not pieces:
+            return True
+        box = dict(evt=threading.Event(), left=len(pieces), ok=True)
+        with self._lock:
+            for p in pieces:
+                self._ec_q.append(dict(data=p, box=box, sends=0, sent=None))
+        while not box["evt"].wait(1.0):
+            if self._stop.is_set():
+                return False
+        return box["ok"] and box["left"] <= 0
+
+    def _ec_fill(self, H, got: list, chunks: dict, evm: dict) -> list:
+        """Timing recovery for the back-to-back stream.  The frame search finds a preamble by the RISING edge of its
+        Schmidl-Cox metric; with no gap between chunks the previous chunk's last symbols can hold the metric above
+        threshold right into the next preamble, so that preamble has no edge and is never tried -- data-dependent,
+        about 1 data chunk in 3 on a full bulk stream (2026-11-13).  The stream's chunk length is fixed, so a chunk
+        missing between two decoded ones sits at a known place: demodulate it there (matched-filter snap only)."""
+        if len(got) < 2:
+            return got
+        c = self.cfg
+        if getattr(self, "_ec_rx_len", None) is None:
+            self._ec_rx_len = len(self._ec_chunk_audio(H, b"", 0, bat=self._rx_bat, band=self._rx_band))
+            self._ec_dem = H_dem(H, c, self._rx_bat, self._rx_band)
+        L, dem, pad = self._ec_rx_len, self._ec_dem, self.cfg.fs // 50
+        extra = []
+        for (s1, c1), (s2, c2) in zip(got, got[1:]):
+            dk = (c2 - c1) & 0xFFFF
+            if not 2 <= dk <= 16 or abs((s2 - s1) - dk * L) > L // 20:
+                continue
+            for j in range(1, dk):
+                cs, pos = (c1 + j) & 0xFFFF, s1 + round(j * (s2 - s1) / dk)
+                x = self._rx_get(pos - pad, pos + L + pad)
+                if x is None or len(x) < L + pad:
+                    continue
+                with _quiet():
+                    start, _score = dem._sc_match(x, pad)
+                    fr = dem._decode_frame(x, start)
+                if fr is None or fr.get("seq") != cs or "_chunk" not in fr:
+                    continue
+                chunks[cs] = fr["_chunk"]
+                evm[cs] = fr.get("evm_pct", 0.0)
+                extra.append((pos - pad + start, cs))
+        if extra:
+            self.ec_refilled = getattr(self, "ec_refilled", 0) + len(extra)
+        return sorted(got + extra)
+
+    def _ec_listen(self) -> None:
+        """Lock on the peer's carrier once and follow its chunk counter (as the bcast listener does); every chunk
+        is a frame for the ARQ.  A chunk-counter gap is counted in ``lost_frames``; ARQ resends what mattered."""
+        H, _ = _imports()
+        c, fs = self.cfg, self.cfg.fs
+        scan = max(self._hs_rx_end, self._cap._start)
+        st = None
+        while not self._stop.wait(0.25):
+            n, now = self._cap.n, time.monotonic()
+            if st is None:
+                spans = self._bursts(scan, n, gap_s=max(c.hang_s, 0.5))
+                if not spans:
+                    scan = max(scan, n - fs)
+                    continue
+                st = dict(frm=spans[0][0], last=None, t_poll=0.0, t_got=now, chunks=0, data=0, lost=0, t_log=now)
+                self.log(f"{self._tag}: far carrier heard, acquiring")
+            if now - st["t_poll"] < c.stream_poll_s:
+                continue
+            st["t_poll"] = now
+            base, stats, chunks = self._decode_from(H, st["frm"] - int(0.2 * fs), None, raw_retry=False)
+            evm = {s["seq"]: s.get("evm_pct", 0.0) for s in stats if s.get("seq") in chunks}
+            got = sorted((base + int(s["frame_start"]), s["seq"]) for s in stats if s.get("seq") in chunks)
+            got = self._ec_fill(H, got, chunks, evm)
+            for start, cs in got:
+                if st["last"] is None:
+                    self.log(f"{self._tag}: lock at chunk {cs}")
+                    self._ev("lock", self._cap.t_of(start), self._cap.t_of(start), f"{self._tag} chunk {cs}")
+                else:
+                    d = (cs - st["last"]) & 0xFFFF
+                    if d == 0 or d >= 0x8000:
+                        continue
+                    if d > 1:
+                        st["lost"] += d - 1
+                        self.lost_frames += d - 1
+                        self.log(f"{self._tag}: {d - 1} chunk(s) lost before chunk {cs} (total lost={st['lost']})")
+                st["last"], st["frm"], st["t_got"] = cs, start + 1, now
+                st["chunks"] += 1
+                fr = self._frame_from({0: chunks[cs]})
+                if fr is None:
+                    self.rx_errors += 1
+                    continue
+                if fr is False:
+                    continue
+                seq, ack, data = fr
+                t0 = self._cap.t_of(start)
+                if self.rx_filter and not self.rx_filter({"seq": seq, "ack": ack, "len": len(data)}):
+                    self.log(f"rx seq={seq} dropped by filter")
+                    continue
+                if data:
+                    self.rx_frames += 1
+                    st["data"] += 1
+                    self._ev("rx", t0, t0, f"DATA seq={seq} ack={ack} {len(data)}B evm={evm.get(cs, 0.0):.1f}%")
+                self.last_activity = time.monotonic()
+                self._on_frame_ec(seq, ack, data)
+            if not got:
+                if n - st["frm"] > 6 * fs:
+                    st["frm"] = n - 2 * fs
+                if now - st["t_got"] > STREAM_STALL_S + 2 * c.stream_poll_s and not self._far_busy(STREAM_STALL_S):
+                    self.log(f"{self._tag}: far carrier lost after chunk {st['last']}: chunks={st['chunks']} "
+                             f"data={st['data']} lost={st['lost']}")
+                    self._ev("err", now, now, f"{self._tag} carrier lost")
+                    st, scan = None, n
+                    continue
+            if now - st["t_log"] >= EC_LOG_S:
+                st["t_log"] = now
+                self.log(f"{self._tag} rx: chunk={st['last']} chunks={st['chunks']} data={st['data']} lost={st['lost']} "
+                         f"bytes={self.ec_rx_bytes} held={len(self._ec_rxbuf)} refilled={getattr(self, 'ec_refilled', 0)}")
 
     # -- full duplex, C engine (backend "cdx") ------------------------------
 
@@ -1549,41 +2042,7 @@ class OfdmLink:
     def _send_full(self, data: bytes) -> bool:
         if self._cdx is not None:
             return self._send_full_c(data)
-        c = self.cfg
-        if not self._up.wait(c.hs_timeout_s):
-            return False
-        for i in range(0, max(len(data), 1), self.capacity):
-            piece = data[i:i + self.capacity]
-            if not piece:
-                break
-            with self._lock:
-                seq, self._tx_seq = self._tx_seq, (self._tx_seq + 1) & 0xFF
-                self._inflight = dict(seq=seq, data=piece, sends=0)
-                self._ack_evt.clear()
-            ok = False
-            for attempt in range(c.retries + 1):
-                if self._stop.is_set():
-                    return False
-                if attempt:
-                    self.retry_count += 1
-                    now = time.monotonic()
-                    self._ev("retry", now, now, f"attempt {attempt}")
-                    if self.on_retry:
-                        self.on_retry(attempt)
-                with self._lock:
-                    nxt = self._rx_next
-                self._tx_frame_full(seq, nxt, piece)
-                if self._ack_evt.wait(c.ack_wait_s):
-                    ok = True
-                    break
-            with self._lock:
-                self._inflight = None
-            if not ok:
-                self.fail_count += 1
-                now = time.monotonic()
-                self._ev("fail", now, now, f"no ACK after {c.retries} retries")
-                return False
-        return True
+        return self._send_ec(data)               # ec and fdd: the sliding window on the continuous carrier
 
 
 def H_dem(H, c: OfdmConfig, bat, band):

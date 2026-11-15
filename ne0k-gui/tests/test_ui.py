@@ -93,20 +93,47 @@ def _link_events(t=100.0):
 
 
 def test_pianoroll_lanes_dots_and_scroll(win, qtbot):
-    for ev in _link_events():
+    import time
+    t = time.monotonic() - 40.0                             # inside the default 60 s window
+    for ev in _link_events(t):
         win.session._emit(ev)
     qtbot.waitUntil(lambda: len(win.linklog.events) == 7, timeout=2000)
     pr = win.pianoroll
+    qtbot.waitUntil(lambda: len(pr.dots.points()) == 7, timeout=2000)   # drawn by the next tick
     assert pr._lanes == {1: 0, 2: 1}                       # one lane per participant
-    assert len(pr.dots.points()) == 7
     assert len(pr.curves["tx"].xData) == 4 and len(pr.curves["rx"].xData) == 2
     # horizontal scroll: moving the bar leaves live-follow and shifts the x range
-    pr.t_origin = 100.0
+    pr.t_origin = t - 200.0                                # live edge far right: the bar has room to move
     pr.refresh()
     pr.scroll.setValue(0)
     assert not pr.follow.isChecked()
     assert pr.plot.getViewBox().viewRange()[0][0] == pytest.approx(0, abs=0.2)
     assert "ERR: 1" in pr.summary.text() and "retry: 1" in pr.summary.text()
+
+
+def test_event_views_redraw_per_tick_and_only_what_is_on_screen(win, qtbot, monkeypatch):
+    """A full-duplex bulk stream logs ~15 events/s into a 4000-event log.  A whole-log redraw per event pegged the
+    GUI thread and starved the modem threads of the GIL (TX underruns, dropped chunks, 2026-11-13): events only mark
+    the views dirty, a tick redraws, and a redraw walks back from the newest event to the visible window."""
+    import time
+    from modemgui.engine import LinkEvent
+    from modemgui.ui import pianoroll as prm
+    pr = win.pianoroll
+    now = time.monotonic()
+    for i in range(3990):                                  # an hour of history, one event a second
+        win.linklog.add(LinkEvent("tx", 1, 2, now - 4000 + i, now - 3999.8 + i, "old"))
+    calls = []
+    real = pr.refresh
+    monkeypatch.setattr(pr, "refresh", lambda: (calls.append(1), real()))
+    seen = []
+    real_window = prm.LinkLog.window
+    monkeypatch.setattr(prm.LinkLog, "window", lambda self, a, b: seen.append(real_window(self, a, b)) or seen[-1])
+    for i in range(200):                                   # a burst: 200 events at once
+        pr.on_link(LinkEvent("ack", 1, 2, now - 1 + i * 1e-3, now - 1 + i * 1e-3, "seq"))
+    assert not calls                                       # nothing drawn per event
+    qtbot.waitUntil(lambda: bool(calls), timeout=2000)
+    assert len(calls) <= 3
+    assert seen and max(len(w) for w in seen) < 300       # the last minute, not the hour
 
 
 def test_spectrogram_event_overlay(win, qtbot):

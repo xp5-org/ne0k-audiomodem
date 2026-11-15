@@ -31,7 +31,8 @@ CSSC  := $(REF)/CSS/c
 RSC   := $(REF)/c
 
 OFDM_SRC := $(addprefix $(OFDMC)/,ofdm_acq.c ofdm_dem.c ofdm_fft.c ofdm_cfg.c ofdm_sym.c \
-            ofdm_mod.c ofdm_probe.c ofdm_sync.c ofdm_frame.c ofdm_fdd.c ofdm_dx.c ofdm_arq.c ofdm_rxf.c ofdm_rxs.c) $(RSC)/rs255.c
+            ofdm_mod.c ofdm_probe.c ofdm_sync.c ofdm_frame.c ofdm_fdd.c ofdm_dx.c ofdm_arq.c ofdm_rxf.c ofdm_rxs.c \
+            ofdm_cx.c ofdm_cxmod.c ofdm_cxsync.c ofdm_cxdem.c ofdm_cxacq.c ofdm_cxprobe.c ofdm_cxfec.c) $(RSC)/rs255.c
 CSSMF_SRC  := $(addprefix $(CSSC)/,css_mf.c css_fft.c)
 CSSENC_SRC := $(addprefix $(CSSC)/,css_enc.c css_dec.c)
 

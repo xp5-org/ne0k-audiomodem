@@ -66,9 +66,12 @@ _SEED_CE    = 0x3D5F
 _SEED_PROBE = 0x7A3F
 _SEED_SYNC  = 0x1B4E
 _SEED_SC    = 0x3D5F ^ 0xFFFF   # = _SEED_CE ^ 0xFFFF
-# Base seed for the probe's NON-PERIODIC measurement segment.  Symbol j carries
-# _known_bpsk(n_occupied, _SEED_MEAS + j), so consecutive symbols are
-# uncorrelated -- see ChannelProbe.build for why that is the whole point.
+# Start of the probe's NON-PERIODIC measurement segment: ONE PRBS stream from
+# this seed, symbol j taking bits j*n_occupied .. (j+1)*n_occupied-1
+# (_known_bpsk_stream), so consecutive symbols are uncorrelated on every
+# carrier -- see ChannelProbe.build for why that is the whole point.  (Seeding
+# symbol j with _SEED_MEAS + j left carriers 0..~10 identical in every symbol:
+# the output is the LFSR's top bit and adjacent seeds differ only low down.)
 _SEED_MEAS  = 0x51C7
 
 # -
@@ -369,6 +372,13 @@ def _prbs(length: int, seed: int = _SEED_DATA) -> np.ndarray:
 def _known_bpsk(n: int, seed: int) -> np.ndarray:
     pn = _prbs(n, seed)
     return (1.0 - 2.0 * pn.astype(float)).astype(complex) / math.sqrt(2)
+
+
+def _known_bpsk_stream(n: int, count: int, seed: int) -> list:
+    """``count`` consecutive n-carrier slices of one PRBS stream from ``seed``
+    (ofdm_known_bpsk_next chained in the C)."""
+    s = _known_bpsk(n * count, seed)
+    return [s[j * n:(j + 1) * n].copy() for j in range(count)]
 
 
 # Amplitude boost applied to the DATA FRAME's CE and SYNC symbols, and to
@@ -1051,8 +1061,8 @@ class ChannelProbe:
         self.probe_known = _known_bpsk(self.n_occupied, _SEED_PROBE)
         self.n_meas_syms = int(cfg.get('n_probe_meas_syms', 0))
         # One independent known pattern per measurement symbol.
-        self.meas_known = [_known_bpsk(self.n_occupied, _SEED_MEAS + j)
-                           for j in range(self.n_meas_syms)]
+        self.meas_known = _known_bpsk_stream(self.n_occupied, self.n_meas_syms,
+                                             _SEED_MEAS)
 
     def build(self) -> np.ndarray:
         """Build probe audio: SC + CE + periodic block + measurement block.

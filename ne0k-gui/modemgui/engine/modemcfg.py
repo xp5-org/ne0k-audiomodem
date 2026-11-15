@@ -94,6 +94,10 @@ class OfdmConfig(_Config):
     ``chunk_bytes`` and the band; the BAT exchange only settles the bit loading."""
     node_id: int = F(1, "Node id", "Link", "", 0, 255)
     peer_id: int = F(2, "Peer id", "Link", "", 0, 255)
+    channel: str = F("radio", "Channel", "Link",
+                     "radio = a keyed transmitter: every burst starts with a 2 s 1000 Hz key-up (PL) lead tone for the "
+                     "PTT, squelch and the far end's receive gate.  line = SIP / dialup / fax-modem audio: no PTT, no "
+                     "lead tone, the frame goes out as is.", choices=["radio", "line"])
     role: str = F("auto", "Role", "Link", "auto = the lower node id initiates.",
                   choices=["auto", "initiator", "responder"])
     mode: str = F("half", "Mode", "Link",
@@ -146,8 +150,35 @@ class OfdmConfig(_Config):
                      "Quiet between frames so the receiver sees separate bursts.", 0, 10)
     hang_s: float = F(0.6, "Burst end after quiet (s)", "One-way and stream", "", 0.1, 10)
     stream_poll_s: float = F(1.0, "Stream decode interval (s)", "One-way and stream", "", 0.5, 30)
+    duplex: str = F("fdd", "Duplex mechanism", "Full duplex",
+                    "How mode full carries both directions at once.  fdd = band split around a guard band, each end "
+                    "filters its own half away: radio (a transmitter deafens its own receiver) and acoustic audio.  "
+                    "ec = V.34 style: both ends use the WHOLE band and each subtracts an echo canceller's estimate "
+                    "of its own signal, trained on the echo of its own BAT probe: SIP / dialup / fax-modem lines.  "
+                    "Both ends must agree.", choices=["fdd", "ec"])
+    ec_taps: int = F(256, "Echo canceller taps", "Full duplex",
+                     "duplex ec: impulse response length the canceller fits after the bulk delay (256 = 5.3 ms at "
+                     "48 kHz).  0 = no canceller (a 4-wire line that never returns our own audio).", 0, 4096)
     duplex_guard_hz: float = F(600.0, "Duplex guard band (Hz)", "Full duplex", "", 0, 5000)
-    dl_frac: float = F(0.5, "Responder share of band", "Full duplex", "", 0.1, 0.9, step=0.05)
+    dl_frac: float = F(0.5, "Responder share of band", "Full duplex",
+                       "fdd: the responder's share of the split (see the next setting).  ec: both directions use "
+                       "the whole band, each at the rate its own BAT measured (0.5 = leave them be); below 0.5 the "
+                       "responder may start a data frame in only 1 of every k chunks (k holding its share of the "
+                       "payload capacity to this), above 0.5 the initiator.  Its ACKs still ride every chunk.", 0.1, 0.9, step=0.05)
+    ratio: str = F("", "Data ratio initiator/responder", "Full duplex",
+                   "The split of the link's data capacity as initiator/responder percent (in p2p the lower node id, "
+                   "A, initiates), e.g. 50/50, 90/10 or 10/90.  Overrides the share above, and unlike it 50/50 is "
+                   "enforced: the faster direction is held to an equal share.  Empty = use the share above.  Both "
+                   "ends must agree.")
+    ec_window: int = F(32, "ARQ window (frames)", "Full duplex",
+                       "duplex ec: data frames in flight unacknowledged (LAPM's k).  The receiver keeps frames that "
+                       "arrive past a gap and the sender resends only the frames whose own timer ran out.  1 = "
+                       "stop-and-wait.", 1, 64)
+    duplex_split: str = F("bits", "Split the share by", "Full duplex",
+                          "bits = place the split so the responder's share of the CAPACITY (bits per symbol from the "
+                          "exchanged BATs, both ends hold both) is the share above: a G.711 line carries little above "
+                          "~3.4 kHz, so a 50/50 split in Hz leaves the high (responder) half short.  hz = split the "
+                          "bandwidth itself.  Both ends must agree, like the share.", choices=["bits", "hz"])
     ack_wait_s: float = F(8.0, "Resend after (s)", "Full duplex / ARQ",
                           "Resend a frame when no ACK arrived within this.", 1, 120)
     carrier_db: float = F(-55.0, "Carrier threshold (dBFS)", "Receive", "", -100, 0)
@@ -156,6 +187,20 @@ class OfdmConfig(_Config):
                      "c = libofdmacq + librs255 (process-wide). "
                      "cdx = c, plus the full-duplex data plane (mode full) run by the C engine.",
                      choices=["python", "c", "cdx"])
+
+    def responder_share(self) -> tuple[float, bool]:
+        """(responder share of the data capacity, strict).  strict = it came from ``ratio`` and 0.5 is enforced
+        too; otherwise it is ``dl_frac`` and 0.5 means "leave each direction at its own rate"."""
+        r = str(self.ratio or "").strip()
+        if not r:
+            return float(self.dl_frac), False
+        try:
+            a, b = (float(x) for x in r.replace(":", "/").split("/"))
+        except ValueError:
+            raise ValueError(f"ratio {r!r}: want initiator/responder, e.g. 90/10") from None
+        if a <= 0 or b <= 0:
+            raise ValueError(f"ratio {r!r}: both directions need a share above 0")
+        return b / (a + b), True
 
 
 @dataclasses.dataclass
@@ -335,10 +380,13 @@ class SerialConfig(_Config):
     autostart: bool = F(False, "Start with audio", "Port",
                         "Open the port whenever audio is opened.")
     buffer: int = F(32, "TX buffer (bytes)", "Handshake",
-                    "Bytes accepted per send; the modem raises CTS again after each.", 1, 250)
+                    "Bytes accepted per send; the modem raises CTS again after each.  Up to 250 on a frame-per-"
+                    "send link; OFDM oneway/stream and a full-duplex p2p link take up to 1 MiB.", 1, 1 << 20)
     mode: str = F("rts", "Send trigger", "Handshake",
-                  "rts = send on the RTS rising edge.  auto = send when the buffer is full or idle.",
-                  choices=["rts", "auto"])
+                  "rts = send on the RTS rising edge.  auto = send when the buffer is full or idle.  fifo = a UART "
+                  "with a FIFO: CTS stays up while there is room, the next buffer follows at once (OFDM "
+                  "oneway/stream, full-duplex p2p: keeps the link's window full).",
+                  choices=["rts", "auto", "fifo"])
     idle_s: float = F(2.0, "Auto idle (s)", "Handshake", "auto mode: send after this long without input.",
                       0.1, 60, step=0.5)
     ack: bool = F(True, "Peer ACKs each buffer", "Reliability",
@@ -406,3 +454,147 @@ OFDM_PRESETS = {
     "Over the air": dict(snr_margin_db=9.0, max_bits_per_bin=2, cp_ratio=0.375, isi_derate=1.0),
     "Phone line":   dict(freq_lo=400.0, freq_hi=3300.0, snr_margin_db=9.0, max_bits_per_bin=2),
 }
+
+
+@dataclasses.dataclass
+class IqConfig(_Config):
+    """Complex-baseband OFDM on an I/Q device (``iq:`` connector, GNU Radio medium, an SDR).
+
+    The ``iq`` profile: 200 ksps complex, the occupied band +-50 kHz around the carrier (a 100 kHz
+    channel with guard), n_fft 256 -> 781.25 Hz carrier spacing and a 64-sample (320 us) cyclic
+    prefix.  The taper is kept at CP/4 (0.08 ms = 16 samples): ofdm_cxdem windows at taper + CP/2
+    and the config clamps the taper to CP/2, which would leave zero ISI margin (COMPLEX_BB.md).
+    Both ends must agree on every field in "PHY"; the probe only settles the bit loading."""
+    node_id: int = F(1, "Node id", "Link", "", 0, 255)
+    peer_id: int = F(2, "Peer id", "Link", "", 0, 255)
+    fs: int = F(200000, "Sample rate (complex sps)", "PHY",
+                "Must equal the I/Q device / GNU Radio medium rate.", 50000, 2000000,
+                [200000, 250000, 400000, 521000, 1000000])
+    band_lo: float = F(-50000.0, "Band low (Hz, baseband)", "PHY", "Signed: below the carrier.", -1e6, 1e6)
+    band_hi: float = F(50000.0, "Band high (Hz, baseband)", "PHY", "Signed: above the carrier.", -1e6, 1e6)
+    n_fft: int = F(256, "FFT size", "PHY", "", choices=[64, 128, 256, 512, 1024, 2048])
+    cp_ratio: float = F(0.25, "Cyclic prefix (fraction of n_fft)", "PHY", "", 0.0625, 0.5, step=0.0625)
+    taper_ms: float = F(0.08, "Symbol taper (ms)", "PHY",
+                        "Keep <= CP/4: the demodulator windows at taper + CP/2.", 0.0, 10.0, step=0.01)
+    pilot_spacing: int = F(8, "Pilot spacing (carriers)", "PHY", "", 2, 32)
+    dc_null: bool = F(True, "Leave the DC carrier empty", "PHY",
+                      "An SDR's LO leak and DC offset sit on bin 0.")
+    sync_period: int = F(32, "SYNC symbol every N data symbols", "PHY", "", 1, 256)
+    ecc_bytes: int = F(16, "Reed-Solomon parity bytes per chunk", "PHY", "", 0, 64)
+    chunk_bytes: int = F(2040, "Payload bytes per frame", "PHY",
+                         "Sequence number and RS parity go on top.  Parity is sized so one lost OFDM symbol is "
+                         "correctable (~176 B at 64-QAM whatever the chunk), so bigger frames amortise it: "
+                         "141 / 282 / 339 / 357 kbit/s at 256 / 1020 / 2040 / 4080 B (64-QAM, gapless, 200 k).  "
+                         "A short message is NUL-padded to a whole frame.", 32, 4080)
+    ctl_chunk_bytes: int = F(512, "Payload bytes per control frame", "PHY",
+                             "Control messages (PING, BAT, READY, POLL, STAT) at the base table go in frames of "
+                             "this size instead of chunk_bytes: a 2040 B QPSK frame lasts 0.24 s on iq-hf, long "
+                             "enough for a 0.5 Hz two-ray fade to move its notches mid-frame (hf-moderate lost 6 "
+                             "of 8 POLLs).  0 = chunk_bytes (the old frames).  Both ends must agree.", 0, 4080)
+    ctl_repeat_s: float = F(0.0, "Send each POLL / STAT twice, this far apart (s)", "PHY",
+                            "Time diversity for the ARQ control frames on a fading channel: the copy goes this "
+                            "long after the first (same seq; the receiver drops whichever arrives second).  On "
+                            "hf-moderate (0.5 Hz fade) one 512 B frame got through ~65 % of the time, either of "
+                            "two 0.6 s apart ~90 %; 0.3 s apart the fades are still correlated.  0 = once.", 0.0, 5.0)
+    seq_bytes: int = F(2, "Sequence number bytes", "PHY", "", 1, 4)
+    frame_gap_ms: float = F(20.0, "Gap between frames (ms)", "PHY", "", 0.0, 1000.0)
+    gapless: bool = F(True, "Frames back to back within a burst", "PHY",
+                      "One frame gap before and after a burst, none between its frames.  Off: a gap after "
+                      "every frame (20 ms default: 256 B frames 59 vs 141 kbit/s at 64-QAM).")
+    max_cfo_bins: int = F(16, "CFO search range (carriers)", "Receive",
+                          "Integer CFO searched, +- this many carrier spacings (781 Hz each at 200 k / 256).", 0, 64)
+    sc_threshold: float = F(0.25, "SC metric threshold", "Receive", "", 0.05, 0.95, step=0.05)
+    sc_ncc_min: float = F(0.10, "SC matched-filter minimum", "Receive", "", 0.0, 0.95, step=0.05)
+    fec: str = F("2/3", "Inner FEC", "PHY",
+                 "K=7 convolutional code (133, 171) with soft-decision Viterbi between the RS and the mapper, "
+                 "bit-interleaved over the frame.  Buys ~4-5 dB (the bit loading spends 4 / 3 / 2.5 dB of the "
+                 "margin at 1/2 / 2/3 / 3/4); costs the rate in air time.  none = the RS-only frame of steps 4-10.",
+                 choices=["none", "1/2", "2/3", "3/4"])
+    window: str = F("mid", "FFT window position", "Receive",
+                    "mid: the middle of the ISI-free stretch (echo up to cp/2 - taper, timing slack both ways).  "
+                    "late: cp_len - 2 samples (echo up to cp - 2*taper - 2, ~2x as long; a late sync costs ISI).",
+                    choices=["mid", "late"])
+    track: bool = F(True, "Track between SYNCs", "Receive",
+                    "Decision-directed: the phase falls back on the data when the pilots disagree (dead or "
+                    "noisy pilots) and the channel estimate follows a fade between SYNC symbols.")
+    iterate: int = F(0, "Decoder-aided re-estimation passes", "Receive",
+                     "Prototype (2026-11-15, off by default): a frame whose RS decode fails is re-encoded from the "
+                     "Viterbi output (and every RS codeword that did decode), H is refit per carrier from the "
+                     "neighbouring symbols' re-encoded cells, and the frame is decoded again, up to this many "
+                     "times.  Needs an inner code; frames that decode first time are untouched.", 0, 8)
+    iterate_win: int = F(2, "Re-estimation window (+- symbols)", "Receive",
+                         "Per-carrier time window of the refit: short follows a fast fade, long averages noise.",
+                         1, 16)
+    erasures: bool = F(True, "Erasure decoding", "Receive",
+                       "A frame the errors-only RS decode cannot correct is retried with its least reliable bytes "
+                       "(decision distance, dead carriers by |H|) erased: up to twice the correction on a notched "
+                       "or noisy carrier.  Off = errors-only, as before 2026-11-14.")
+    default_bits: int = F(2, "Bits per carrier before a probe", "Bit loading",
+                          "Every data carrier, until a probe has measured the channel.", choices=[1, 2, 4, 6])
+    snr_margin_db: float = F(7.0, "SNR margin (dB)", "Bit loading",
+                             "Subtracted before ofdm_allocate (floors 4/7/14/21 dB for BPSK..64-QAM are "
+                             "raw).  7 dB: 30/30 frames just above every 16/64-QAM step (6 dB loses "
+                             "frames at the QPSK edge, 3 dB loses up to half at each step).", 0.0, 20.0)
+    max_bits: int = F(6, "Most bits per carrier", "Bit loading", "", choices=[1, 2, 4, 6])
+    probe_syms: int = F(64, "Probe periodic symbols", "Bit loading", "", 8, 1024)
+    meas_syms: int = F(32, "Probe measurement symbols", "Bit loading", "", 0, 1024)
+    max_rtd_s: float = F(15.0, "Longest round trip allowed for (s)", "Link",
+                         "Before the probe exchange has measured the round-trip delay, probe retries back off "
+                         "(3, 6, 12 s ...) up to this, and the exchange's time budget is sized from it.  After "
+                         "the first answer every retry / wait is sized from the MEASURED round trip.  15 s covers "
+                         "speaker+mic (~0.3 s), G.711 paths (1-2 s) and a ham satellite hop (5+ s one way).",
+                         0.5, 120.0, step=0.5)
+    arq_rounds: int = F(8, "ARQ rounds per message", "Link",
+                        "send_reliable: after the data and a POLL, the receiver answers with a bitmap of the frames "
+                        "it holds and the missing ones are sent again, up to this many rounds (POLL-only rounds "
+                        "when no answer comes count too).  0 = fire and forget.", 0, 64)
+    reprobe_s: float = F(60.0, "Re-probe interval (s)", "Link",
+                         "ARQ: the receiver asks for a fresh probe (STAT flag) this often, and at once when a table "
+                         "update left carriers at 0 bits, then sends the probe's table: carriers come back and bits go "
+                         "up when the channel recovers.  0 = never.", 0.0, 3600.0, step=5.0)
+    duplex: str = F("full", "Duplex", "Link",
+                    "full: keep receiving while we transmit (a mix-minus medium, FDD, or an SDR with "
+                    "cancellation).  half: RX blocks captured during our own TX are zeroed (a radio that hears "
+                    "itself).", choices=["full", "half"])
+    excise: bool = F(True, "Notch narrowband interferers", "Receive",
+                     "Stationary tones standing 12 dB over their spectral neighbourhood are notched (one carrier "
+                     "wide) before the sync and the probe; a constant 2.6 ms delay either way.")
+    lbt: bool = F(False, "Listen before talk", "Link",
+                  "Before a burst, wait (up to lbt_max_s) until the last 20 ms of RX are within 6 dB of the noise "
+                  "floor, plus a random 0-50 ms backoff.  For shared channels; off on a point-to-point link.")
+    lbt_max_s: float = F(2.0, "LBT longest wait (s)", "Link", "", 0.0, 30.0, step=0.5)
+    papr_clip_db: float = F(0.0, "PAPR clip (dB over RMS)", "Level",
+                            "Clip each burst at this many dB over its RMS and filter the clipping noise back into "
+                            "the occupied band (2 passes).  ~8 dB buys a few dB of PA headroom; 0 = off.",
+                            0.0, 15.0, step=0.5)
+    callsign: str = F("", "Station ID callsign", "Ident",
+                      "Sent as CW (on/off keyed carrier at ident_hz) before the first burst and every ident_s.  "
+                      "Required on amateur bands (e.g. FCC 97.119: every 10 minutes and at the end).")
+    ident_s: float = F(600.0, "Station ID interval (s)", "Ident", "", 30.0, 3600.0, step=30.0)
+    ident_wpm: float = F(20.0, "Station ID speed (wpm)", "Ident", "", 5.0, 40.0)
+    ident_hz: float = F(25000.0, "Station ID offset (Hz)", "Ident", "Baseband offset of the CW carrier.",
+                        -100000.0, 100000.0)
+    tx_rms: float = F(0.2, "TX RMS level (full scale 1.0)", "Level",
+                      "Complex RMS of every burst; OFDM peaks run ~10 dB above it, so 0.2 stays clear of "
+                      "an sc16 / ADC full scale.", 0.001, 0.7, step=0.01)
+    block: int = F(4000, "I/Q block (samples)", "Engine", "20 ms at 200 ksps.", 256, 65536)
+
+# Named I/Q profiles: IqConfig field overrides.  "iq" is the defaults themselves (200 ksps, +-50 kHz).
+IQ_PROFILES = {
+    "iq": {},
+    # Multipath: CP 0.5 x 256 = 640 us and the late window: echoes to ~470 us (impair "echo": 50 + 200 us).
+    "iq-echo": {"cp_ratio": 0.5, "window": "late"},
+    # HF-like long echoes: 512-point FFT (390 Hz carriers), CP 0.5 = 1.28 ms, late window: echoes to ~1.1 ms
+    # (impair "echo-isi" / "hf-moderate": 1 ms).  Half the carrier spacing also halves the CFO range in Hz.
+    "iq-hf": {"n_fft": 512, "cp_ratio": 0.5, "window": "late", "ctl_repeat_s": 0.6},
+}
+
+
+def iq_profile(name: str = "iq", **over) -> IqConfig:
+    """``IqConfig`` for a named profile, with field overrides on top."""
+    if name not in IQ_PROFILES:
+        raise KeyError(f"unknown I/Q profile {name!r}; have {sorted(IQ_PROFILES)}")
+    d = IqConfig().to_dict()
+    d.update(IQ_PROFILES[name])
+    d.update(over)
+    return IqConfig.from_dict(d)

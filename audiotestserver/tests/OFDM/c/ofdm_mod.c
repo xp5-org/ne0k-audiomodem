@@ -11,6 +11,8 @@
  * -- since REF_SYM_BOOST -- the CE/SYNC symbols too. */
 #define PILOT_RE 0.70710678118654752
 #define PILOT_IM 0.70710678118654752
+/* Data-frame SC preamble gain, = ofdm_modem.SC_TX_GAIN (2026-11-07). */
+#define OFDM_SC_TX_GAIN 2.0
 
 struct ofdm_mod {
     ofdm_cfg c;
@@ -225,14 +227,19 @@ int  ofdm_mod_payload_bytes(const ofdm_mod *m) { return m ? m->payload_bytes : 0
 long ofdm_mod_frame_samples(const ofdm_mod *m) { return m ? m->frame_len : 0; }
 const double *ofdm_mod_sc_preamble(const ofdm_mod *m) { return m ? m->sc_td : 0; }
 
-long ofdm_mod_signal_samples(const ofdm_mod *m, int n_bytes)
+long ofdm_mod_signal_samples_ex(const ofdm_mod *m, int n_bytes, int gap)
 {
     int n_chunks;
     if (!m || n_bytes < 0) return -1;
     n_chunks = (n_bytes + m->c.chunk_bytes - 1) / m->c.chunk_bytes;
     if (n_chunks < 1) n_chunks = 1;
     return (long)n_chunks * m->frame_len
-         + (long)(n_chunks + 1) * m->c.frame_gap_samples;
+         + (gap ? (long)(n_chunks + 1) * m->c.frame_gap_samples : 0L);
+}
+
+long ofdm_mod_signal_samples(const ofdm_mod *m, int n_bytes)
+{
+    return ofdm_mod_signal_samples_ex(m, n_bytes, 1);
 }
 
 long ofdm_mod_frame(ofdm_mod *m, unsigned seq, const unsigned char *chunk,
@@ -276,8 +283,13 @@ long ofdm_mod_frame(ofdm_mod *m, unsigned seq, const unsigned char *chunk,
         state = ((state << 1) | fb) & 0xFFFFu;
     }
 
-    /* ---- SC preamble, then the overlap-added body ---- */
-    for (i = 0; i < c->symbol_samples; i++) out[i] = m->sc_td[i];
+    /* ---- SC preamble, then the overlap-added body ----
+     * The preamble goes out at OFDM_SC_TX_GAIN (ofdm_modem.SC_TX_GAIN): built
+     * as-is it fills only the even bins at 1/sqrt(2), 6 dB under the data, an
+     * audible ~1 Hz beat on back-to-back frames.  TX only: m->sc_td stays the
+     * unscaled reference (ofdm_mod_sc_preamble, the dx matched filter). */
+    for (i = 0; i < c->symbol_samples; i++)
+        out[i] = m->sc_td[i] * OFDM_SC_TX_GAIN;
     for (i = 0; i < m->ola_len; i++) out[c->symbol_samples + i] = 0.0;
     base = c->symbol_samples;
 
@@ -346,24 +358,32 @@ long ofdm_mod_frame(ofdm_mod *m, unsigned seq, const unsigned char *chunk,
     return m->frame_len;
 }
 
-long ofdm_mod_encode(ofdm_mod *m, const unsigned char *data, int n_bytes,
-                     double *out, long out_cap)
+long ofdm_mod_encode_ex(ofdm_mod *m, const unsigned char *data, int n_bytes,
+                        unsigned long seq0, int gap,
+                        double *out, long out_cap)
 {
     const ofdm_cfg *c;
-    long need, pos;
+    long need, pos, n_gap;
     int  n_chunks, s, i;
+    unsigned long seq_mask;
 
     if (!m || (!data && n_bytes > 0) || !out || n_bytes < 0) return -1;
     c = &m->c;
-    need = ofdm_mod_signal_samples(m, n_bytes);
+    need = ofdm_mod_signal_samples_ex(m, n_bytes, gap);
     if (need < 0) return -1;
     if (out_cap < need) return -2;
+    n_gap = gap ? c->frame_gap_samples : 0;
+    /* (seq0 + s) mod 2^(8*seq_bytes), as encode_bytes' seq_mod.  ofdm_mod_frame
+     * only serialises the low seq_bytes anyway; the mask keeps the arithmetic
+     * honest and the shift defined for seq_bytes >= sizeof(long). */
+    seq_mask = (c->seq_bytes >= (int)sizeof(unsigned long)) ? ~0UL
+             : ((1UL << (8 * c->seq_bytes)) - 1UL);
 
     n_chunks = (n_bytes + c->chunk_bytes - 1) / c->chunk_bytes;
     if (n_chunks < 1) n_chunks = 1;
 
     pos = 0;
-    for (i = 0; i < c->frame_gap_samples; i++) out[pos++] = 0.0;
+    for (i = 0; i < n_gap; i++) out[pos++] = 0.0;
     for (s = 0; s < n_chunks; s++) {
         const unsigned char *src = data + (long)s * c->chunk_bytes;
         int  avail = n_bytes - s * c->chunk_bytes;
@@ -378,10 +398,17 @@ long ofdm_mod_encode(ofdm_mod *m, const unsigned char *data, int n_bytes,
                 m->padbuf[i] = (i < avail) ? src[i] : 0;
             src = m->padbuf;
         }
-        rc = ofdm_mod_frame(m, (unsigned)s, src, out + pos, out_cap - pos);
+        rc = ofdm_mod_frame(m, (unsigned)((seq0 + (unsigned long)s) & seq_mask),
+                            src, out + pos, out_cap - pos);
         if (rc < 0) return rc;
         pos += rc;
-        for (i = 0; i < c->frame_gap_samples; i++) out[pos++] = 0.0;
+        for (i = 0; i < n_gap; i++) out[pos++] = 0.0;
     }
     return pos;
+}
+
+long ofdm_mod_encode(ofdm_mod *m, const unsigned char *data, int n_bytes,
+                     double *out, long out_cap)
+{
+    return ofdm_mod_encode_ex(m, data, n_bytes, 0UL, 1, out, out_cap);
 }

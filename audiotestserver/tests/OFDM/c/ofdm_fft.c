@@ -126,3 +126,43 @@ void ofdm_irfft(ofdm_fft *f, const ofdm_cpx *X, ofdm_real *x)
         x[2 * k + 1] = z[k].im * s;
     }
 }
+
+/* ------------------------------------------------- full complex transform */
+
+size_t ofdm_cfft_workspace(int n)
+{
+    if (n < 4 || (n & (n - 1)) != 0) return 0;
+    return align8((size_t)(n / 2) * sizeof(ofdm_cpx));
+}
+
+int ofdm_cfft_init(ofdm_cfft *f, int n, void *mem, size_t memlen)
+{
+    int i;
+    if (!f || !mem) return -1;
+    if (n < 4 || (n & (n - 1)) != 0) return -1;
+    if (memlen < ofdm_cfft_workspace(n)) return -2;
+    f->n  = n;
+    f->tw = (ofdm_cpx *)mem;
+    for (i = 0; i < n / 2; i++) {                    /* e^{-2*pi*i*k/n}, in double */
+        double a = -2.0 * M_PI * (double)i / (double)n;
+        f->tw[i].re = (ofdm_real)cos(a);
+        f->tw[i].im = (ofdm_real)sin(a);
+    }
+    return 0;
+}
+
+void ofdm_cfft_fwd(const ofdm_cfft *f, ofdm_cpx *a)
+{
+    cfft(a, f->n, f->tw, -1);
+}
+
+void ofdm_cfft_inv(const ofdm_cfft *f, ofdm_cpx *a)
+{
+    int k;
+    ofdm_real s = (ofdm_real)1 / (ofdm_real)f->n;
+    cfft(a, f->n, f->tw, +1);
+    for (k = 0; k < f->n; k++) {
+        a[k].re *= s;
+        a[k].im *= s;
+    }
+}

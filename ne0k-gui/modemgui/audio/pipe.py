@@ -32,7 +32,7 @@ from collections import deque
 
 import numpy as np
 
-from .base import AudioError, Sink, Source, StreamSpec, as_mono_f32
+from .base import AudioError, Sink, Source, StreamSpec, as_block
 from .registry import Registry
 
 CLIP_LEVEL = 0.999
@@ -40,7 +40,7 @@ CLIP_LEVEL = 0.999
 
 @dataclasses.dataclass(frozen=True)
 class Block:
-    samples: np.ndarray      # float32 mono
+    samples: np.ndarray      # float32 mono, or complex64 when spec.iq
     index: int               # absolute RX sample index of samples[0]
     tx_active: bool          # we were transmitting (or within the guard) at capture
     peak: float
@@ -102,6 +102,7 @@ class AudioPipe:
         self._taps_lock = threading.Lock()
         self._hist: deque[Block] = deque()
         self._hist_n, self._hist_cap = 0, int(history_s * self.spec.rate)
+        self._dtype = np.complex64 if self.spec.iq else np.float32
         self._rx_index = 0
         self._tx: deque[np.ndarray] = deque()
         self._tx_fresh: deque[bool] = deque()   # parallel to _tx: buffer not yet started
@@ -175,8 +176,8 @@ class AudioPipe:
             (time.monotonic() - self._tx_last) < self._tx_guard
 
     def _on_rx(self, x: np.ndarray) -> None:
-        x = as_mono_f32(x)
-        a = np.abs(x)
+        x = as_block(x, self.spec.iq)
+        a = np.abs(x)                     # |I + jQ| on an I/Q stream: clipping is on the envelope
         peak = float(a.max()) if len(a) else 0.0
         clipped = int(np.count_nonzero(a >= CLIP_LEVEL))
         b = Block(x, self._rx_index, self._tx_now(), peak, clipped)
@@ -202,7 +203,16 @@ class AudioPipe:
         the first one.  Contiguous: every block arrives in order."""
         blocks = list(self._hist)
         if not blocks:
-            return np.zeros(0, np.float32), self._rx_index
+            return np.zeros(0, self._dtype), self._rx_index
+        if n is not None:
+            # Join only the tail that holds n samples: the whole history is 30 s (48 MB of I/Q at
+            # 200 ksps), and copying it under the GIL stalls the device thread -- on the iq: socket
+            # that stalls the GNU Radio medium for every node.
+            k, got = len(blocks), 0
+            while k > 0 and got < n:
+                k -= 1
+                got += len(blocks[k].samples)
+            blocks = blocks[k:]
         x = np.concatenate([b.samples for b in blocks])
         i0 = blocks[0].index
         if n is not None and n < len(x):
@@ -220,7 +230,7 @@ class AudioPipe:
         """Queue audio for transmission.  Non-blocking; see wait_tx()."""
         if not self._snk:
             raise AudioError("no TX sink open")
-        x = as_mono_f32(samples)
+        x = as_block(samples, self.spec.iq)
         if not len(x):
             return
         with self._tx_lock:
@@ -246,7 +256,7 @@ class AudioPipe:
             self._tx_idle.set()
 
     def _pull(self, n: int) -> np.ndarray:
-        out = np.zeros(n, np.float32)
+        out = np.zeros(n, self._dtype)
         got = 0
         onsets = []
         with self._tx_lock:

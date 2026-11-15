@@ -26,12 +26,13 @@ from .base import AudioError, Connector, DeviceInfo, Sink, Source, StreamSpec
 ENTRY_GROUP = "modemgui.connectors"
 PLUGIN_ENV = "MODEMGUI_PLUGIN_PATH"
 
-_BUILTIN_MODULES = ("file_backend", "pulse_backend", "sounddevice_backend")
+_BUILTIN_MODULES = ("file_backend", "pulse_backend", "sounddevice_backend", "iq_backend")
 
 # import_module() with a computed name is invisible to PyInstaller, so a frozen build would ship
 # only the backends something else imports (file) and lose the system devices.  Naming them here
 # as real imports makes the freezer collect them; each module tolerates a missing PortAudio/pactl.
 from . import file_backend as _fb, pulse_backend as _pb, sounddevice_backend as _sb  # noqa: E402,F401
+from . import iq_backend as _iq  # noqa: E402,F401
 
 
 def _instances(obj) -> list[Connector]:
@@ -136,10 +137,21 @@ class Registry:
             raise AudioError(f"connector {name!r} unavailable: {why}")
         return c, dev
 
+    @staticmethod
+    def _kind_ok(c: Connector, address: str, spec: StreamSpec) -> None:
+        # An I/Q session on a sound card (or audio into the GNU Radio medium) would "work" and carry
+        # garbage: refuse it here, once, rather than in every connector.
+        if bool(getattr(c, "iq", False)) != bool(spec.iq):
+            want = "an I/Q (complex baseband)" if spec.iq else "an audio"
+            got = "I/Q" if getattr(c, "iq", False) else "audio"
+            raise AudioError(f"{address!r} is an {got} device; this session needs {want} device")
+
     def open_source(self, address: str, spec: StreamSpec) -> Source:
         c, dev = self._resolve(address)
+        self._kind_ok(c, address, spec)
         return c.open_source(dev, spec)
 
     def open_sink(self, address: str, spec: StreamSpec) -> Sink:
         c, dev = self._resolve(address)
+        self._kind_ok(c, address, spec)
         return c.open_sink(dev, spec)

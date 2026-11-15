@@ -109,9 +109,14 @@ void ofdm_prbs(unsigned char *out, int n, unsigned seed)
 
 void ofdm_known_bpsk(double *re, int n, unsigned seed, double amp)
 {
+    (void)ofdm_known_bpsk_next(re, n, seed, amp);
+}
+
+unsigned ofdm_known_bpsk_next(double *re, int n, unsigned seed, double amp)
+{
     unsigned state = seed & 0xFFFFu;
     int i;
-    if (!re) return;
+    if (!re) return state;
     /* Inlined rather than calling ofdm_prbs into a scratch buffer: the caller
      * would otherwise have to find n bytes of workspace for a value used once. */
     for (i = 0; i < n; i++) {
@@ -121,6 +126,7 @@ void ofdm_known_bpsk(double *re, int n, unsigned seed, double amp)
         state = ((state << 1) | fb) & 0xFFFFu;
         re[i] = b ? -amp : amp;
     }
+    return state;
 }
 
 /* -------------------------------------------------------- frame arithmetic */

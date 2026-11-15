@@ -64,6 +64,15 @@ def load():
                  ("ofdm_mod_frame_samples", ctypes.c_long)):
         getattr(lib, f).restype = r
         getattr(lib, f).argtypes = [ctypes.c_void_p]
+    if hasattr(lib, "ofdm_mod_encode_ex"):
+        lib.ofdm_mod_signal_samples_ex.restype = ctypes.c_long
+        lib.ofdm_mod_signal_samples_ex.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                   ctypes.c_int]
+        lib.ofdm_mod_encode_ex.restype = ctypes.c_long
+        lib.ofdm_mod_encode_ex.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int,
+            ctypes.c_ulong, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_double), ctypes.c_long]
     lib.ofdm_mod_sc_preamble.restype = ctypes.POINTER(ctypes.c_double)
     lib.ofdm_mod_sc_preamble.argtypes = [ctypes.c_void_p]
     return lib
@@ -171,6 +180,37 @@ def main() -> int:
                 where = int(np.argmax(np.abs(c_sig - py_sig)))
                 print(f"  FAIL [{tag}/{label}] max|d|={d:.3e} at sample {where} "
                       f"of {n} (signal rms {rms:.4f})")
+                bad += 1
+            elif a.verbose:
+                print(f"  ok   [{tag}/{label}] {n} samples, max|d|={d:.2e}")
+        # encode_bytes(data, seq0, gap): a running chunk counter that wraps at
+        # 2^(8*seq_bytes), and gapless frames for a continuous broadcast.
+        ex_cases = (("seq0", 5, True), ("wrap", (1 << (8 * seq)) - 1, True),
+                    ("nogap", 0, False), ("wrap-nogap", (1 << (8 * seq)) - 2,
+                                          False))
+        if not hasattr(lib, "ofdm_mod_encode_ex"):
+            print(f"  FAIL [{tag}] ofdm_mod_encode_ex missing from the library")
+            bad += 1
+            ex_cases = ()
+        nb = chunk * 3 - 5
+        payload = bytes((i * 53 + 7) & 0xFF for i in range(nb))
+        for label, seq0, gp in ex_cases:
+            n = lib.ofdm_mod_signal_samples_ex(h, nb, int(gp))
+            out = (ctypes.c_double * n)()
+            buf = (ctypes.c_ubyte * nb)(*payload)
+            got = lib.ofdm_mod_encode_ex(h, buf, nb, seq0, int(gp), out, n)
+            py_sig = mod.encode_bytes(payload, seq0, gap=gp)
+            if got != n or len(py_sig) != n:
+                print(f"  FAIL [{tag}/{label}] length c={got} sized={n} "
+                      f"py={len(py_sig)}")
+                bad += 1
+                continue
+            c_sig = np.frombuffer(out, dtype=np.float64, count=n)
+            d = float(np.max(np.abs(c_sig - py_sig)))
+            if d > 1e-11:
+                where = int(np.argmax(np.abs(c_sig - py_sig)))
+                print(f"  FAIL [{tag}/{label}] max|d|={d:.3e} at sample {where} "
+                      f"of {n}")
                 bad += 1
             elif a.verbose:
                 print(f"  ok   [{tag}/{label}] {n} samples, max|d|={d:.2e}")

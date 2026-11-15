@@ -78,13 +78,16 @@ class SerialBridge:
                  dst: int | None = None) -> None:
         # MAX_BUF is the CSS frame's one-byte length.  The OFDM one-way/stream link frames its own bursts
         # (4-byte length, MiB capacity), so its serial buffer is limited only by what the link reports.
-        big = isinstance(cfg, OfdmConfig) and cfg.mode in ("oneway", "stream")
+        # A p2p full-duplex MeshNode (ofdm mode full) splits a send into frames on its own sliding window, so it
+        # takes big buffers too, and a FIFO port keeps that window full.
+        big = ((isinstance(cfg, OfdmConfig) and cfg.mode in ("oneway", "stream"))
+               or (isinstance(cfg, MeshNode) and getattr(cfg, "duplex", False)))
         if not 1 <= buf_size <= (MAX_BIG_BUF if big else MAX_BUF):
             raise ValueError(f"buf_size must be 1..{MAX_BIG_BUF if big else MAX_BUF}")
         if mode not in ("rts", "auto", "fifo"):
             raise ValueError("mode must be 'rts', 'auto' or 'fifo'")
         if mode == "fifo" and not big:
-            raise ValueError("mode 'fifo' needs an OFDM link in oneway or stream mode")
+            raise ValueError("mode 'fifo' needs an OFDM link in oneway or stream mode, or a full-duplex mesh p2p link")
         self.fifo = mode == "fifo"
         self._chain = False                      # fifo: bytes arrived while the last burst was on the air
         self.mesh = isinstance(cfg, MeshNode)
@@ -163,7 +166,8 @@ class SerialBridge:
     @property
     def cts(self) -> bool:
         if self.fifo:                            # a UART with a FIFO: ready while there is room, TX or not
-            return self.link.up and len(self.txbuf) < self.buf_size
+            # a mesh node has no single link to be up: its duplex send waits for the link itself
+            return (self.mesh or self.link.up) and len(self.txbuf) < self.buf_size
         return not self.busy and (not self.ofdm or self.link.up)
 
     def _rxq_put(self, data: bytes) -> None:
@@ -344,8 +348,9 @@ class SerialBridge:
             ok = False
         if not ok:
             self.fail_count += 1
+        self._chain = self.fifo and bool(self.txbuf)
         self.busy = False
-        self._notify("TXDONE" if ok else "TXFAIL"); self._notify("CTS 1")
+        self._notify("TXDONE" if ok else "TXFAIL"); self._notify(f"CTS {int(self.cts)}")
         self.log("tx done" if ok else "tx FAILED")
 
     def _tx_job_ofdm(self, data: bytes) -> None:

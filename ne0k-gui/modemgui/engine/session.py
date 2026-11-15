@@ -31,9 +31,9 @@ def _db(x: float) -> float:
 
 class Session:
     def __init__(self, registry: Registry | None = None, rate: int = 48000,
-                 block: int = 1024, nfft: int = 2048, hop: int = 512) -> None:
+                 block: int = 1024, nfft: int = 2048, hop: int = 512, iq: bool = False) -> None:
         self.registry = registry or Registry()
-        self.spec = StreamSpec(rate, block)
+        self.spec = StreamSpec(rate, block, iq)   # iq: complex baseband on an iq: device (IqConfig)
         self.events: "queue.Queue[Event]" = queue.Queue(maxsize=512)
         self._stft_args = (nfft, hop)
         self._pipe: AudioPipe | None = None
@@ -43,6 +43,7 @@ class Session:
         self.ident = Identifier(self)       # ham-mode station ID; inert until HamConfig.enabled
         self.tx_hooks: list = []            # f(samples, rx_sample_index): called for every play()
         self.ignore_busy = False            # GeneralConfig.ignore_busy: skip the energy checks before TX
+        self.keyup_tone = True              # OfdmConfig.channel == radio: ofdm_link.keyup() leads each burst with a tone
 
     # -- events -------------------------------------------------------------
 
@@ -152,7 +153,7 @@ class Session:
     # -- worker -------------------------------------------------------------
 
     def _run(self, pipe: AudioPipe, tap) -> None:
-        stft = Stft(self.spec.rate, *self._stft_args)
+        stft = Stft(self.spec.rate, *self._stft_args, iq=self.spec.iq)
         acc = {"pk": 0.0, "ss": 0.0, "n": 0}
         pend_cols: list[np.ndarray] = []
         pend_tx: list[np.ndarray] = []
@@ -183,7 +184,7 @@ class Session:
                 continue
             tx_now = b.tx_active
             acc["pk"] = max(acc["pk"], b.peak)
-            acc["ss"] += float(np.dot(b.samples, b.samples))
+            acc["ss"] += float(np.vdot(b.samples, b.samples).real)   # |x|^2, real or I/Q
             acc["n"] += len(b.samples)
             idx, cols = stft.feed(b.samples, b.index)
             if len(cols):

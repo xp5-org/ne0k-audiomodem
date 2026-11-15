@@ -9,6 +9,10 @@
     python -m modemgui selfloop --rx A --tx B     send text, decode it on the same pipe
     python -m modemgui serial --link /tmp/modem0 ...  pty + RTS/CTS handshake
     python -m modemgui native                     check the C libraries
+    python -m modemgui iq-send --dev iq:H:P ...    complex OFDM (iq profile) over an I/Q socket
+    python -m modemgui iq-recv --dev iq:H:P ...    ... and its receiver
+    python -m modemgui iq-p2p --dev iq:H:P --role initiator|responder ...
+                                                   probe -> BAT exchange, then a message each way
 """
 from __future__ import annotations
 
@@ -304,6 +308,235 @@ def cmd_native(a, reg) -> int:
     return native._main()
 
 
+def _iq_link(a, reg: Registry, on_frame=None):
+    from .engine.iq_link import IqLink, open_iq_session
+    from .engine.modemcfg import iq_profile
+    over = {k: v for k, v in dict(node_id=a.node, peer_id=a.peer, fs=a.fs, block=a.block,
+                                  tx_rms=a.tx_rms, default_bits=a.bits).items() if v is not None}
+    if a.gapped:
+        over["gapless"] = False
+    if getattr(a, "max_rtd", None) is not None:
+        over["max_rtd_s"] = a.max_rtd
+    if getattr(a, "no_erasures", False):
+        over["erasures"] = False
+    if getattr(a, "arq_rounds", None) is not None:
+        over["arq_rounds"] = a.arq_rounds
+    for k in ("fec", "window", "duplex", "callsign", "papr_clip_db", "reprobe_s", "iterate", "iterate_win"):
+        if getattr(a, k, None) is not None:
+            over[k] = getattr(a, k)
+    if getattr(a, "no_track", False):
+        over["track"] = False
+    if getattr(a, "no_excise", False):
+        over["excise"] = False
+    if getattr(a, "lbt", False):
+        over["lbt"] = True
+    cfg = iq_profile(a.profile, **over)
+    sess = open_iq_session(cfg, a.dev, registry=reg)
+    return sess, IqLink(sess, cfg, on_frame=on_frame).start(), cfg
+
+
+def cmd_iq_send(a, reg: Registry) -> int:
+    """Send a probe (optional) then one message as complex OFDM frames over an iq: device."""
+    data = open(a.file, "rb").read() if a.file else a.text.encode()
+    sess, link, cfg = _iq_link(a, reg)
+    try:
+        time.sleep(a.lead)
+        for _ in range(a.probes):
+            n = link.send_probe()
+            print(f"PROBE {n} samples ({n / cfg.fs * 1e3:.0f} ms)", flush=True)
+            link.wait_tx(10)
+            time.sleep(a.probe_gap)
+        for i in range(a.repeat):
+            s0, nf = link.send_message(data, seq0=0)
+            print(f"SENT {len(data)} bytes in {nf} frames seq0={s0} bits/sym={link.bits_per_symbol} "
+                  f"gain={link.gain:.4f}", flush=True)
+            if not link.wait_tx(60):
+                print("timed out waiting for TX to drain", file=sys.stderr)
+                return 1
+            time.sleep(a.gap)
+        time.sleep(a.tail)
+        st = sess.pipe.stats
+        print(f"DONE tx_samples={st.tx_samples} rx_samples={st.rx_samples} rx_error={st.rx_error}", flush=True)
+        return 1 if st.rx_error or st.tx_error else 0
+    finally:
+        link.stop(); sess.close()
+
+
+def _p2p_payload(nbytes: int, seed: int) -> bytes:
+    return np.random.default_rng(seed).bytes(nbytes) if nbytes else b""
+
+
+def cmd_iq_p2p(a, reg: Registry) -> int:
+    """Both ends of a P2P transfer: probe -> BAT exchange (IqLink.negotiate), then the initiator
+    sends --send-bytes (seeded random, so the far end can check it without a file), the responder
+    checks it and answers with its own --send-bytes, the initiator checks that.  Prints
+    NEG / SENT / RECV lines and P2P PASS or P2P FAIL; --json writes the numbers."""
+    from .engine.iq_link import BAT_MAGIC, MSG_MAGIC
+    sess, link, cfg = _iq_link(a, reg)
+    initiator = a.role == "initiator"
+    out = dict(role=a.role, node=int(cfg.node_id))
+    t_end = time.monotonic() + a.seconds
+    gate = None
+    if a.slot_impair and a.slot_impair != "none":       # test hook: aim an impairment at our agreed table
+        from .engine.slotimpair import attach_iq
+        gate = attach_iq(link, a.slot_impair, seed=a.slot_seed + int(cfg.node_id))
+
+    def fail(why: str) -> int:
+        out["fail"] = why
+        print(f"P2P FAIL {why}", flush=True)
+        return 1
+
+    arq = not a.no_arq
+    out["arq"] = arq
+    out["erasures"] = bool(cfg.erasures)
+
+    def recv(since: int) -> tuple[bytes | None, str, float]:
+        t0 = time.monotonic()
+        if arq:
+            data = link.receive_reliable(max(0.0, t_end - time.monotonic()))
+            return data, "" if data is not None else "ARQ: no whole message before --seconds", time.monotonic() - t0
+        data, why, first = link.receive_msg(MSG_MAGIC, max(0.0, t_end - time.monotonic()), since=since)
+        return data, why, time.monotonic() - t0
+
+    def send(data: bytes) -> float:
+        t0 = time.monotonic()
+        bits0 = link.bits_per_symbol
+        air = link.mod.frames_for(len(data) + 12) * link.mod.frame_samples / cfg.fs
+        if arq:
+            r = link.send_reliable(data, log=lambda m: print(m, flush=True), deadline=t_end)
+            nf, ok = r["frames"], r["ok"]
+        else:
+            r = {}
+            _s0, nf = link.send_message(data)
+            ok = link.wait_tx(max(5.0, t_end - time.monotonic()))
+        dt = time.monotonic() - t0
+        extra = (f", ARQ {r['rounds']} rounds, resent {r['resent']} frames, {r['table_updates']} table updates "
+                 f"-> {r['tx_bits']} bits/sym" if arq else "")
+        print(f"SENT {len(data)} bytes in {nf} frames at {bits0} bits/sym, "
+              f"air {air:.2f} s ({8 * len(data) / air / 1e3:.0f} kbit/s) wall {dt:.2f} s"
+              f" ({8 * len(data) / max(dt, 1e-3) / 1e3:.0f} kbit/s){extra}", flush=True)
+        out.setdefault("sent", []).append(dict(bytes=len(data), frames=nf, bits=bits0, air_s=air, wall_s=dt,
+                                              arq=r or None))
+        if not ok:
+            raise RuntimeError(f"ARQ: {r['why']}" if arq else "TX did not drain")
+        return dt
+
+    def check(data, why, dt, expect: bytes, what: str) -> bool:
+        st = link.stats
+        good = [f for f in link.frames if f.ok and f.payload[:4] != BAT_MAGIC]   # data, not control
+        evm = float(np.median([f.evm for f in good[-64:]])) if good else float("nan")
+        out.setdefault("recv", []).append(dict(what=what, ok=data == expect, why=why, bytes=len(data or b""),
+                                              wait_s=dt, evm=evm, frames_ok=int(st["frames_ok"]),
+                                              frames_bad=int(st["frames_bad"])))
+        if data is None:
+            print(f"RECV {what} FAIL {why} (frames ok {st['frames_ok']} bad {st['frames_bad']})", flush=True)
+            return False
+        if data != expect:
+            print(f"RECV {what} FAIL content differs ({len(data)} bytes, want {len(expect)})", flush=True)
+            return False
+        print(f"RECV {what} {len(data)} bytes crc ok, evm {evm:.3f}, waited {dt:.2f} s "
+              f"(frames ok {st['frames_ok']} bad {st['frames_bad']})", flush=True)
+        return True
+
+    try:
+        time.sleep(a.lead)
+        neg = link.negotiate(initiator, timeout=a.neg_timeout, retry_s=a.retry,
+                             log=lambda m: print(m, flush=True))
+        res = neg["probe"]
+        out["neg"] = {k: v for k, v in neg.items() if k != "probe"}
+        if res is not None and res.ok:
+            out["neg"]["snr_db_median"] = float(np.median(res.snr_db))
+            out["neg"]["cfo_hz"] = float(res.cfo_hz)
+            out["neg"]["image_db"] = res.image_db_median
+        rtd = f"{neg['rtd_s']:.2f} s" if neg.get("rtd_s") is not None else "-"
+        print(f"NEG {'OK' if neg['ok'] else 'FAIL'} settled={int(neg['settled'])} in {neg['seconds']:.1f} s: "
+              f"TX {neg['tx_bits']} bits/sym, RX {neg['rx_bits']} bits/sym, RTD {rtd}; {neg['counts']}", flush=True)
+        if not neg["ok"]:
+            return fail("negotiation")
+        if a.min_bits and min(neg["tx_bits"], neg["rx_bits"]) < a.min_bits:
+            return fail(f"bit tables below --min-bits {a.min_bits}")
+        mine = _p2p_payload(a.send_bytes, a.seed + int(cfg.node_id))
+        theirs = _p2p_payload(a.expect_bytes, a.seed + int(cfg.peer_id))
+        since = neg["since"]
+        if initiator:
+            send(mine)
+            if not check(*recv(since), theirs, "reply"):
+                return fail("reply")
+            if arq:     # the replier may not have our last STAT: answer its re-POLLs before closing
+                out["linger_s"] = round(link.linger(max(0.0, min(60.0, t_end - time.monotonic()))), 2)
+        else:
+            if not check(*recv(since), theirs, "message"):
+                return fail("message")
+            send(mine)
+        time.sleep(a.tail)
+        st = sess.pipe.stats
+        out["pipe"] = dict(tx_samples=int(st.tx_samples), rx_samples=int(st.rx_samples),
+                           rx_error=str(st.rx_error or ""), tx_error=str(st.tx_error or ""),
+                           dropped=int(link._tap.dropped if link._tap else 0))
+        if st.rx_error or st.tx_error:
+            return fail(f"device error rx={st.rx_error} tx={st.tx_error}")
+        if gate is not None and gate.rules and not max(gate.hits(r.cls) for r in gate.rules):
+            return fail("NOHIT: no burst of the slot rule's class went out after the table was agreed")
+        print("P2P PASS", flush=True)
+        return 0
+    except Exception as e:
+        return fail(f"{type(e).__name__}: {e}")
+    finally:
+        out["stats"] = {k: int(v) for k, v in link.stats.items()}
+        if gate is not None:
+            out["slot"] = rep = gate.report()
+            last = rep["picked"][-1]["rules"] if rep["picked"] else []
+            print("SLOT %s armed=%d %s bursts %s" % (rep["spec"], rep["armed"], [(x["rule"], x["n_slots"], x["bits_hit"])
+                  for x in last], {k: (v["filtered"], v["passed"]) for k, v in rep["bursts"].items()}), flush=True)
+        link.stop(); sess.close()
+        if a.json:
+            with open(a.json, "w") as fh:
+                json.dump(out, fh, indent=1, default=str)
+
+
+def cmd_iq_recv(a, reg: Registry) -> int:
+    """Receive one message (and grade probes, with --probe) from an iq: device."""
+    def show(f):
+        print(f"FRAME seq={f.seq} ok={int(f.ok)} evm={f.evm:.3f} errata={f.errata} cfo={f.cfo_hz:+.1f}Hz "
+              f"score={f.score:.2f} at={f.index}", flush=True)
+    sess, link, cfg = _iq_link(a, reg, on_frame=show if a.verbose else None)
+    try:
+        t_end = time.monotonic() + a.seconds
+        if a.probe:
+            res = None
+            while time.monotonic() < t_end:
+                time.sleep(0.25)
+                res = link.grade_probe(window_s=a.probe_window)
+                if res.ok:
+                    break
+            print(res.summary() if res else "probe: none", flush=True)
+            if res is None or not res.ok:
+                return 2
+            time.sleep(link.prober.samples / cfg.fs)   # don't find the same probe again
+        data, why = link.receive_message(max(0.0, t_end - time.monotonic()))
+        st = link.stats
+        print(f"STATS frames_ok={st['frames_ok']} frames_bad={st['frames_bad']} rx_blocks={st['rx_blocks']} "
+              f"dropped={link._tap.dropped if link._tap else 0}", flush=True)
+        if data is None:
+            print(f"RECV FAIL {why}", flush=True)
+            return 1
+        if a.out:
+            open(a.out, "wb").write(data)
+        good = [f for f in link.frames if f.ok]
+        evm = float(np.mean([f.evm for f in good])) if good else float("nan")
+        cfo = float(np.median([f.cfo_hz for f in good])) if good else float("nan")
+        print(f"RECV {len(data)} bytes crc ok evm={evm:.3f} cfo={cfo:+.1f}Hz", flush=True)
+        if a.expect is not None and data != a.expect.encode():
+            print("RECV MISMATCH vs --expect", flush=True)
+            return 1
+        if a.expect_file and data != open(a.expect_file, "rb").read():
+            print("RECV MISMATCH vs --expect-file", flush=True)
+            return 1
+        return 0
+    finally:
+        link.stop(); sess.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="ne0k-modem", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -394,6 +627,65 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--hear-own", action="store_true", help="decode our own TX (null-sink self-loop)")
     p.add_argument("--settings", metavar="FILE.json", help="apply this settings file (File > Save settings format) for this run only")
     p = sub.add_parser("native"); p.set_defaults(fn=cmd_native)
+
+    def iq(p):
+        p.add_argument("--dev", required=True, help="I/Q device, e.g. iq:127.0.0.1:5601 (/sc16 for int16)")
+        p.add_argument("--profile", default="iq", help="modemcfg IQ_PROFILES name (iq = 200 ksps, +-50 kHz)")
+        p.add_argument("--fs", type=int); p.add_argument("--block", type=int)
+        p.add_argument("--tx-rms", type=float); p.add_argument("--bits", type=int, choices=[1, 2, 4, 6])
+        p.add_argument("--node", type=int); p.add_argument("--peer", type=int)
+        p.add_argument("--gapped", action="store_true", help="a frame gap after every frame (default: back to back)")
+        p.add_argument("--no-erasures", action="store_true", help="errors-only RS decode (IqConfig.erasures off)")
+        p.add_argument("--fec", choices=["none", "1/2", "2/3", "3/4"], help="inner code (IqConfig.fec; both ends)")
+        p.add_argument("--window", choices=["mid", "late"], help="FFT window position (IqConfig.window)")
+        p.add_argument("--duplex", choices=["full", "half"], help="keep RX during our TX (full) or mute it (half)")
+        p.add_argument("--no-track", action="store_true", help="no decision-directed tracking between SYNCs")
+        p.add_argument("--iterate", type=int, help="decoder-aided re-estimation passes on a failed frame (0 = off)")
+        p.add_argument("--iterate-win", dest="iterate_win", type=int, help="re-estimation window, +- symbols")
+        p.add_argument("--no-excise", action="store_true", help="do not notch narrowband interferers")
+        p.add_argument("--lbt", action="store_true", help="listen before talk")
+        p.add_argument("--papr-clip", dest="papr_clip_db", type=float, help="clip bursts at this many dB over RMS")
+        p.add_argument("--callsign", help="station ID in CW before the first burst and every ident_s")
+        p.add_argument("--reprobe", dest="reprobe_s", type=float, help="ARQ re-probe interval, s (0 = never)")
+    p = sub.add_parser("iq-send", help="complex OFDM: probe + one message over an iq: device")
+    iq(p); p.set_defaults(fn=cmd_iq_send)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--text"); g.add_argument("--file")
+    p.add_argument("--probes", type=int, default=0, help="probes to send before the message")
+    p.add_argument("--probe-gap", type=float, default=1.0, help="quiet after each probe, s")
+    p.add_argument("--repeat", type=int, default=1, help="send the message this many times")
+    p.add_argument("--gap", type=float, default=0.5, help="quiet between repeats, s")
+    p.add_argument("--lead", type=float, default=0.5, help="wait after connecting, s")
+    p.add_argument("--tail", type=float, default=0.5, help="wait after the last burst, s")
+    p = sub.add_parser("iq-recv", help="complex OFDM: receive one message (and grade a probe) on an iq: device")
+    iq(p); p.set_defaults(fn=cmd_iq_recv)
+    p.add_argument("--seconds", type=float, default=30.0)
+    p.add_argument("--probe", action="store_true", help="first wait for the peer's probe and print its grade")
+    p.add_argument("--probe-window", type=float, default=0.6, help="RX history searched per probe attempt, s")
+    p.add_argument("--expect"); p.add_argument("--expect-file"); p.add_argument("--out")
+    p.add_argument("-v", "--verbose", action="store_true", help="print every frame")
+    p = sub.add_parser("iq-p2p", help="complex OFDM: probe -> BAT exchange, then a message each way")
+    iq(p); p.set_defaults(fn=cmd_iq_p2p)
+    p.add_argument("--role", required=True, choices=["initiator", "responder"])
+    p.add_argument("--send-bytes", type=int, default=100000, help="our message size (seeded random)")
+    p.add_argument("--expect-bytes", type=int, default=100000, help="the peer's message size")
+    p.add_argument("--seed", type=int, default=9000, help="payload seed base (+ node id of the sender)")
+    p.add_argument("--seconds", type=float, default=120.0, help="give up after this long, s")
+    p.add_argument("--neg-timeout", type=float, default=None,
+                   help="probe -> BAT exchange budget, s (default 3 x max RTD + 20)")
+    p.add_argument("--retry", type=float, default=3.0,
+                   help="first resend after this long without an answer, s (backs off until the RTD is measured)")
+    p.add_argument("--max-rtd", type=float, default=None, help="longest round trip to allow for, s (IqConfig.max_rtd_s)")
+    p.add_argument("--min-bits", type=int, default=0, help="fail if either table carries fewer bits/sym")
+    p.add_argument("--no-arq", action="store_true", help="fire and forget (send_message): a lost frame fails the "
+                   "message, as before 2026-11-14.  Default: send_reliable (selective repeat + table updates)")
+    p.add_argument("--arq-rounds", type=int, default=None, help="POLL rounds per message (IqConfig.arq_rounds)")
+    p.add_argument("--slot-impair", default="", help="test hook: engine/slotimpair rule(s) on our TX once our table "
+                   "is agreed, e.g. hot:4:block:data, pilot:all:fuzz@3:ctrl (none: off)")
+    p.add_argument("--slot-seed", type=int, default=1, help="fuzz noise seed (+ node id)")
+    p.add_argument("--lead", type=float, default=0.5, help="wait after connecting, s")
+    p.add_argument("--tail", type=float, default=1.0, help="wait after the last burst, s")
+    p.add_argument("--json", help="write the numbers here")
     p = sub.add_parser("faxmodem", help="Hayes + Class 2 fax modem on an 86Box COM pty, line = SIP call with OFDM over G.711")
     p.set_defaults(fn=cmd_faxmodem)
     p.add_argument("--vm-path", help="86Box -P directory; the COM pty is found from its process")

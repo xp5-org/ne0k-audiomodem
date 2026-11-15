@@ -141,6 +141,32 @@ def test_own_bursts_keep_a_gap_even_from_two_threads():
     assert b0 - a1 >= OWN_GAP_S - 0.02
 
 
+def test_radio_keys_every_burst_even_right_after_our_last():
+    """channel=radio: the PTT drops between two of our bursts (OWN_GAP_S apart), so the second -- the short ACK
+    right after a DATA -- needs its own lead tone too.  The old 4 s idle gate sent it bare."""
+    import time as _t
+    from modemgui.engine.ofdm_link import KEYUP_LEAD_S, keyup
+    fs, n = 8000, 800
+    s = types.SimpleNamespace(_keyup_end=_t.monotonic() - 10, keyup_tone=True)
+    a = keyup(s, np.full(n, 0.5, np.float32), fs)
+    s._keyup_end = _t.monotonic() - 1.3                   # our last burst ended 1.3 s ago
+    b = keyup(s, np.full(n, 0.5, np.float32), fs)
+    assert len(a) == len(b) == n + int(KEYUP_LEAD_S * fs)
+
+
+def test_line_channel_sends_no_lead_tone_but_keeps_the_gap():
+    """channel=line (SIP / dialup / fax-modem audio): no PTT, no PL lead tone; the OWN_GAP_S spacing and the
+    transmit-end mark the receivers' burst gate relies on stay."""
+    import time as _t
+    from modemgui.engine.ofdm_link import keyup
+    fs, n = 8000, 800
+    s = types.SimpleNamespace(_keyup_end=_t.monotonic() - 10, keyup_tone=False)
+    t0 = _t.monotonic()
+    a = keyup(s, np.full(n, 0.5, np.float32), fs)
+    assert len(a) == n
+    assert abs(s._keyup_end - (t0 + n / fs)) < 0.05
+
+
 def test_burst_heard_during_a_decode_keeps_its_real_start():
     """A burst that begins -- or begins and ends -- while the previous one is being decoded must be closed with
     the start it really had, not the moment the gate looked again (a GO's frame was lost so)."""

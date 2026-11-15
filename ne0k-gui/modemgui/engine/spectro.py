@@ -7,18 +7,26 @@ import numpy as np
 
 
 class Stft:
-    def __init__(self, rate: int, nfft: int = 2048, hop: int = 512) -> None:
+    """``iq=True``: complex64 input, two-sided spectrum, ``freqs`` ascending from -rate/2 (the
+    column order the spectrogram draws bottom to top)."""
+
+    def __init__(self, rate: int, nfft: int = 2048, hop: int = 512, iq: bool = False) -> None:
         if hop > nfft:
             raise ValueError("hop > nfft")
-        self.rate, self.nfft, self.hop = rate, nfft, hop
+        self.rate, self.nfft, self.hop, self.iq = rate, nfft, hop, iq
         self.window = np.hanning(nfft).astype(np.float32)
-        self.freqs = np.fft.rfftfreq(nfft, 1.0 / rate)
-        self._buf = np.zeros(0, np.float32)
+        self._dtype = np.complex64 if iq else np.float32
+        if iq:
+            self.freqs = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / rate))
+            self._scale = 1.0 / self.window.sum()      # a full-scale complex tone reads 0 dB
+        else:
+            self.freqs = np.fft.rfftfreq(nfft, 1.0 / rate)
+            self._scale = 1.0 / (self.window.sum() / 2)
+        self._buf = np.zeros(0, self._dtype)
         self._next = 0                 # absolute index of _buf[0]
-        self._scale = 1.0 / (self.window.sum() / 2)
 
     def reset(self) -> None:
-        self._buf = np.zeros(0, np.float32)
+        self._buf = np.zeros(0, self._dtype)
         self._next = 0
 
     def feed(self, x: np.ndarray, index: int | None = None
@@ -29,13 +37,16 @@ class Stft:
             self.reset()
         if index is not None and not len(self._buf):
             self._next = index
-        self._buf = np.concatenate([self._buf, x]) if len(self._buf) else x.astype(np.float32)
+        self._buf = np.concatenate([self._buf, x]) if len(self._buf) else x.astype(self._dtype)
         n = (len(self._buf) - self.nfft) // self.hop + 1 if len(self._buf) >= self.nfft else 0
         first = self._next
         if n <= 0:
             return first, np.zeros((0, len(self.freqs)), np.float32)
         idx = np.arange(self.nfft)[None, :] + self.hop * np.arange(n)[:, None]
-        spec = np.fft.rfft(self._buf[idx] * self.window, axis=1)
+        if self.iq:
+            spec = np.fft.fftshift(np.fft.fft(self._buf[idx] * self.window, axis=1), axes=1)
+        else:
+            spec = np.fft.rfft(self._buf[idx] * self.window, axis=1)
         db = 20 * np.log10(np.abs(spec) * self._scale + 1e-9)
         used = n * self.hop
         self._buf, self._next = self._buf[used:], self._next + used

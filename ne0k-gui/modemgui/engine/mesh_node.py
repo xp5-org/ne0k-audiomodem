@@ -23,7 +23,9 @@ leaves the band to the CSS control plane.  ``phy_mode="css_only"`` skips OFDM al
 above do not apply.  The mesh is OFDM HALF duplex: one shared channel and one receiver per node
 (``mesh_rx``), turns set by the id-ordered announce round (``ofdm_announce``: announce, BAT training,
 one data turn per node), and each link still one-way ``mode="arq"`` on the full band.  There is no
-full-duplex (``mode="full"``, split band) mesh yet; that exists point-to-point only.
+full-duplex (``mode="full"``, split band) mesh yet; that exists point-to-point only: ofdm_only with
+``OfdmConfig.mode="full"`` and no announce round (GUI topology p2p) runs ONE mode-full link to the peer
+(``self.duplex``, ``_duplex_link``), both ends sending at once on their own sub-bands.
 
 BLOCKOUT (``send_blockout``/``end_blockout``, ``self.blockout``): an on-demand exclusive window
 for two nodes, requiring OFDM -- CSS's baud rate cannot carry it, so it is only available under
@@ -185,6 +187,13 @@ class MeshNode:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self.rx: MeshReceiver | None = None    # ofdm_only: the node's one ear (mesh_rx)
+        # ofdm_only + OfdmConfig.mode "full": point-to-point FULL DUPLEX.  One mode-full OfdmLink per peer (key
+        # (peer, "dx")) carries both directions at once on split sub-bands; no shared receiver, no announce round,
+        # no carrier sense.  A mesh (announce round) stays half duplex.
+        self.duplex = mesh.phy_mode == "ofdm_only" and ofdm.mode == "full"
+        if self.duplex and mesh.announce_round:
+            raise ValueError("ofdm mode full is point-to-point only (topology p2p): the mesh announce round is "
+                             "half duplex")
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -200,8 +209,8 @@ class MeshNode:
             t = threading.Thread(target=fn, name=name, daemon=True)
             t.start()
             self._threads.append(t)
-        if not ofdm_only:
-            return                                # css_only / css_then_ofdm: unchanged (each OFDM link listens itself)
+        if not ofdm_only or self.duplex:
+            return                                # css_only / css_then_ofdm / duplex: each OFDM link listens itself
         # ofdm_only -- one ear for the one channel: data frames for every link, announce/GO, blockout REQ/END, IDs
         self.rx = rx = MeshReceiver(self.session, self.ofdm_cfg, self.me, lambda m: self.log(m))
         rx.links = self._all_links
@@ -233,6 +242,14 @@ class MeshNode:
         handshakes (again, whenever the link drops); the responder (ofdm_only, where no CSS REQ will ever
         announce the initiator) just listens.  The announce round runs its own BAT turns, so it is left alone."""
         while not self._stop.wait(2.0):
+            if self.duplex:                       # one full-duplex link to the peer, always trained
+                dst = self.ring_dst_fn()
+                if dst:
+                    try:
+                        self._duplex_link(dst)
+                    except Exception as e:
+                        self.log(f"duplex link to {dst}: {type(e).__name__}: {e}")
+                continue
             if not self.mesh.auto_link or self.announce is not None:
                 continue
             dst = self.ring_dst_fn()
@@ -765,10 +782,13 @@ class MeshNode:
     def _new_link(self, peer: int, requester: bool) -> OfdmLink:
         role = "initiator" if requester else "responder"
         cfg = dataclasses.replace(self.ofdm_cfg, node_id=self.me, peer_id=peer, role=role,
-                                  mode="arq", sender="initiator",
+                                  mode="full" if self.duplex else "arq", sender="initiator",
                                   ack_wait_s=max(self.ofdm_cfg.ack_wait_s, MESH_ACK_WAIT_S))
         lk = OfdmLink(self.session, cfg, log=lambda m, p=peer: self.log(f"ofdm[{p}] {m}"))
         lk.shared_rx = self.rx is not None                     # ofdm_only: data frames come from self.rx, decoded once
+        if self.duplex:                                        # both ends send and receive on the one link
+            lk.on_data = lambda d, p=peer: self._ofdm_rx(p, d)
+            return lk
         if self.announce:                                      # a link coming up ends the current BAT turn, once
             lk.on_state = lambda st, an=self.announce: an.note_own_go() if st == "up" else None
         if not requester:
@@ -846,6 +866,7 @@ class MeshNode:
                 dead = [k for k, lk in self.links.items()
                         if lk.state in ("failed", "closed")
                         or (lk.up and not self.mesh.auto_link     # a powered-on modem stays trained, quiet or not
+                            and k[1] != "dx"                     # so does the duplex link: the peer cannot tell
                             and now - max(lk.last_activity, since or 0.0) > idle_s)]
                 gone = [self.links.pop(k) for k in dead]
             for lk in gone:
@@ -957,6 +978,9 @@ class MeshNode:
         OFDM_HS_REQ to trigger one (``_on_req``) -- there is no CSS REQ either end is ever going
         to send in this mode.  The only caller is ``_apply_blockout_req``, reacting to a
         BLOCKOUT_REQ overheard (via ``_blockout_rx``) from the peer that announced the window."""
+        if self.duplex:
+            self._duplex_link(peer)
+            return
         key = (peer, "rx")
         with self._lock:
             if key in self.links:
@@ -998,6 +1022,8 @@ class MeshNode:
         is just a failed ``send``, not a silent CSS delivery."""
         while time.monotonic() < self._hold_until and not self._stop.wait(1.0):
             pass                                         # someone else's handshake is on the air
+        if self.duplex:                                  # the duplex link frames a payload of any size itself
+            return self._send_duplex(dst, payload)
         if len(payload) > 250:
             raise ValueError("mesh payload over 250 bytes")
         ofdm_only = self.mesh.phy_mode == "ofdm_only"
@@ -1019,6 +1045,41 @@ class MeshNode:
         ok = self._send_css(dst, payload)
         if ok:
             self.tx_count += 1
+        return ok
+
+    def _duplex_link(self, peer: int) -> OfdmLink:
+        """The full-duplex link to ``peer``, created (and started) when missing or dead.  The lower id initiates
+        (role auto) and probes; the other end listens for that probe.  No gate: the pair has the line to itself."""
+        key = (peer, "dx")
+        with self._lock:
+            lk = self.links.get(key)
+            if lk is not None and lk.state not in ("failed", "closed"):
+                return lk
+            self.links.pop(key, None)
+            old, lk = lk, self._new_link(peer, requester=self._is_initiator(peer))
+            self.links[key] = lk
+        if old is not None:
+            old.stop()
+        self.log(f"duplex link to {peer}: {lk.role}")
+        lk.start()
+        return lk
+
+    def _send_duplex(self, dst: int, payload: bytes) -> bool:
+        """Full duplex: send on the one link, whatever the peer is sending meanwhile.  A failed send leaves the
+        link alone (the far end cannot tell it was dropped); the keeper replaces it only once it has failed."""
+        lk = self._duplex_link(dst)
+        if not lk.wait_settled(lk.cfg.hs_timeout_s):
+            self.log(f"duplex send to {dst}: link not up ({lk.fail_reason or lk.state})")
+            return False
+        try:
+            ok = lk.send(payload)
+        except Exception as e:
+            self.log(f"duplex send: {type(e).__name__}: {e}")
+            ok = False
+        if ok:
+            self.tx_count += 1
+        else:
+            self.log(f"OFDM to {dst} failed (full duplex, no ACK)")
         return ok
 
     def _open_tx_link(self, dst: int):

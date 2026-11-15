@@ -58,6 +58,8 @@ long ofdm_mod_frame_samples(const ofdm_mod *m);  /* one frame, no gap */
 /* Samples ofdm_mod_encode will write for an n-byte payload, including the
  * leading and trailing gaps.  Negative on bad args. */
 long ofdm_mod_signal_samples(const ofdm_mod *m, int n_bytes);
+/* Same, for ofdm_mod_encode_ex: gap == 0 leaves out every inter-frame gap. */
+long ofdm_mod_signal_samples_ex(const ofdm_mod *m, int n_bytes, int gap);
 
 /* Encode `n_bytes` into `out`.  The payload is NUL-padded up to a whole number
  * of chunks, exactly as the reference does -- so a payload whose own tail is
@@ -68,6 +70,17 @@ long ofdm_mod_signal_samples(const ofdm_mod *m, int n_bytes);
  * failed. */
 long ofdm_mod_encode(ofdm_mod *m, const unsigned char *data, int n_bytes,
                      double *out, long out_cap);
+
+/* encode_bytes(data, seq0, gap): ofdm_mod_encode is this with seq0 = 0, gap = 1.
+ * `seq0` numbers the first chunk, the rest count up from it, wrapping at
+ * 2^(8*seq_bytes): a continuous broadcast encodes one chunk per call with a
+ * running counter.  `gap` == 0 drops the leading, inter-frame and trailing
+ * silence so consecutive calls' frames play back to back (the SC detector's
+ * min_gap already excludes the gap).  Size `out` with
+ * ofdm_mod_signal_samples_ex(m, n_bytes, gap).  Same error codes. */
+long ofdm_mod_encode_ex(ofdm_mod *m, const unsigned char *data, int n_bytes,
+                        unsigned long seq0, int gap,
+                        double *out, long out_cap);
 
 /* One frame for an explicit sequence number and one chunk of exactly
  * c->chunk_bytes.  Lets a caller drive framing itself (retransmission, a mesh

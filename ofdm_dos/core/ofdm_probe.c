@@ -229,6 +229,7 @@ long ofdm_probe_build(ofdm_probe *p, double *out, long cap)
     long need;
     int  i, j, si = 0, len;
     double *occ_re, *occ_im;
+    unsigned ms;
 
     if (!p || !out) return -1;
     c = &p->c;
@@ -268,9 +269,9 @@ long ofdm_probe_build(ofdm_probe *p, double *out, long cap)
                 p->symbuf[i];
         si++;
     }
+    ms = OFDM_SEED_MEAS;
     for (j = 0; j < p->n_meas_syms; j++) {
-        ofdm_known_bpsk(occ_re, c->n_occupied,
-                        OFDM_SEED_MEAS + (unsigned)j, 1.0 / sqrt(2.0));
+        ms = ofdm_known_bpsk_next(occ_re, c->n_occupied, ms, 1.0 / sqrt(2.0));
         len = ofdm_sym_make(p->sym, occ_re, occ_im, 1, p->symbuf);
         for (i = 0; i < len; i++)
             out[c->symbol_samples + (long)si * c->symbol_samples + i] +=
@@ -625,6 +626,7 @@ int ofdm_probe_estimate(ofdm_probe *p, const double *rx, int n,
     int    lo_g, hi_g, first, meas_at = -1, dly = 0, meas_cnt = 0;
     double gate, peak, floor_v, e, ebest;
     double *pdb;
+    unsigned ms;
 
     if (!p || !rx || !info || !H_re || !H_im || !snr_lin || !snr_db) return -1;
     c   = &p->c;
@@ -796,9 +798,9 @@ int ofdm_probe_estimate(ofdm_probe *p, const double *rx, int n,
     if (meas_at >= 0) {
         acc_reset(p);
         meas_cnt = 0;
+        ms = OFDM_SEED_MEAS;
         for (j = 0; j < p->n_meas_syms; j++) {
-            ofdm_known_bpsk(p->mk, c->n_occupied,
-                            OFDM_SEED_MEAS + (unsigned)j, 1.0 / sqrt(2.0));
+            ms = ofdm_known_bpsk_next(p->mk, c->n_occupied, ms, 1.0 / sqrt(2.0));
             if (H_row(p, rx, n, meas_at + j * SYM, p->mk, p->hr, p->hi) != 0)
                 break;
             meas_cnt++;

@@ -164,12 +164,41 @@ Every mode starts with the same BAT exchange; only what follows differs. Default
 | `half` | both, in alternating windows | per frame | the windows described above |
 | `oneway` | only `--sender` (initiator by default) | none | frames of up to 250 B, `gap_s` of silence between them; a lost frame shows up as a seq gap (`lost_frames`). The listener's `send` / `TXFAIL` is refused. |
 | `stream` | only `--sender` | none | one `send` is one continuous burst (`[len u32] + data + crc16`, chunks back to back); the listener decodes the growing burst every `stream_poll_s` and delivers bytes as they become contiguous (`on_stream(ok, n)` reports the end). Up to 65535 chunks (about 2 MB at 32 B). |
-| `full` | both at once | per frame | FDD: after the full-band exchange the band is split around `--duplex-guard` (`ofdm_fdd.plan_duplex_bands`), initiator low, responder high; each half is its own carrier set with the full-band table re-indexed onto it, and the receiver filters its own half out (`ofdm_fdd.rx_filter`; if the filter costs a frame the raw capture is tried too). Frames are ACKed by a pure-ACK frame on the ACKer's own half, resent after `ack_wait_s`. |
+| `full` | both at once | piggybacked, sliding window | after the full-band BAT exchange each end keys a continuous carrier (chunks back to back, no keyup, no gap) and keeps it up; every chunk is one frame `[src\|dst, seq, ack, len, crc]` carrying data when due, else a filler, and always our current ACK. How the two directions share the line is the `duplex` setting, below. |
 | `arq` | only `sender` | per frame | one-way with acknowledgement and no windows; the data plane of the mesh node. |
+
+##### Full-duplex mechanism (`duplex`: `fdd` or `ec`)
+
+Both ends must use the same `duplex` value (OFDM settings, group *Full duplex*); the difference is whether the
+two directions share the spectrum:
+
+| `duplex` | spectrum | how each end hears the other | use it for |
+|---|---|---|---|
+| `fdd` (default) | **split**: the band is cut around a `--duplex-guard` dead band (`ofdm_fdd.plan_duplex_bands`), initiator low, responder high | each half is its own carrier set with the full-band table re-indexed onto it (`_sub_bat`); the receiver filters its own half out (`ofdm_fdd.rx_filter`) | radio (a transmitter deafens its own receiver) and acoustic audio |
+| `ec` | **whole band both ways**, V.34 style, each direction on the table measured for it | each end subtracts an echo canceller's estimate of its own signal (`engine/ofdm_ec.py`: bulk delay + `ec_taps` FIR, fitted by least squares on the echo of its own BAT probe while the peer listens) | SIP / dial-up / fax-modem lines (2-wire hybrids) |
+
+Settings in the same group:
+
+* `duplex_split` (fdd only): `bits` (default) places the cut so the responder's share of the *capacity* (bits per
+  symbol from both BATs) is `dl_frac`, since a G.711 line carries little above ~3.4 kHz and a 50/50 cut in Hz
+  leaves the high (responder) half short; `hz` cuts the bandwidth itself.
+* `dl_frac` / `ratio`: the responder's share. In `fdd` it moves the band cut. In `ec` the PHY keeps its measured
+  tables and the link enforces the share instead: the end over its share may start a data frame in only some of
+  its chunks (a duty credit, the rest are fillers that still carry ACKs). At `dl_frac` 0.5 with no `ratio`, each
+  direction runs whatever its line supports; `ratio` 50/50 holds the faster direction to the slower one's rate.
+  (Trimming the BAT instead made back-to-back chunks undecodable 1 time in 3 on a clean loop, 2026-11-13.)
+* `ec_taps` (ec only): canceller length after the bulk delay (256 = 5.3 ms at 48 kHz); `0` = no canceller, for a
+  4-wire line that never returns our own audio. With no echo path found in training the canceller stays off and
+  passes audio through, and the link log says so.
+* `ec_window`: data frames in flight unacknowledged (LAPM's k; 1 = stop-and-wait). The receiver keeps frames past
+  a gap, and only the oldest unacked frame has a resend timer (srtt + 4 rttvar, at most `ack_wait_s`).
+
+The canceller's taps and delay are frozen after training. Tracking through data is not done yet: a plain re-fit
+under double talk locks onto false lags, because both ends' chunks carry the same preambles and pilots.
 
 ##### The full-duplex engine in C (`--backend cdx`)
 
-`--ofdm-mode full --backend cdx` runs the whole full-duplex data plane in C89 (`tests/OFDM/c`), loaded through
+`--ofdm-mode full --backend cdx` (with `duplex` `fdd` only; `ec` falls back to the Python data plane, and the link logs that) runs the whole full-duplex data plane in C89 (`tests/OFDM/c`), loaded through
 `engine/ofdm_cdx.py`; the BAT-exchange handshake still runs on the reference modem. The OFDM tab's state line shows
 `backend: c engine (libofdm: ...)` so a run says which plane it used (the global status bar only counts loaded C libs).
 

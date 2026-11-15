@@ -30,6 +30,11 @@ extern "C" {
 #define OFDM_SEED_CE    0x3D5Fu
 #define OFDM_SEED_SC    (0x3D5Fu ^ 0xFFFFu)
 #define OFDM_SEED_PROBE 0x7A3Fu
+/* Start of the probe's measurement block.  The block is ONE PRBS stream:
+ * symbol j takes bits j*n_occupied .. (j+1)*n_occupied-1 (chain
+ * ofdm_known_bpsk_next).  Seeding symbol j with OFDM_SEED_MEAS + j instead
+ * (the old layout) gave every symbol the same first ~10 carriers, because
+ * the output is the LFSR's top bit and adjacent seeds differ only low down. */
 #define OFDM_SEED_MEAS  0x51C7u
 
 /* Amplitude of the DATA FRAME's CE/SYNC symbols relative to _known_bpsk's
@@ -83,6 +88,10 @@ void ofdm_prbs(unsigned char *out, int n, unsigned seed);
  * amp = 1/sqrt(2) for the probe's sequences, or
  * amp = OFDM_REF_SYM_BOOST/sqrt(2) (i.e. 1.0) for a data frame's CE/SYNC. */
 void ofdm_known_bpsk(double *re, int n, unsigned seed, double amp);
+
+/* ofdm_known_bpsk, returning the LFSR state after the n bits: pass it back as
+ * the next call's seed to continue the same stream. */
+unsigned ofdm_known_bpsk_next(double *re, int n, unsigned seed, double amp);
 
 /* Interleave geometry for one frame body: how many equal RS codewords it
  * splits into, their padded data size, and the wire length.  Mirrors

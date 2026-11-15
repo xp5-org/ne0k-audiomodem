@@ -32,6 +32,10 @@ KINDS = {
     "echo":  ("#8b949e", "echo"),
 }
 BARS = ("tx", "rx")                       # kinds that have airtime
+# Events arrive in time order give or take a burst: a tx is logged at its start with its end ahead, an rx at its end.
+# Scanning back from the newest stops this far before the window (so a long burst that began earlier still shows).
+SCAN_SLACK_S = 60.0
+REDRAW_S = 0.25                           # views redraw at most this often, however fast events come
 
 
 def legend_html() -> str:
@@ -57,25 +61,45 @@ class LinkLog:
         """Lane that owns a burst's airtime: we sent a tx, the peer sent what we received."""
         return ev.peer if ev.kind == "rx" and ev.peer >= 0 else ev.node
 
-    def points(self, kinds, lanes: dict[int, int], t_min: float, t_max: float):
+    def window(self, t_min: float, t_max: float) -> list:
+        """Events overlapping [t_min, t_max], oldest first, found by scanning back from the newest: a redraw costs
+        what is on screen, not the whole log.  A full duplex bulk stream logs ~15 events/s, and a whole-log redraw
+        per event pegged the GUI thread, which starved the modem's threads of the GIL (2026-11-13)."""
+        out = []
+        for e in reversed(self.events):
+            if e.t0 < t_min - SCAN_SLACK_S:
+                break
+            if t_min <= e.t1 and e.t0 <= t_max:
+                out.append(e)
+        out.reverse()
+        return out
+
+    def points(self, kinds, lanes: dict[int, int], t_min: float, t_max: float, evs=None):
         """(x_time, lane_index, event) for dot events inside [t_min, t_max]."""
         return [(e.t0 if e.kind != "rx" else e.t1, lanes[e.node], e)
-                for e in self.events if e.kind in kinds and t_min <= e.t1 and e.t0 <= t_max
-                and e.node in lanes]
+                for e in (self.window(t_min, t_max) if evs is None else evs)
+                if e.kind in kinds and e.node in lanes]
 
-    def bars(self, lanes: dict[int, int], t_min: float, t_max: float):
-        return [(e, lanes[self.sender(e)]) for e in self.events
-                if e.kind in BARS and t_min <= e.t1 and e.t0 <= t_max and self.sender(e) in lanes]
+    def bars(self, lanes: dict[int, int], t_min: float, t_max: float, evs=None):
+        return [(e, lanes[self.sender(e)]) for e in (self.window(t_min, t_max) if evs is None else evs)
+                if e.kind in BARS and self.sender(e) in lanes]
+
+
+_BRUSH: dict = {}
+_PEN = None
 
 
 def dots_and_bars(log: LinkLog, lanes, t_min, t_max, y_of, x_of):
     """Shared by both views.  Returns (spots for ScatterPlotItem, {kind: x/y arrays for bars})."""
-    spots = []
-    for t, lane, e in log.points(KINDS, lanes, t_min, t_max):
-        spots.append(dict(pos=(x_of(t), y_of(lane)), brush=pg.mkBrush(KINDS[e.kind][0]),
-                          pen=pg.mkPen("#000", width=0.5), size=9, data=e))
+    global _PEN
+    if _PEN is None:
+        _PEN = pg.mkPen("#000", width=0.5)
+        _BRUSH.update({k: pg.mkBrush(c) for k, (c, _) in KINDS.items()})
+    evs = log.window(t_min, t_max)
+    spots = [dict(pos=(x_of(t), y_of(lane)), brush=_BRUSH[e.kind], pen=_PEN, size=9, data=e)
+             for t, lane, e in log.points(KINDS, lanes, t_min, t_max, evs)]
     bars = {k: ([], []) for k in BARS}
-    for e, lane in log.bars(lanes, t_min, t_max):
+    for e, lane in log.bars(lanes, t_min, t_max, evs):
         xs, ys = bars[e.kind]
         xs += [x_of(e.t0), x_of(e.t1)]; ys += [y_of(lane)] * 2
     return spots, bars
@@ -121,7 +145,8 @@ class PianoRoll(QWidget):
         self.scroll.valueChanged.connect(self._on_scroll)
         self.window.valueChanged.connect(lambda _=None: self.refresh())
         self.follow.toggled.connect(lambda _=None: self.refresh())
-        self._timer = QTimer(self); self._timer.setInterval(250)
+        self._dirty = False
+        self._timer = QTimer(self); self._timer.setInterval(int(REDRAW_S * 1000))
         self._timer.timeout.connect(self._tick); self._timer.start()
         self.refresh()
 
@@ -129,7 +154,7 @@ class PianoRoll(QWidget):
 
     def on_link(self, ev: LinkEvent) -> None:
         self.log.add(ev)
-        self.refresh()
+        self._dirty = True                    # drawn by the next tick, not per event
 
     def clear(self) -> None:
         self.log.clear(); self.t_origin = self._t_stop = time.monotonic(); self.refresh()
@@ -149,7 +174,7 @@ class PianoRoll(QWidget):
         self.refresh()
 
     def _tick(self) -> None:
-        if self._active and self.follow.isChecked() and self.isVisible():
+        if self._dirty or (self._active and self.follow.isChecked() and self.isVisible()):
             self.refresh()
 
     def refresh(self) -> None:
@@ -159,14 +184,20 @@ class PianoRoll(QWidget):
         ax.setTicks([[(i, f"node {n}") for n, i in self._lanes.items()]])
         n = max(1, len(ids))
         self.plot.setYRange(-0.6, n - 0.4, padding=0)
+        self._dirty = False
         o = self.t_origin
-        spots, bars = dots_and_bars(self.log, self._lanes, -1e18, 1e18, float, lambda t: t - o)
+        w = self.window.value()
+        if self.follow.isChecked():
+            t_min, t_max = o + self._now() - 1.1 * w, o + self._now() + 0.2 * w
+        else:                                 # what is in view, plus a screen either side for panning
+            lo, hi = self.plot.getViewBox().viewRange()[0]
+            t_min, t_max = o + lo - (hi - lo), o + hi + (hi - lo)
+        spots, bars = dots_and_bars(self.log, self._lanes, t_min, t_max, float, lambda t: t - o)
         self.dots.setData(spots)
         for k, c in self.curves.items():
             xs, ys = bars[k]
             c.setData(np.array(xs, float), np.array(ys, float)) if xs else c.setData([], [])
         now = self._now()
-        w = self.window.value()
         if self.follow.isChecked():
             self._syncing = True
             self.plot.setXRange(now - w + 0.1 * w, now + 0.1 * w, padding=0)
@@ -189,6 +220,7 @@ class PianoRoll(QWidget):
         if self._syncing:
             return
         self.follow.setChecked(False)         # user panned/zoomed: stop chasing the live edge
+        self._dirty = True                    # draw what panned into view
         self._sync_scrollbar(self._now(), self.window.value())
 
     def _on_scroll(self, v: int) -> None:

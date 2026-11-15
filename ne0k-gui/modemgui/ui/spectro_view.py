@@ -8,11 +8,12 @@ import time
 
 import numpy as np
 import pyqtgraph as pg
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QHBoxLayout, QLabel, QSpinBox,
                                QVBoxLayout, QWidget)
 
 from ..engine import Spectrum
-from .pianoroll import BARS, KINDS, LinkLog, dots_and_bars
+from .pianoroll import BARS, KINDS, REDRAW_S, LinkLog, dots_and_bars
 
 
 class SpectroView(QWidget):
@@ -102,4 +103,11 @@ class SpectroView(QWidget):
             c.setData(np.array(xs, float), np.array(ys, float)) if xs else c.setData([], [])
 
     def on_link(self, ev=None) -> None:
+        # coalesced: a bulk stream logs ~15 events/s; one overlay redraw per REDRAW_S is plenty
+        if not getattr(self, "_ov_pending", False):
+            self._ov_pending = True
+            QTimer.singleShot(int(REDRAW_S * 1000), self._ov_flush)
+
+    def _ov_flush(self) -> None:
+        self._ov_pending = False
         self._draw_overlay()
