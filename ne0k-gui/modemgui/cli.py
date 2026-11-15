@@ -254,12 +254,27 @@ def cmd_serial(a, reg: Registry) -> int:
                       log=lambda m: (diag.log("serial: " + m), print("serial:", m, flush=True, file=sys.__stdout__)),
                       ack=a.ack, retries=a.retries, dst=dst)
     br.start()
+    ctl = None
+    if a.control_port is not None:
+        from .engine.control import ControlServer, EngineHost
+        secs = {"mesh": cfg.mesh, "css": cfg.css_cfg, "ofdm": cfg.ofdm_cfg} if a.modem == "mesh" else {a.modem: cfg}
+        ctl = ControlServer(EngineHost(br, {k: v for k, v in secs.items() if v is not None}), a.control_port,
+                            a.control_bind, log=lambda m: (diag.log("control: " + m),
+                                                           print("control:", m, flush=True, file=sys.__stdout__)))
+        try:
+            ctl.start()
+        except OSError as e:
+            print(f"error: control port {a.control_bind}:{a.control_port}: {e}", file=sys.stderr)
+            br.stop(); s.close(); diag.close()
+            return 2
     end = time.monotonic() + a.seconds if a.seconds else None
     try:
         while end is None or time.monotonic() < end:
             time.sleep(0.2)
     except KeyboardInterrupt:
         pass
+    if ctl:
+        ctl.stop()
     br.stop(); s.close(); diag.close()
     if diag.dir:
         print(f"serial: diagnostics in {diag.dir}", flush=True)
@@ -300,7 +315,8 @@ def cmd_faxmodem(a, reg: Registry) -> int:
 
 def cmd_gui(a, reg: Registry) -> int:
     from .ui.app import main as gui_main
-    return gui_main(rx=a.rx, tx=a.tx, autosend=a.autosend, hear_own=a.hear_own, settings_file=a.settings)
+    return gui_main(rx=a.rx, tx=a.tx, autosend=a.autosend, hear_own=a.hear_own, settings_file=a.settings,
+                    control_port=a.control_port, control_bind=a.control_bind)
 
 
 def cmd_native(a, reg) -> int:
@@ -559,6 +575,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wav")
     p = sub.add_parser("loopback"); common(p, rx=True, tx=True); p.set_defaults(fn=cmd_loopback)
     p.add_argument("--tone", type=float, default=1500.0); p.add_argument("--seconds", type=float, default=1.5)
+    def control(p):
+        p.add_argument("--control-port", type=int, default=None, metavar="PORT",
+                       help="TCP control/debug port (README: TCP control port); off unless given, 0 = any free port. "
+                            "NO AUTHENTICATION")
+        p.add_argument("--control-bind", default="127.0.0.1", metavar="ADDR",
+                       help="address the control port listens on (default 127.0.0.1; 0.0.0.0 = every interface)")
     def css(p):
         p.add_argument("--preset", default="Fast (POC)", choices=["Fast (POC)", "Robust", "Over the air"])
     p = sub.add_parser("send"); common(p, tx=True); css(p); p.set_defaults(fn=cmd_send)
@@ -621,11 +643,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="record the audio we received / transmitted (time-aligned WAVs)")
     p.add_argument("--diag-dir", default=str(__import__("pathlib").Path.home() / "modemgui-diagnostics"),
                    help="where --debug-log / --capture-wav write their session folder")
+    control(p)
     p = sub.add_parser("gui", help="desktop app (needs PySide6)")
     p.add_argument("--rx"); p.add_argument("--tx"); p.set_defaults(fn=cmd_gui)
     p.add_argument("--autosend", help="transmit this text once the window is up (demo)")
     p.add_argument("--hear-own", action="store_true", help="decode our own TX (null-sink self-loop)")
     p.add_argument("--settings", metavar="FILE.json", help="apply this settings file (File > Save settings format) for this run only")
+    control(p)
     p = sub.add_parser("native"); p.set_defaults(fn=cmd_native)
 
     def iq(p):

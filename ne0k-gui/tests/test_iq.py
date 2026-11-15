@@ -586,6 +586,69 @@ def test_late_bat_after_negotiate_gets_a_ready():
     assert late == 1 and f is not None
 
 
+def test_negotiate_sends_a_table_improved_in_the_ready_pass():
+    """vhf-mobile 2026-11-15: the responder's first probe was in a fade, its second
+    probe improved the table in the same pass the peer's BAT{have} arrived; READY went first and the
+    better table was never sent, so the initiator stayed at the faded table.  Forced here: node 1's
+    first probe is cut to a weak table, its second is held until node 0's BAT{have} is decodable."""
+    _cx_or_skip()
+    import dataclasses
+    from modemgui.engine.iq_link import IqLink, open_iq_session, BAT_MAGIC
+    cfg = [iq_profile(block=2000, node_id=k, peer_id=1 - k) for k in range(2)]
+    med = PairMedium(cfo_hz=(0.0, 0.0), noise=0.2 * 10 ** (-30 / 20))
+    try:
+        sess = [open_iq_session(cfg[k], f"iq:127.0.0.1:{med.ports[k]}") for k in range(2)]
+        link = [IqLink(sess[k], cfg[k]).start() for k in range(2)]
+        time.sleep(0.3)
+        real, n_probe, good, start = link[1].poll_probe, [0], [], link[1].rx_now()
+
+        def peer_bat_have() -> bool:
+            for f in list(link[1].frames):
+                if f.ok and f.payload[:4] == BAT_MAGIC and f.index >= start:
+                    try:
+                        ln = int.from_bytes(f.payload[4:8], "big")
+                        if link[1]._parse_bat(f.payload[8:8 + ln])[1]:
+                            return True
+                    except ValueError:
+                        pass
+            return False
+
+        def poll(since):
+            got = real(since)
+            if not got:
+                return got
+            if n_probe[0] == 0:                       # faded: 2 bits on carrier 0, nothing else
+                n_probe[0] = 1
+                weak = [0] * len(got[0].bat)
+                weak[0] = 2
+                return dataclasses.replace(got[0], bat=weak), got[1]
+            if n_probe[0] == 1 and not peer_bat_have():
+                return None                           # hold the good probe for the peer's BAT pass
+            if n_probe[0] == 1:
+                n_probe[0], good[:] = 2, list(got[0].bat)
+            # later probes add nothing: only the BAT sent before
+            # READY can carry it, not the after-done resend on an improvement
+            return dataclasses.replace(got[0], bat=list(good)), got[1]
+        link[1].poll_probe = poll
+        res = [None, None]
+
+        def run(k):
+            res[k] = link[k].negotiate(initiator=k == 0, timeout=40, retry_s=2.0)
+        th = [threading.Thread(target=run, args=(k,)) for k in range(2)]
+        for t in th:
+            t.start()
+        for t in th:
+            t.join(50)
+        for k in range(2):
+            link[k].stop(); sess[k].close()
+    finally:
+        med.close()
+    assert n_probe[0] == 2, "the race was not set up"
+    assert res[0]["ok"] and res[1]["ok"], res
+    assert res[0]["tx_bat"] == res[1]["rx_bat"], (res[0]["tx_bits"], res[1]["rx_bits"])
+    assert res[0]["tx_bits"] > sum(link[0].base.bat)
+
+
 def test_arq_table_update_routes_around_pinned_dead_carriers():
     """Eight dead hot carriers that stay put (:pin), RS-only frame: past the erasure budget, so frames are lost;
     with ARQ the receiver's STAT carries a table with those carriers at 0 bits, the missing frames go

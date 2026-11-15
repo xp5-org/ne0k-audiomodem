@@ -39,6 +39,11 @@ from .statusstrip import StatusStrip
 STATE_VERSION = 5                          # bump when the dock set changes (tabs -> docks 1 -> 2, BAT dock 2 -> 3, status strip 4 -> 5)
 
 
+def g_hub(g) -> bool:
+    """Hub & spoke topology (hub / hub_relay): the hub's schedule runs the channel."""
+    return g.topology in ("hub", "hub_relay")
+
+
 def _echo(line: str) -> None:
     """Also write a line to the process stdout (the run's modemgui.log), timestamped like the CLI path does."""
     try:
@@ -178,6 +183,11 @@ class MainWindow(QMainWindow):
 
     def _show_mode(self) -> None:
         g = self.app.general
+        if g_hub(g):
+            self.column.set_mode(f"{g.modem.upper()}, hub & spoke{' + relay' if g.topology == 'hub_relay' else ''}, "
+                                 + (f"HUB (node {g.node_id}) of {g.hub_nodes}" if g.node_id == g.hub_id
+                                    else f"node {g.node_id}, hub {g.hub_id}"))
+            return
         self.column.set_mode(f"{g.modem.upper()}, {'point to point' if g.topology == 'p2p' else 'mesh'}, "
                              f"node {g.node_id}" + (f" -> {g.peer_id}" if g.topology == "p2p" else ", beacons " + ("on" if g.beacon else "off")))
 
@@ -520,10 +530,11 @@ class MainWindow(QMainWindow):
             mesh = self._make_mesh()
             br = SerialBridge(self.session, mesh, str(Path(sc.link_path).expanduser()), sc.buffer,
                               sc.mode, sc.idle_s, log=lambda m: self.app.diag.log_serial and (self.diag.log("serial: " + m), _echo("serial: " + m)),
-                              ack=sc.ack, retries=sc.retries, dst=lambda: self._mesh_dst(mesh))
+                              ack=sc.ack, retries=sc.retries, dst=lambda: self._mesh_dst(mesh),
+                              page_addr=sc.page_addr if g_hub(self.app.general) else "off")
             to_host = mesh.on_data                     # the bridge's receive queue; the Log hears it too
             mesh.on_data = lambda src, d: (self._mesh_rx(src, d), to_host(src, d))
-            if sc.rx_host:
+            if sc.rx_host and not g_hub(self.app.general):
                 br.rx_filter = lambda src, h=sc.rx_host: src == h
             br.start()
             self.link = mesh
@@ -624,7 +635,12 @@ class MainWindow(QMainWindow):
                         hs_guard_s=g.hs_guard_s, announce_round=g.announce_round,
                         announce_bat_turn_s=g.announce_bat_turn_s, announce_cycle_s=g.announce_cycle_s,
                         announce_bat_mode=g.announce_bat_mode,
-                        auto_link=g.auto_link and g.blockout_role == "off")   # blockout trials sequence their own links
+                        auto_link=g.auto_link and g.blockout_role == "off",   # blockout trials sequence their own links
+                        topology=g.topology if g_hub(g) else "mesh", hub_id=g.hub_id, hub_nodes=g.hub_nodes,
+                        hub_turn_s=g.hub_turn_s, hub_cycle_s=g.hub_cycle_s, hub_page_timeout_s=g.hub_page_timeout_s)
+        if g_hub(g):
+            mc.announce_round = False                 # the hub's schedule replaces the mesh announce round
+            mc.auto_link = False
         mesh = MeshNode(self.session, mc, self.app.css,
                         self.app.ofdm, log=lambda m: (self.diag.log("mesh: " + m), _echo("mesh: " + m)), own_events=False)
         mesh.on_data = self._mesh_rx
@@ -637,6 +653,8 @@ class MainWindow(QMainWindow):
         g = self.app.general
         if g.topology == "p2p":
             return g.peer_id
+        if g_hub(g):                                  # a client sends to the hub; the hub, unaddressed, to everyone
+            return 0xF if g.node_id == g.hub_id else g.hub_id
         return g.mesh_dst or mesh.best_neighbor()
 
     def _mesh_rx(self, src: int, data: bytes) -> None:
@@ -677,7 +695,7 @@ class MainWindow(QMainWindow):
         is never coming.  Every path that (re)creates the mesh node must call this: the serial
         bridge builds a fresh node, and without it that node is an initiator with no responder
         anywhere on the ring, so no handshake can ever complete."""
-        if mesh.mesh.phy_mode == "ofdm_only" and self.app.serial.rx_host:
+        if mesh.mesh.phy_mode == "ofdm_only" and self.app.serial.rx_host and mesh.hub is None:
             mesh._ensure_rx_link(self.app.serial.rx_host)
 
     def _schedule_blockout(self, mesh: MeshNode) -> None:
@@ -735,9 +753,14 @@ class MainWindow(QMainWindow):
                         # just its handshake ("link up" fires before the data frame does), before
                         # taking the channel for our own reply -- single radio, one transmission
                         # at a time.
+                        # A payload longer than one frame (carrier-schedule OFDM: one note per frame) lands
+                        # piece by piece, so wait for all of it: both legs send blockout_payload, so
+                        # its length is what the announcer's leg delivers.
                         rx0 = mesh.rx_count
+                        b0 = mesh.ofdm_rx_bytes.get(g.blockout_peer, 0)
                         while self.link is mesh and time.monotonic() < deadline:
-                            if mesh.rx_count > rx0:
+                            if mesh.rx_count > rx0 and \
+                                    mesh.ofdm_rx_bytes.get(g.blockout_peer, 0) - b0 >= len(payload):
                                 break
                             time.sleep(0.5)
                     # drop the link we just received the announcer's leg on: single radio, one

@@ -1,10 +1,10 @@
 """
-melodic_ofdm_demo.py  —  OFDM synthesis on a musical scale (audition only, no decoder).
+schedule_ofdm_demo.py  —  OFDM synthesis on a musical scale.
 
 Standard OFDM places subcarriers on a uniform FFT grid (k * fs/n_fft Hz).
 This variant instead:
   * builds a musical scale over [f_min, f_max],
-  * snaps each scale note to its nearest FFT bin (still orthogonal OFDM),
+  * snaps each scale note to its nearest FFT bin,
   * activates only those bins, mutes everything else,
   * QAM-modulates data onto each active bin.
 One OFDM symbol (n_fft/fs seconds) is a held chord of scale notes, with data
@@ -16,23 +16,23 @@ Modes
   --chord         every symbol rings the whole scale (sustained OFDM drone,
                   max carriers / max data rate).
   (default)       follow a melody (MIDI or built-in Fur Elise): each symbol
-                  activates the current note's bin + its octave (dual-tone).
+                  activates the current note's bin + its octave.
 
-Melody pitch mapping (dual-tone mode) is chromatic, not scale-quantized: it
-reuses build_mapper()'s equal-tempered note->Hz from melodic_css_demo.py.
+Melody pitch mapping is chromatic, not scale-quantized: it
+reuses build_mapper()'s equal-tempered note->Hz from schedule_css_demo.py.
 --scale only shapes --chord's drone and the note->bin snap grid.
 
-Note timing uses the MIDI file's own tempo (Set Tempo meta event) by default,
+Note timing uses the MIDI file's own tempo by default,
 via get_midi_tempo(). Override with --beat-unit.
 
 Usage
 -----
-  python melodic_ofdm_demo.py                         # Fur Elise melody, QPSK
-  python melodic_ofdm_demo.py --chord                 # full-scale drone
-  python melodic_ofdm_demo.py fur_elise.mid --use-note-dur
-  python melodic_ofdm_demo.py --fmin 400 --fmax 4000 --nfft 8192
+  python schedule_ofdm_demo.py                         # Fur Elise melody, QPSK
+  python schedule_ofdm_demo.py --chord                 # full-scale drone
+  python schedule_ofdm_demo.py fur_elise.mid --use-note-dur
+  python schedule_ofdm_demo.py --fmin 400 --fmax 4000 --nfft 8192
 
-Reuses parse_midi_melody / build_mapper / get_midi_tempo from melodic_css_demo.py.
+Reuses parse_midi_melody / build_mapper / get_midi_tempo from schedule_css_demo.py.
 """
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 XP5-ORG
@@ -56,7 +56,8 @@ for _p in (_TESTS_ROOT, _REPO_ROOT, _TESTS_ROOT / "CSS", _TESTS_ROOT / "MESH",
         _sys.path.insert(0, _s)
 # --- end bootstrap ---
 
-from melodic_css_demo import parse_midi_melody, build_mapper, get_midi_tempo, _FUR_ELISE
+from schedule_css_demo import (parse_midi_melody, build_mapper, get_midi_tempo,
+                              _FUR_ELISE, _read_vlq)
 
 # --- QAM constellations (unit average power), Gray-coded ---------------------
 _R2, _R10 = math.sqrt(2), math.sqrt(10)
@@ -74,7 +75,7 @@ _SCALES = {
 
 
 def scale_freqs(f_min, f_max, scale):
-    """Musical scale frequencies (Hz) spanning [f_min, f_max], A440 tuning."""
+    """Musical scale frequencies spanning [f_min, f_max], A440 tuning."""
     degs = _SCALES[scale]
     # midi 69 = A4 = 440 Hz. Walk octaves overlapping the band.
     out = []
@@ -110,11 +111,120 @@ def ofdm_symbol(active_bins, syms, n_fft, cp_len):
     return np.concatenate([td[-cp_len:], td])
 
 
+def parse_midi_held_top(path, track=None):
+    """Like parse_midi_melody() but the skyline is taken over notes still
+    SOUNDING (note-offs honoured), not just notes struck on the same tick.
+    A left-hand note under a held right-hand note is skipped; when the right
+    hand rests, the left hand becomes the top line (e.g. an intro bass walk).
+    Returns [(midi_note, duration_beats)]."""
+    import struct
+    data = open(path, "rb").read()
+    hlen = struct.unpack(">I", data[4:8])[0]
+    _fmt, ntracks, division = struct.unpack(">HHH", data[8:14])
+    if division & 0x8000:
+        division = 480
+    pos = 8 + hlen
+    tracks = []                          # per track: [(tick, on, note)]
+    for _ in range(ntracks):
+        tlen = struct.unpack(">I", data[pos + 4:pos + 8])[0]
+        i, end = pos + 8, pos + 8 + tlen
+        pos = end
+        tick, status, ev = 0, 0, []
+        while i < end:
+            dt, i = _read_vlq(data, i)
+            tick += dt
+            if data[i] & 0x80:
+                status = data[i]; i += 1
+            if status == 0xFF:
+                i += 1
+                mlen, i = _read_vlq(data, i)
+                i += mlen
+            elif status in (0xF0, 0xF7):
+                slen, i = _read_vlq(data, i)
+                i += slen
+            elif status & 0xF0 in (0x80, 0x90):
+                note, vel = data[i], data[i + 1]; i += 2
+                ev.append((tick, status & 0xF0 == 0x90 and vel > 0, note))
+            else:
+                i += 1 if status & 0xF0 in (0xC0, 0xD0) else 2
+        tracks.append(ev)
+    cands = [k for k, ev in enumerate(tracks) if any(on for _, on, _ in ev)]
+    if track is None:
+        track = max(cands, key=lambda k: (np.mean([n for _, on, n in tracks[k] if on]),
+                                          len(tracks[k])))
+    # offs before ons on the same tick
+    ev = sorted(tracks[track], key=lambda e: (e[0], e[1]))
+    sounding, line, j = {}, [], 0
+    while j < len(ev):
+        tick, struck = ev[j][0], []
+        while j < len(ev) and ev[j][0] == tick:
+            _, on, n = ev[j]; j += 1
+            if on:
+                sounding[n] = sounding.get(n, 0) + 1; struck.append(n)
+            elif sounding.get(n):
+                sounding[n] -= 1
+                if not sounding[n]:
+                    del sounding[n]
+        if struck and max(struck) >= max(sounding):
+            line.append((tick, max(struck)))
+    return [(n, max(0.125, ((line[k + 1][0] if k + 1 < len(line) else t + division) - t)
+                    / division)) for k, (t, n) in enumerate(line)]
+
+
+def fit_to_band(notes_w, f_min, f_max):
+    """Scan the (note, weight) list ahead of rendering and pick a semitone
+    transposition that puts its whole pitch span inside [f_min, f_max].
+    If the span is wider than the band, choose the transposition that folds
+    the least note-time, and octave-fold the stragglers inward.
+    Returns (tone(note)->Hz, info dict)."""
+    et = lambda n: 440.0 * 2 ** ((n - 69) / 12.0)
+    lo = min(n for n, _ in notes_w); hi = max(n for n, _ in notes_w)
+    band = 12 * math.log2(f_max / f_min)            # semitones available
+    # transpositions placing lo at or just above f_min .. hi at or below f_max
+    t_lo = math.ceil(12 * math.log2(f_min / et(lo)))
+    t_hi = math.floor(12 * math.log2(f_max / et(hi)))
+    def cost(t):
+        return sum(w for n, w in notes_w if not f_min <= et(n + t) <= f_max)
+    if t_hi >= t_lo:
+        tr = t_lo                     # fits: sit low, max room for octave companions
+    else:
+        tr = min(range(t_hi, t_lo + 1), key=lambda t: (cost(t), -t))
+    def tone(n):
+        f = et(n + tr)
+        while f < f_min: f *= 2
+        while f > f_max: f /= 2
+        return f
+    folded = sorted({n for n, _ in notes_w if not f_min <= et(n + tr) <= f_max})
+    return tone, dict(lo=lo, hi=hi, span=hi - lo, band=band, transpose=tr,
+                      folded=folded, fold_frac=cost(tr) / sum(w for _, w in notes_w))
+
+
+def clean_melody(melody, min_note=0, quantize=0.0, b_start=0.0, b_end=None):
+    """Re-skyline a (note, beats) melody: drop notes below min_note, snap onsets to a `quantize`-beat grid so rolled octaves merge, and keep only onsets in [b_start, b_end) beats."""
+    t, ons = 0.0, []
+    for n, d in melody:
+        ons.append((t, n)); t += d
+    total = t
+    sky = {}
+    for t, n in ons:
+        if n < min_note:
+            continue
+        if quantize > 0:
+            t = round(t / quantize) * quantize
+        if t < b_start or (b_end is not None and t >= b_end):
+            continue
+        sky[t] = max(n, sky.get(t, -1))
+    ts = sorted(sky)
+    end = b_end if b_end is not None else total
+    return [(sky[t], (ts[i + 1] if i + 1 < len(ts) else end) - t)
+            for i, t in enumerate(ts)]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("midi", nargs="?", help="input .mid (omit for Fur Elise)")
-    ap.add_argument("-o", "--out", default="melodic_ofdm.wav")
+    ap.add_argument("-o", "--out", default="schedule_ofdm.wav")
     ap.add_argument("--message", default=None, help="data bytes (else random)")
     ap.add_argument("--fmin", type=float, default=400.0)
     ap.add_argument("--fmax", type=float, default=4000.0)
@@ -137,7 +247,25 @@ def main():
     ap.add_argument("--beat-unit", type=float, default=None,
                     help="seconds per quarter-note beat (tempo); default: read "
                          "the MIDI file's own Set Tempo event")
-    ap.add_argument("--gap", type=float, default=0.0, help="silence between symbols s")
+    ap.add_argument("--held-skyline", action="store_true",
+                    help="top line = highest note still SOUNDING (note-offs), "
+                         "so LH notes under a held RH note don't leak in")
+    ap.add_argument("--fit", action="store_true",
+                    help="scan the whole (windowed) melody first and transpose "
+                         "by semitones so its full span fits [fmin, fmax]; "
+                         "octave-fold only if the span is wider than the band; "
+                         "octave companions only where they stay <= fmax")
+    ap.add_argument("--harm-rolloff", type=float, default=0.0,
+                    help="overtone level k**-R for the k-th harmonic carrier "
+                         "(octave = k 2); 0 = all carriers equal (old sound), "
+                         "1 = sawtooth-like, 2 = mellow")
+    ap.add_argument("--min-note", type=int, default=0,
+                    help="drop MIDI notes below this before skyline (strip bass)")
+    ap.add_argument("--quantize", type=float, default=0.0,
+                    help="snap onsets to this beat grid first (merges rolled octaves)")
+    ap.add_argument("--t-start", type=float, default=0.0, help="window start s")
+    ap.add_argument("--t-end", type=float, default=None, help="window end s")
+    ap.add_argument("--gap",type=float, default=0.0, help="silence between symbols s")
     ap.add_argument("--amp", type=float, default=0.7)
     ap.add_argument("--extra-carriers", type=int, default=0,
                     help="extra data-only subcarriers ABOVE fmax, always active "
@@ -165,9 +293,10 @@ def main():
 
     # Extra data-only carriers track the current note as integer-multiple
     # harmonics of its fundamental. b0=1st harmonic (fundamental), b1=2nd
-    # (octave, existing dual-tone); extras are the 3rd..(2+extra_carriers)th
-    # harmonics, capped at --extra-fmax (default 3x fmax) / Nyquist.
-    extra_fmax = args.extra_fmax or args.fmax * 3
+    #; extras are the 3rd..(2+extra_carriers)th
+    # harmonics, capped at --extra-fmax / Nyquist.
+    # With --fit the whole signal must stay in band, so overtones stop at fmax.
+    extra_fmax = args.extra_fmax or (args.fmax if args.fit else args.fmax * 3)
     extra_bin_cap = min(n_fft // 2 - 1, int(math.floor(extra_fmax / sc)))
 
     def harmonics(base_freq, count, taken):
@@ -190,7 +319,7 @@ def main():
     bitpos = 0
 
     def next_syms(k):
-        """k QAM symbols from the message (looped) or random."""
+        """k QAM symbols from the message or random."""
         nonlocal bitpos
         idxs = np.empty(k, dtype=int)
         for j in range(k):
@@ -210,7 +339,9 @@ def main():
         src = f"scale drone ({args.scale})"
     else:
         if args.midi:
-            melody = parse_midi_melody(args.midi, track=args.track)
+            melody = (parse_midi_held_top(args.midi, track=args.track)
+                      if args.held_skyline else
+                      parse_midi_melody(args.midi, track=args.track))
             src = args.midi
             beat_unit = (args.beat_unit if args.beat_unit is not None
                         else get_midi_tempo(args.midi))
@@ -218,13 +349,21 @@ def main():
             melody = _FUR_ELISE
             src = "built-in Fur Elise"
             beat_unit = args.beat_unit if args.beat_unit is not None else 0.5
+        if args.min_note or args.quantize or args.t_start or args.t_end:
+            melody = clean_melody(
+                melody, args.min_note, args.quantize, args.t_start / beat_unit,
+                None if args.t_end is None else args.t_end / beat_unit)
         if args.limit > 0:
             melody = melody[:args.limit]
 
         # Dual-tone mapping is chromatic (equal-tempered), not snapped to the
         # --scale grid: reuses build_mapper(), preserving every semitone interval.
         notes = [n for n, _ in melody]
-        tone  = build_mapper(notes, args.fmin, args.fmax, "musical", args.headroom)
+        fit = None
+        if args.fit:
+            tone, fit = fit_to_band(melody, args.fmin, args.fmax)
+        else:
+            tone = build_mapper(notes, args.fmin, args.fmax, "musical", args.headroom)
         all_bins = list(range(bin_lo, bin_hi + 1))
 
         def nearest_bin(f):
@@ -232,16 +371,21 @@ def main():
             return min(all_bins, key=lambda x: abs(x - b))
 
         symbol_bins = []
+        t_note = 0.0   # cumulative note time: round slot ends, not durations,
+                       # so short notes don't drift the rhythm
         for note, beats in melody:
             base = tone(note)
             b0 = nearest_bin(base)
-            b1 = nearest_bin(base * 2)          # octave companion (dual-tone)
+            b1 = nearest_bin(base * 2)          # octave companion
+            if fit and base * 2 > args.fmax:
+                b1 = b0          # --fit: no companion above the band
             active = [b0] if b1 == b0 else [b0, b1]
             if args.extra_carriers > 0:
                 active = active + harmonics(base, args.extra_carriers, set(active))
             # Hold this note's chord across enough OFDM symbols to match its
             # MIDI duration. Each held symbol still draws fresh QAM data.
-            n_slots = (max(1, round(beats * beat_unit / sym_dur))
+            t_note += beats * beat_unit
+            n_slots = (max(1, round(t_note / sym_dur) - len(symbol_bins))
                        if args.use_note_dur else 1)
             symbol_bins.extend([active] * n_slots)
 
@@ -250,7 +394,12 @@ def main():
     taper = max(1, int(fs * 0.004))
     out = [np.zeros(int(fs * 0.1), dtype=np.float32)]
     for active in symbol_bins:
-        s = ofdm_symbol(active, next_syms(len(active)), n_fft, cp_len)
+        syms = next_syms(len(active))
+        if args.harm_rolloff and not args.chord:
+            # overtone k (= bin/fundamental bin) at k**-rolloff: QPSK data is
+            # in the phase, so per-carrier level is free to shape the timbre
+            syms = syms * (np.array(active, float) / active[0]) ** -args.harm_rolloff
+        s = ofdm_symbol(active, syms, n_fft, cp_len)
         s = s.astype(np.float32)
         ramp = np.linspace(0, 1, taper, dtype=np.float32)
         s[:taper] *= ramp
@@ -283,6 +432,17 @@ def main():
         print(f"tempo         : {beat_unit:.3f} s/beat ({60/beat_unit:.1f} bpm)"
               f"{'  [--beat-unit override]' if args.beat_unit is not None else '  [from MIDI]'}"
               f"   note-dur={'on' if args.use_note_dur else 'off (1 symbol/note)'}")
+        if fit:
+            nm = lambda n: "C C# D D# E F F# G G# A A# B".split()[n % 12] + str(n // 12 - 1)
+            comp = np.mean([len(a) > 1 for a in symbol_bins])
+            print(f"fit           : melody {nm(fit['lo'])}-{nm(fit['hi'])} = {fit['span']} st, "
+                  f"band {args.fmin:.0f}-{args.fmax:.0f} Hz = {fit['band']:.1f} st, "
+                  f"transpose {fit['transpose']:+d} st -> "
+                  f"{tone(fit['lo']):.0f}-{tone(fit['hi']):.0f} Hz")
+            print(f"              : octave-folded notes: "
+                  f"{', '.join(map(nm, fit['folded'])) or 'none'} "
+                  f"({fit['fold_frac']*100:.0f}% of note time); "
+                  f"octave companion on {comp*100:.0f}% of symbols")
     print(f"wrote         : {args.out}   ({len(audio)/fs:.1f} s)")
 
 

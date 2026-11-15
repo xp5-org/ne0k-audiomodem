@@ -598,7 +598,24 @@ idea does, as the coherent form of turbo channel estimation.
   a quarter of HF frames are never found (sync).  Best setting in the bench: passes 3, half_win 4-8.
 - *Test:* tests/test_iq.py `test_iterate_rescues_frames_on_a_fast_selective_fade` (echo 20 samples @ 0.5
   with its own 6 Hz Doppler: 0/6 frames off, 6/6 at iterate 3 / win 4, payload checked).
-- *Next:* cluster `gnuradio-iq-impair-2node` with `--iterate 3 --iterate-win 4` vs without (vhf-mobile,
+- *Cluster A/B 2026-11-15* (`gnuradio-iq-impair-2node`, testlist key `p2p_extra` set per member via POST
+  /groups; both arms R xp5kvm15, A xp5kvm13, B xp5kvm14; baseline group ..._dd25, iterate ..._18eb):
+  - baseline 15/16 (hf-moderate on the default profile, as 10e).  Iterate arm 13/16.
+  - hf-moderate-hf: bad frames A 22 -> 12, B 65 -> 19 (kbit/s 139/104 -> 110/112); the cell the bench
+    called unchanged improves on the real medium.  All other passing cells within run-to-run noise.
+  - vhf-mobile FAILED in the iterate arm, not because of it: B's first probe of A landed in a fade
+    (-0.2 dB -> 6-bit BAT), B's second probe raised its best-of table to 465, A's BAT then made B send
+    READY first (`continue`) and the pending need_reply BAT was never sent; the after-done resend compares
+    with `prev`, not with the table last SENT.  A kept TX 6 bits/sym -> --min-bits fail.  Negotiation bug
+    in iq_link.negotiate, independent of iterate (negotiation never reaches the second pass).
+  - hf-moderate (default profile) fails in both arms.
+  One run per arm: the vhf-mobile comparison needs a rerun after the negotiation fix.
+- *Negotiate race FIXED 2026-11-15* (iq_link.negotiate): `bat_sent` tracks the table our last BAT
+  carried; the READY branch sends `rx_bat` first when it differs (same TX queue, so it lands before
+  READY), and the after-done resend compares with `bat_sent`, not `prev`.  Test:
+  test_negotiate_sends_a_table_improved_in_the_ready_pass (forces a faded first probe and holds the
+  second until the peer's BAT{have} is in; fails ~1 in 2 without the fix, timing-dependent).
+- *Next:* rerun both arms (vhf-mobile,
   fade cells; ARQ rounds and wall throughput, not just frames); then decide the default.  Not done: soft
   (SOVA/BCJR) reliabilities for the reference cells, mixing in neighbouring carriers' cells (wrong under
   a long echo), applying it to control frames at the base table.

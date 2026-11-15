@@ -637,6 +637,7 @@ class IqLink:
         peer_has = sent_ready = settled = False
         done_at = None
         need_reply = False
+        bat_sent = None                              # the table our last BAT carried
         next_act = t0 if initiator else float("inf")
         while True:
             now = time.monotonic()
@@ -674,9 +675,12 @@ class IqLink:
                 log(f"NEG heard probe: {res.summary()}"
                     + (f" -> best of probes {sum(rx_bat)} per symbol" if prev is not None else ""))
                 need_reply = True
-                if done_at is not None and rx_bat != prev:
-                    # the peer is still probing (its table from us was weak): give it the better one
+                if done_at is not None and rx_bat != bat_sent:
+                    # the peer is still probing: give it the better one.
+                    # Against what we SENT, not the previous best: a probe that improved the table in
+                    # the pass we went READY never reached the peer otherwise.
                     self._send_bat(rx_bat, True, res, NO_TOKEN, 0.0)
+                    bat_sent = list(rx_bat)
                     log(f"NEG sent BAT (after done): {sum(rx_bat)} bits/sym")
                     done_at, settled = time.monotonic(), False
             while True:
@@ -724,6 +728,12 @@ class IqLink:
             # -- what to send --
             if (tx_bat is not None and peer_has and not sent_ready
                     and (not weak(tx_bat) or time.monotonic() >= t0 + (end - t0) / 2)):
+                if rx_bat is not None and rx_bat != bat_sent:
+                    # a probe this pass changed our table after the peer's BAT came in: send it before
+                    # READY (same queue, so it lands first), or the reply branch below never runs again
+                    self._send_bat(rx_bat, True, res, NO_TOKEN, 0.0)
+                    bat_sent = list(rx_bat)
+                    log(f"NEG sent BAT (before READY): {sum(rx_bat)} bits/sym")
                 self.send_message(b"", magic=READY_MAGIC, repeat_s=self._ctl_repeat())  # at the new TX table
                 self.stats["tx_ready"] += 1
                 sent_ready = True
@@ -736,6 +746,7 @@ class IqLink:
                 if rx_bat is not None:
                     held = time.monotonic() - heard_at if heard_token != NO_TOKEN else 0.0
                     self._send_bat(rx_bat, tx_bat is not None, res, heard_token, held)
+                    bat_sent = list(rx_bat)
                 if rx_bat is None or tx_bat is None or weak(tx_bat):
                     send_ping_probe()         # the peer has no measurement of us yet
                     log("NEG sent ping + probe" + (" + BAT" if rx_bat is not None else ""))

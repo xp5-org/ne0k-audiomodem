@@ -75,6 +75,7 @@ import importlib.util
 import io
 import os
 import sys
+import struct
 import threading
 import time
 from pathlib import Path
@@ -82,11 +83,17 @@ from pathlib import Path
 import numpy as np
 
 from .events import ProbeReport, LinkEvent
+from . import carrier_schedule
 from .ident import KEYUP_TONE_HZ
 from .modemcfg import OfdmConfig
 
 BACKEND = "python"
 HDR = 6                             # addr, seq, ack, len, crc16
+# P2P TX window reservation (OfdmConfig.tx_window_chunks): control frames carried as ordinary frame data
+RSV_MAGIC, STA_MAGIC = b"RSV1", b"STA1"
+_RSV = struct.Struct("<HHIIH")      # window id, chunks, first schedule step, bytes, crc16 of the bytes
+_STA = struct.Struct("<HH")         # window id, chunks listed: the ones to stream again
+STA_MAX = 100                       # chunk numbers per status
 BROADCAST_ID = 0xF                  # frame destination 0xF = every station (as css_modem.BROADCAST_ID)
 MODES = ("half", "oneway", "stream", "full", "arq", "bcast")
 MAX_CHUNKS = 65535                  # chunk seq is 2 bytes
@@ -361,6 +368,17 @@ class OfdmLink:
         self._send_lock = threading.Lock()
         self._dup_cfgs = None                           # (tx sub-band cfg, rx sub-band cfg)
         self._ack_evt = threading.Event()
+        # carrier-schedule OFDM (carrier_schedule.py): score for our DATA frames / the peer's, frames counted per direction, receive demodulators per step
+        self._mel_tx = self._mel_rx = None
+        self._mel_tx_n = self._mel_rx_n = 0
+        self._mel_rx_prev = 0                           # score step the last frame we took began on
+        self._mel_dems: dict = {}
+        # TX window reservation: our next window id, the window we are sending, the
+        # window we are receiving
+        self._rsv_id = 0
+        self._rsv_tx: dict | None = None
+        self._rsv_evt = threading.Event()
+        self._rsv_rx: dict | None = None
         self.plan = None
         self.backend = ""
         self.last_activity = time.monotonic()
@@ -684,6 +702,7 @@ class OfdmLink:
         self._tx_bat = H.data_bat(my_tx_bat, c.fs, self._band, c.chunk_bytes)
         self._rx_bat = H.data_bat(peer_tx_bat, c.fs, self._band, c.chunk_bytes)
         m = c.mode
+        self._setup_schedule(H)
         if m == "full":
             self._setup_duplex(H)
             if c.backend == "cdx" and c.duplex == "ec":
@@ -814,9 +833,12 @@ class OfdmLink:
         self.log(f"rx frame ok seq={seq} ack={ack} {len(data)}B ({src}->{dst})")
         return seq, ack, data
 
-    def _frame_audio(self, H, body: bytes) -> np.ndarray:
+    def _frame_audio(self, H, body: bytes, bat=None) -> np.ndarray:
         c = self.cfg
-        audio = H.make_data_audio(c.fs, body, self._tx_bat, self._tx_band, c.chunk_bytes)
+        if isinstance(bat, list):              # a scheduled frame: one table per chunk, note carriers over the pilots
+            audio = self._mel_tx.audio(H, c.fs, body, bat, self._tx_band, c.chunk_bytes, c.schedule_boost_db)
+        else:
+            audio = H.make_data_audio(c.fs, body, self._tx_bat if bat is None else bat, self._tx_band, c.chunk_bytes)
         return H.scale_hs_tx(audio, c.amplitude, c.fs, is_probe=False, band=self._tx_band)[0]
 
     def _capacity(self, H) -> int:
@@ -989,6 +1011,9 @@ class OfdmLink:
                     if seq != self._rx_next:
                         self.log(f"rx seq gap: expected {self._rx_next} got {seq} (resync)")
                     self._rx_next = (seq + 1) & 0xFF
+                    # schedule: one score step per chunk of the frame; the peer's next new frame starts after them
+                    self._mel_rx_prev = self._mel_rx_n
+                    self._mel_rx_n += self._chunks_of(data)
                     deliver = data
         if deliver is not None and self.on_data:
             self.on_data(deliver)
@@ -1591,6 +1616,9 @@ class OfdmLink:
         self._ev("lock", t0, t0, f"{nchunks} frames")
         self._ev("rx", t0, t1, f"DATA seq={seq} ack={ack} {len(data)}B evm={evm:.1f}%"
                  if data else f"ACK ack={ack}")
+        if self.cfg.tx_window_chunks and data[:4] in (RSV_MAGIC, STA_MAGIC):
+            self._on_rsv_ctrl(data)               # a window reservation's control frame, not data
+            return
         self._on_frame(seq, ack, data)
         with self._lock:
             owe, self._owe_ack = self._owe_ack, False
@@ -1603,14 +1631,22 @@ class OfdmLink:
         with self._lock:
             return self._inflight is not None
 
-    def _tx_frame_full(self, seq: int, ack: int, data: bytes) -> None:
+    def _tx_frame_full(self, seq: int, ack: int, data: bytes, step: int | None = None) -> None:
+        """One frame on the full band.  ``step``: schedule step of a DATA frame; None = the full table."""
         H, _ = _imports()
+        bat, tag = None, ""
+        if step is not None and self._mel_tx is not None:
+            sc, n = self._mel_tx, self._chunks_of(data)
+            bat = [sc.bat(self._tx_bat, step + k) for k in range(n)]      # one score step per chunk: a phrase
+            tag = (f" schedule steps {step % len(sc)}-{(step + n - 1) % len(sc)}/{len(sc)} "
+                   f"[{' '.join(sc.describe(step + k) for k in range(n))}] "
+                   f"{'/'.join(str(int((b > 0).sum())) for b in bat)} carriers")
         with self._txlock:
             with _quiet():
-                audio = self._frame_audio(H, self._pack(seq, ack, data))
+                audio = self._frame_audio(H, self._pack(seq, ack, data), bat)
             self.tx_frames += 1
-            self._play(audio, f"DATA seq={seq} ack={ack} {len(data)}B" if data
-                       else f"ACK ack={ack}", ident=True)
+            self._play(audio, (f"DATA seq={seq} ack={ack} {len(data)}B" if data
+                               else f"ACK ack={ack}") + tag, ident=True)
             self.last_activity = time.monotonic()
             self._stop.wait(self.cfg.gap_s)        # quiet so our bursts never run together
 
@@ -2042,7 +2078,363 @@ class OfdmLink:
     def _send_full(self, data: bytes) -> bool:
         if self._cdx is not None:
             return self._send_full_c(data)
+        if self.cfg.mode == "arq":
+            return self._send_arq(data)          # bursts, one frame in flight
         return self._send_ec(data)               # ec and fdd: the sliding window on the continuous carrier
+
+    def _send_arq(self, data: bytes) -> bool:
+        """arq: stop-and-wait, one burst per frame, resent after ack_wait_s. """
+        c = self.cfg
+        if c.tx_window_chunks > 0:
+            return self._send_rsv(data)
+        if not self._up.wait(c.hs_timeout_s):
+            return False
+        for i in range(0, max(len(data), 1), self.capacity):
+            piece = data[i:i + self.capacity]
+            if not piece:
+                break
+            with self._lock:
+                seq, self._tx_seq = self._tx_seq, (self._tx_seq + 1) & 0xFF
+                self._inflight = dict(seq=seq, data=piece, sends=0)
+                self._ack_evt.clear()
+                step, self._mel_tx_n = self._mel_tx_n, self._mel_tx_n + self._chunks_of(piece)
+            ok = False
+            for attempt in range(c.retries + 1):
+                if self._stop.is_set():
+                    return False
+                if attempt:
+                    self.retry_count += 1
+                    now = time.monotonic()
+                    self._ev("retry", now, now, f"attempt {attempt}")
+                    if self.on_retry:
+                        self.on_retry(attempt)
+                with self._lock:
+                    nxt = self._rx_next
+                self._tx_frame_full(seq, nxt, piece, step)
+                if self._ack_evt.wait(c.ack_wait_s):
+                    ok = True
+                    break
+            with self._lock:
+                self._inflight = None
+            if not ok:
+                self.fail_count += 1
+                now = time.monotonic()
+                self._ev("fail", now, now, f"no ACK after {c.retries} retries")
+                return False
+        return True
+
+    # -- P2P TX window reservation ------------------------------------------------
+    #
+    # RESERVE (window id, N chunks, first schedule step, bytes, crc16) -> the receiver arms for N chunks and answers
+    # STATUS (all N to stream) -> the sender streams them back to back in one burst, no ACKs, no pauses -> the
+    # receiver reads the burst slot by slot and answers STATUS: the chunks to stream again.  A
+    # lost STATUS: the sender reserves the same window again and the receiver repeats its status.  With a carrier
+    # score, chunk k plays score step first+k: the tone map is the slot schedule, and every slot carries data.
+
+    def _rsv_send_ctrl(self, payload: bytes) -> None:
+        with self._lock:
+            seq, self._tx_seq = self._tx_seq, (self._tx_seq + 1) & 0xFF
+        self._tx_frame_full(seq, 0, payload)
+
+    def _send_rsv(self, data: bytes) -> bool:
+        from ofdm_handshake import crc16
+        c = self.cfg
+        if not self._up.wait(c.hs_timeout_s):
+            return False
+        cb = c.chunk_bytes
+        per = max(1, min(c.tx_window_chunks, STA_MAX))
+        for off in range(0, len(data), per * cb):
+            win = bytes(data[off:off + per * cb])
+            n = -(-len(win) // cb)
+            with self._lock:
+                wid, self._rsv_id = self._rsv_id, (self._rsv_id + 1) & 0xFFFF
+                step0, self._mel_tx_n = self._mel_tx_n, self._mel_tx_n + n
+            if not self._rsv_window(wid, win, n, step0, crc16(win)):
+                return False
+        return True
+
+    def _rsv_status(self, timeout: float):
+        """The peer's status for the window in flight, or None on timeout."""
+        if not self._rsv_evt.wait(timeout):
+            return None
+        with self._lock:
+            self._rsv_evt.clear()
+            return list(self._rsv_tx["status"])
+
+    def _rsv_window(self, wid: int, win: bytes, n: int, step0: int, crc: int) -> bool:
+        c = self.cfg
+        hdr = RSV_MAGIC + _RSV.pack(wid, n, step0 & 0xFFFFFFFF, len(win), crc)
+        with self._lock:
+            self._rsv_tx = dict(wid=wid, status=None)
+            self._rsv_evt.clear()
+        todo, tries, reserved = None, 0, False
+        try:
+            while not self._stop.is_set():
+                if not reserved:
+                    self.log(f"window {wid}: reserve {n} chunks ({len(win)} B)")
+                    self._rsv_send_ctrl(hdr)
+                    st = self._rsv_status(c.ack_wait_s)
+                    if st is None:
+                        tries += 1
+                        if tries > c.retries:
+                            break
+                        continue
+                    reserved, todo = True, st
+                if not todo:
+                    self.log(f"window {wid}: all {n} chunks in")
+                    return True
+                air = self._rsv_stream(wid, win, todo, step0, first=len(todo) == n)
+                st = self._rsv_status(c.ack_wait_s + 0.25 * len(todo) + air * 0.05)
+                if st is None:
+                    reserved = False             # status lost: reserve again, the receiver repeats it
+                    tries += 1
+                    if tries > c.retries:
+                        break
+                    continue
+                if set(st) >= set(todo):
+                    tries += 1                   # nothing got through
+                    if tries > c.retries:
+                        break
+                else:
+                    tries = 0
+                todo = st
+            self.fail_count += 1
+            now = time.monotonic()
+            self._ev("fail", now, now, f"window {wid}: no progress after {c.retries} retries")
+            return False
+        finally:
+            with self._lock:
+                self._rsv_tx = None
+
+    def _rsv_chunk_bat(self, sc, bat, step: int | None):
+        return bat if sc is None or step is None else sc.bat(bat, step)
+
+    def _rsv_stream(self, wid: int, win: bytes, todo: list, step0: int, first: bool) -> float:
+        """Chunks ``todo`` of the window, back to back in one burst (chunk k numbered k, on step step0+k)."""
+        H, _ = _imports()
+        from ofdm_modem import AdaptiveModulator
+        c, sc, cb = self.cfg, self._mel_tx, self.cfg.chunk_bytes
+        cfg = H.hs_data_cfg(c.fs, self._tx_band, cb)
+        parts = []
+        with self._txlock:
+            with _quiet():
+                for i, k in enumerate(todo):
+                    body = win[k * cb:(k + 1) * cb].ljust(cb, b"\0")
+                    if sc is not None:
+                        a = sc.audio(H, c.fs, body, [sc.bat(self._tx_bat, step0 + k)], self._tx_band, cb,
+                                     c.schedule_boost_db, seq0=k)
+                    else:
+                        a = AdaptiveModulator(cfg, self._tx_bat).encode_bytes(body, seq0=k)
+                    parts.append(a if i == len(todo) - 1 else a[:len(a) - int(cfg.get("frame_gap_samples", 0))])
+                audio = H.scale_hs_tx(np.concatenate(parts), c.amplitude, c.fs, is_probe=False, band=self._tx_band)[0]
+            self.tx_frames += 1
+            if sc is not None and first:
+                tag = f" schedule steps {step0 % len(sc)}+{len(todo)}/{len(sc)}"
+            elif sc is not None:
+                tag = f" schedule resend steps {','.join(str((step0 + k) % len(sc)) for k in todo)}"
+            else:
+                tag = ""
+            n_b = min(len(win), len(todo) * cb)
+            air = self._play(audio, f"DATA seq={wid} ack=0 {n_b}B window {wid}: {len(todo)} chunks"
+                                    f"{'' if first else ' (again)'}{tag}", ident=True)
+            self.last_activity = time.monotonic()
+            self._stop.wait(c.gap_s)
+        return air
+
+    def _on_rsv_ctrl(self, data: bytes) -> None:
+        if data[:4] == STA_MAGIC and len(data) >= 4 + _STA.size:
+            wid, k = _STA.unpack(data[4:4 + _STA.size])
+            miss = list(struct.unpack(f"<{k}H", data[4 + _STA.size:4 + _STA.size + 2 * k]))
+            with self._lock:
+                t = self._rsv_tx
+                if t is None or t["wid"] != wid:
+                    return
+                t["status"] = miss
+                self._rsv_evt.set()
+            self.log(f"window {wid}: status {'all in' if not miss else f'{len(miss)} chunk(s) to send again'}")
+        elif data[:4] == RSV_MAGIC and len(data) >= 4 + _RSV.size:
+            wid, n, step0, nbytes, crc = _RSV.unpack(data[4:4 + _RSV.size])
+            with self._lock:
+                r = self._rsv_rx
+                if r is None or r["wid"] != wid:
+                    r = self._rsv_rx = dict(wid=wid, n=n, step0=step0, nbytes=nbytes, crc=crc, got={},
+                                            expect=list(range(n))[:STA_MAX], done=False)
+                    self.log(f"window {wid}: reserved {n} chunks ({nbytes} B) from step {step0}")
+            self._rsv_reply(r)
+
+    def _rsv_reply(self, r: dict) -> None:
+        miss = [] if r["done"] else r["expect"]
+        self._rsv_send_ctrl(STA_MAGIC + _STA.pack(r["wid"], len(miss)) + struct.pack(f"<{len(miss)}H", *miss))
+
+    def rsv_expecting(self) -> bool:
+        r = self._rsv_rx
+        return bool(r and not r["done"] and r["expect"])
+
+    def _rsv_air(self, step) -> int:
+        """Samples from one chunk's preamble to the next one's on this slot's table."""
+        key = ("rsv-air", None if step is None else step % len(self._mel_rx))
+        if key not in self._mel_dems:
+            H, _ = _imports()
+            from ofdm_modem import AdaptiveModulator
+            mod = AdaptiveModulator(H.hs_data_cfg(self.cfg.fs, self._rx_band, self.cfg.chunk_bytes),
+                                    self._rsv_chunk_bat(self._mel_rx, self._rx_bat, step))
+            with contextlib.redirect_stdout(io.StringIO()):
+                n = len(mod.encode_bytes(b"\0" * self.cfg.chunk_bytes))
+            self._mel_dems[key] = n - mod.frame_gap_samp
+        return self._mel_dems[key]
+
+    def _rsv_dem(self, step):
+        key = ("rsv-dem", None if step is None else step % len(self._mel_rx))
+        if key not in self._mel_dems:
+            H, _ = _imports()
+            self._mel_dems[key] = H_dem(H, self.cfg, self._rsv_chunk_bat(self._mel_rx, self._rx_bat, step),
+                                        self._rx_band)
+        return self._mel_dems[key]
+
+    def rx_window(self, x: np.ndarray) -> bool:
+        """The reserved stream in burst ``x``: every expected chunk decoded from its own slot, then our status.
+        False when the burst is not the stream, for the ordinary decode."""
+        r = self._rsv_rx
+        if not r or r["done"] or not r["expect"]:
+            return False
+        fs, lead = self.cfg.fs, int(0.015 * self.cfg.fs)
+        mel = self._mel_rx is not None
+        at, skipped, got = None, 0, []
+        for k in r["expect"]:
+            step = r["step0"] + k if mel else None
+            air = self._rsv_air(step)
+            if at is None:                        # not anchored yet: search the start of the burst
+                y0, y = 0, x[:skipped + air + 2 * fs]
+            else:
+                y0 = max(0, at - lead)
+                y = x[y0:at + air + lead]
+            with _quiet():
+                st, ch = self._rsv_dem(step).decode_samples(y)
+            if k in ch:
+                if not got and unpack_frame(ch[k]) is not None and ch[k][HDR:HDR + 4] in (RSV_MAGIC, STA_MAGIC):
+                    return False                  # a control frame, not the stream
+                r["got"][k] = ch[k]
+                got.append(k)
+                f = next((d.get("frame_start") for d in st if d.get("seq") == k), None)
+                at = (y0 + int(f) if f is not None else (at or 0)) + air
+            elif at is not None:
+                at += air                         # the slot is lost; the next one starts where the schedule says
+            else:
+                skipped += air
+        if not got:
+            return False
+        miss = [k for k in range(r["n"]) if k not in r["got"]]
+        self.log(f"window {r['wid']}: {len(got)}/{len(r['expect'])} chunks this burst, "
+                 f"{r['n'] - len(miss)}/{r['n']} in")
+        if not miss:
+            from ofdm_handshake import crc16
+            data = b"".join(r["got"][k] for k in range(r["n"]))[:r["nbytes"]]
+            if crc16(data) == r["crc"]:
+                r["done"], r["expect"] = True, []
+                self.rx_frames += 1
+                self.last_activity = time.monotonic()
+                if self.on_data:
+                    self.on_data(data)
+            else:
+                self.log(f"window {r['wid']}: crc mismatch -- every chunk again")
+                r["got"], miss = {}, list(range(r["n"]))
+        if not r["done"]:
+            r["expect"] = miss[:STA_MAX]
+        self._rsv_reply(r)
+        return True
+
+    # -- carrier-schedule OFDM (carrier_schedule.py) ----------------------------------------------
+
+    def _setup_schedule(self, H) -> None:
+        c = self.cfg
+        for attr, path, band in (("_mel_tx", c.schedule_tx, self._tx_band), ("_mel_rx", c.schedule_rx, self._rx_band)):
+            sc = None
+            if path:
+                try:
+                    sc = carrier_schedule.CarrierScore(carrier_schedule.load_score(path), H.hs_data_cfg(c.fs, band, c.chunk_bytes),
+                                             c.schedule_step_carriers)
+                    self.log(f"schedule {attr[-2:]}: {sc.summary()}")
+                except (OSError, ValueError, KeyError) as e:
+                    self.log(f"schedule {attr[-2:]}: {path}: {e} -- off")
+            setattr(self, attr, sc)
+        self._mel_tx_n = self._mel_rx_n = 0
+        self._mel_dems = {}
+
+    @property
+    def schedule_rx(self):
+        return self._mel_rx
+
+    def _chunks_of(self, data: bytes) -> int:
+        """Chunks one link frame carrying ``data`` takes on the air."""
+        return max(1, -(-(len(data) + HDR) // self.cfg.chunk_bytes))
+
+    def rx_demods_for(self, x: np.ndarray) -> list:
+        """Demodulators to try on burst ``x``, in order.  With a receive score: the peer's next new frame, a resend of the last frame, then the full table."""
+        base = self.rx_demod()
+        if base is None:
+            return []
+        dem, bat, band = base
+        if self._mel_rx is None:
+            return [dem]
+        starts = [self._mel_rx_n] + ([self._mel_rx_prev] if self._mel_rx_prev != self._mel_rx_n else [])
+        return [_PhraseDem(self, s, bat, band) for s in starts] + [dem]
+
+    def _mel_chunk_air(self, step: int, bat, band) -> int:
+        """Samples from one scheduled chunk's preamble to the next one's: its frame on this step's table plus one gap
+       ."""
+        sc = self._mel_rx
+        key = ("air", step % len(sc))
+        if key not in self._mel_dems:
+            H, _ = _imports()
+            from ofdm_modem import AdaptiveModulator
+            mod = AdaptiveModulator(H.hs_data_cfg(self.cfg.fs, band, self.cfg.chunk_bytes), sc.bat(bat, step))
+            with contextlib.redirect_stdout(io.StringIO()):        # not _quiet(): the caller holds its DSP lock
+                n = len(mod.encode_bytes(b"\0" * self.cfg.chunk_bytes))
+            self._mel_dems[key] = n - mod.frame_gap_samp            # [gap, frame, gap] -> frame + one gap
+        return self._mel_dems[key]
+
+    def _mel_dem(self, step: int, bat, band):
+        sc = self._mel_rx
+        k = step % len(sc)
+        if k not in self._mel_dems:
+            H, _ = _imports()
+            self._mel_dems[k] = H_dem(H, self.cfg, sc.bat(bat, step), band)
+        return self._mel_dems[k]
+
+
+class _PhraseDem:
+    """A scheduled frame's demodulator: chunk k was sent on score step ``start + k``, so it is decoded with that step's
+    table until the chunks so far make a whole frame or a chunk is missing.
+
+    Every chunk starts with the same full-band preamble but lasts as long as its own table needs, so a demodulator
+    run over the whole burst locks onto the chunk BEFORE its own, fails it, and skips ahead by its own frame length
+    -- past the start of the chunk it is for.  So chunk k is decoded from just before its own preamble: where
+    chunk k-1 was found plus k-1's length on its table."""
+
+    LEAD_S = 0.015                       # decode window opens this far before the expected preamble
+
+    def __init__(self, link, start: int, bat, band):
+        self.link, self.start, self.bat, self.band = link, start, bat, band
+
+    def decode_samples(self, x):
+        stats, chunks = [], {}
+        lead = int(self.LEAD_S * self.link.cfg.fs)
+        at = None                         # sample index in x where chunk k's preamble is due
+        for k in range(-(-255 // self.link.cfg.chunk_bytes)):      # a frame is 255 B at most
+            step = self.start + k
+            off = 0 if at is None else max(0, at - lead)
+            st, ch = self.link._mel_dem(step, self.bat, self.band).decode_samples(x[off:])
+            if k not in ch:
+                break
+            st_k = [d for d in st if d.get("seq") == k]
+            chunks[k] = ch[k]
+            stats += st_k
+            if unpack_frame(b"".join(chunks[i] for i in range(k + 1))) is not None:
+                break
+            found = st_k[0].get("frame_start") if st_k else None
+            here = off + int(found) if found is not None else (at or 0)
+            at = here + self.link._mel_chunk_air(step, self.bat, self.band)
+        return stats, chunks
 
 
 def H_dem(H, c: OfdmConfig, bat, band):

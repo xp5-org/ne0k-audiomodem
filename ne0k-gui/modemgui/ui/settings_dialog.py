@@ -149,11 +149,16 @@ class SettingsDialog(QDialog):
     def _topology_changed(self) -> None:
         """A mesh has no configured peer and beacons; point to point has a peer and no beacons."""
         g = self.pages["general"].w
-        mesh = _get(g["topology"]) == "mesh"
-        g["peer_id"].setEnabled(not mesh)
+        topo = _get(g["topology"])
+        mesh = topo == "mesh"
+        hub = topo in ("hub", "hub_relay")
+        g["peer_id"].setEnabled(topo == "p2p")
         for k in ("beacon", "beacon_min_s", "beacon_max_s", "first_beacon_s",
                   "airtime_windows", "hs_window_s", "hs_slots"):
             g[k].setEnabled(mesh)
+        for k in ("hub_id", "hub_nodes", "hub_turn_s", "hub_cycle_s", "hub_page_timeout_s"):
+            if k in g:
+                g[k].setEnabled(hub)
 
     def _audio_mirror(self) -> QGroupBox:
         """Read-only copy of the front-page audio choice; change it there."""

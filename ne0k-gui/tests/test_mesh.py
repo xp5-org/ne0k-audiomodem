@@ -149,3 +149,40 @@ def test_announce_mask_older_than_our_announce_does_not_flag_us():
     assert an._flagged()                       # node 3 announced after us and did not hear us
     an.masks[3] = 0b1110
     assert not an._flagged()
+
+
+def _blockout_node(fails):
+    """A MeshNode shell for send_blockout: each send() pops the next handshake outcome from ``fails``
+    ("" = delivered, else the requester link's fail_reason)."""
+    import threading as _th
+    import types as _ty
+    from modemgui.engine import mesh_node as mn
+    n = object.__new__(mn.MeshNode)
+    n.mesh = _ty.SimpleNamespace(phy_mode="ofdm_only")
+    n._hold_until, n._stop, n.rx_count, n.last_hs_fail = 0.0, _th.Event(), 0, ""
+    n.announced, n.sends = [], 0
+    n.log = lambda m: None
+    n._blockout_budget_s = lambda p: 600.0
+    n._announce_blockout = lambda peer, dur, again=False: n.announced.append((peer, round(dur), again))
+    n.release_link = n._ensure_rx_link = lambda peer: None
+
+    def send(peer, payload):
+        n.sends += 1
+        n.last_hs_fail = fails.pop(0)
+        return n.last_hs_fail == ""
+    n.send = send
+    n.end_blockout = lambda: None
+    return n
+
+
+def test_blockout_req_is_repeated_while_the_peer_answers_no_probe():
+    n = _blockout_node(["timeout_i_wait_probe", ""])
+    assert n.send_blockout(2, b"x", duration_s=600.0, announce_end=True)
+    assert n.sends == 2 and [a[2] for a in n.announced] == [False, True] and n.announced[0][:2] == (2, 600)
+
+
+def test_blockout_req_not_repeated_after_other_failures_or_past_three():
+    n = _blockout_node(["timeout_i_wait_bat"])
+    assert not n.send_blockout(2, b"x", duration_s=600.0, announce_end=True) and len(n.announced) == 1
+    n = _blockout_node(["timeout_i_wait_probe"] * 5)
+    assert not n.send_blockout(2, b"x", duration_s=600.0, announce_end=True) and len(n.announced) == 3

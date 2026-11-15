@@ -54,6 +54,9 @@ class MeshReceiver:
         self.announce = None                                        # AnnounceRound (shared_rx) or None
         self.on_msg: Callable[[object], None] | None = None         # blockout etc.: f(try_decode_msg result)
         self.on_level: Callable[[float], None] | None = None        # f(rms) of each quiet 100 ms: ambient estimate
+        self.on_bcast: Callable[[int, int, bytes], None] | None = None  # hub topologies: f(src, seq, data) of a frame
+                                                                        # to 0xF
+        self.extra_links: Callable[[], list] = lambda: []           # stand-in links to decode with
         self._last_busy = -1e9
         self._in_burst = False
         self.bursts = self.frames = self.foreign = self.undecodable = self.msgs = 0
@@ -196,7 +199,8 @@ class MeshReceiver:
         self.bursts += 1
         end_t = self._cap.t_of(b)
         msg_cap = self._cap.get(a - int(MSG_PRE_S * fs), b + int(POST_S * fs))
-        if b - a < fs // 4:                      # shorter than any frame: a click
+        if b - a < fs // 10:                     # shorter than any frame (preamble + CE + 1 symbol): a click.
+                                                 # Not 0.25 s: a full-band 64-QAM ACK airs in 0.2 s
             return
         if self._ident(msg_cap):                 # a bare ID part (no keyup, so no frame after it): nothing to decode
             return
@@ -262,7 +266,8 @@ class MeshReceiver:
 
     def _candidates(self) -> list:
         """Up links whose rx BAT may decode this burst, the expected sender's first, one per distinct table."""
-        up = [lk for lk in self.links() if lk.up and getattr(lk, "shared_rx", False) and lk.rx_demod() is not None]
+        up = [lk for lk in list(self.links()) + list(self.extra_links())
+              if lk.up and getattr(lk, "shared_rx", False) and lk.rx_demod() is not None]
         if not up:
             return []
         rank = {p: i for i, p in enumerate(self.expected())}
@@ -270,7 +275,8 @@ class MeshReceiver:
         out, seen = [], []
         for lk in up:
             _, bat, band = lk.rx_demod()
-            if any(tuple(band) == sb and np.array_equal(bat, sbat) for sbat, sb in seen):
+            if getattr(lk, "schedule_rx", None) is None and \
+                    any(tuple(band) == sb and np.array_equal(bat, sbat) for sbat, sb in seen):
                 continue                         # same table, same band: the same decode
             seen.append((bat, tuple(band)))
             out.append(lk)
@@ -284,8 +290,15 @@ class MeshReceiver:
         fs = self.cfg.fs
         x = self._cap.get(a - int(PRE_S * fs), b + int(POST_S * fs))
         t0, t1 = self._cap.t_of(a), self._cap.t_of(b)
-        for lk in cands:
-            dem, _, _ = lk.rx_demod()
+        for lk in cands:                         # a TX window reservation we are armed for: the burst is its stream
+            if getattr(lk, "rsv_expecting", None) and lk.rsv_expecting():
+                t = time.monotonic()
+                ok = lk.rx_window(x)
+                self.decode_s += time.monotonic() - t
+                if ok:
+                    self.frames += 1
+                    return True
+        for lk, dem in self._demods(cands, x):
             t = time.monotonic()
             with _quiet():
                 stats, chunks = dem.decode_samples(x)
@@ -303,6 +316,10 @@ class MeshReceiver:
                 self.foreign += 1
                 self.log(f"rx frame {what}: for another station")
                 return True
+            if dst == BROADCAST_ID and self.on_bcast is not None:
+                self.log(f"rx frame ok {what} -> broadcast")
+                self.on_bcast(src, seq, data)
+                return True
             target = self._route(src, data)
             if target is None:
                 self.log(f"rx frame {what}: no link to {src} -- dropped")
@@ -312,6 +329,18 @@ class MeshReceiver:
             return True
         self.undecodable += 1
         return False
+
+    @staticmethod
+    def _demods(cands: list, x: np.ndarray):
+        """(link, demodulator) pairs to try in order.  A link with a scheduled score offers one per likely score step
+        before its full table; the rest offer their one table."""
+        for lk in cands:
+            f = getattr(lk, "rx_demods_for", None)
+            if f is not None and getattr(lk, "schedule_rx", None) is not None:
+                for dem in f(x):
+                    yield lk, dem
+            else:
+                yield lk, lk.rx_demod()[0]
 
     def _route(self, src: int, data: bytes):
         """DATA goes to the link that listens to ``src`` (arq: the end that is not the sender); a pure ACK to the

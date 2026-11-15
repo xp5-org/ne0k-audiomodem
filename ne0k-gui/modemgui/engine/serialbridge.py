@@ -71,11 +71,23 @@ def unframe(payload: bytes) -> bytes:
     return payload[1:1 + payload[0]]
 
 
+def parse_page_addr(data: bytes):
+    """('@<hex id>:' or '@*:' at the start of a page) -> (destination or None, the page without it).  '*' = 0xF, every
+    station.  No prefix: (None, data) -- the port's default destination."""
+    if len(data) >= 3 and data[:1] == b"@" and data[2:3] == b":":
+        c = data[1:2].decode("ascii", "replace")
+        if c == "*":
+            return 0xF, data[3:]
+        if c in "0123456789abcdefABCDEF":
+            return int(c, 16), data[3:]
+    return None, data
+
+
 class SerialBridge:
     def __init__(self, session, cfg: CssConfig | OfdmConfig | MeshNode, link_path: str,
                  buf_size: int = 32, mode: str = "rts", idle_s: float = 2.0, log=lambda m: None,
                  ack: bool = True, retries: int = 3, ack_timeout: float | None = None,
-                 dst: int | None = None) -> None:
+                 dst: int | None = None, page_addr: str = "off") -> None:
         # MAX_BUF is the CSS frame's one-byte length.  The OFDM one-way/stream link frames its own bursts
         # (4-byte length, MiB capacity), so its serial buffer is limited only by what the link reports.
         # A p2p full-duplex MeshNode (ofdm mode full) splits a send into frames on its own sliding window, so it
@@ -94,6 +106,9 @@ class SerialBridge:
         if self.mesh and dst is None:
             raise ValueError("a mesh bridge needs dst (the node its bytes are sent to)")
         self.dst = dst
+        if page_addr not in ("off", "ascii"):
+            raise ValueError("page_addr must be off or ascii")
+        self.page_addr = page_addr               # mesh: '@<id>:' at the start of a page names its destination
         self.session, self.cfg = session, (cfg.mesh if self.mesh else cfg)
         self.link_path, self.ctl_path = link_path, link_path + ".ctl"
         self.buf_size, self.mode, self.idle_s, self.log = buf_size, mode, idle_s, log
@@ -125,6 +140,13 @@ class SerialBridge:
         self.rx_filter = None                    # test hook: f(Decoded) -> False drops the packet
         self._want_ack: int | None = None
         self._ack_evt = threading.Event()
+        # Other front ends drive the same command handler: their calls run
+        # on the bridge thread (``call``), they hear every control-socket line (``add_listener``) and every received
+        # byte (``add_rx_tap``) as the pty and the .ctl socket do.
+        self._calls: "queue.Queue[tuple]" = queue.Queue()
+        self._wake_r = self._wake_w = None
+        self._listeners: list = []
+        self._rx_taps: list = []
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -140,6 +162,8 @@ class SerialBridge:
         os.symlink(name, self.link_path)
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._srv.bind(self.ctl_path); self._srv.listen(4); self._srv.setblocking(False)
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
         self.link.start()
         self._thread = threading.Thread(target=self._run, name="serial-bridge", daemon=True)
         self._thread.start()
@@ -153,7 +177,7 @@ class SerialBridge:
         if self._thread:
             self._thread.join(5.0)
         self.link.stop()
-        for s in self._clients + [self._srv]:
+        for s in self._clients + [self._srv, self._wake_r, self._wake_w]:
             s.close()
         for fd in (self.master, self._slave):
             os.close(fd)
@@ -178,6 +202,8 @@ class SerialBridge:
         if self.rx_filter is not None and not self.rx_filter(src):
             self.log(f"rx {len(data)}B from {src} dropped by filter")
             return
+        if self.page_addr == "ascii":
+            data = f"@{src:X}:".encode() + data
         self._rxq_put(data)
 
     def _ofdm_retry(self, k: int) -> None:
@@ -198,16 +224,95 @@ class SerialBridge:
                 c.sendall(data)
             except OSError:
                 self._drop(c)
+        for fn in list(self._listeners):
+            try:
+                fn(line)
+            except Exception:
+                pass
 
-    def _status(self, c: socket.socket | None = None) -> None:
+    def _status_lines(self) -> list[str]:
         lines = [f"CTS {int(self.cts)}", f"BUF {len(self.txbuf)}/{self.buf_size}"]
         if self.ofdm:
             lines.insert(1, f"CD {int(self.link.up)}")
-        for ln in lines:
+        return lines
+
+    def _status(self, c: socket.socket | None = None) -> None:
+        for ln in self._status_lines():
             if c is None:
                 self._notify(ln)
             else:
                 c.sendall((ln + "\n").encode())
+
+    # -- other front ends ---------------------------------
+
+    def add_listener(self, fn) -> None:
+        """``fn(line)`` hears every line the .ctl socket clients hear."""
+        self._listeners.append(fn)
+
+    def remove_listener(self, fn) -> None:
+        with _suppress(ValueError):
+            self._listeners.remove(fn)
+
+    def add_rx_tap(self, fn) -> None:
+        """``fn(data)`` gets every received byte string as it is queued for the pty."""
+        self._rx_taps.append(fn)
+
+    def remove_rx_tap(self, fn) -> None:
+        with _suppress(ValueError):
+            self._rx_taps.remove(fn)
+
+    def call(self, fn, timeout: float = 5.0):
+        """Run ``fn()`` on the bridge thread and return its result."""
+        if self._thread is None or not self._thread.is_alive() or self._stop.is_set():
+            raise RuntimeError("serial port is not running")
+        if threading.current_thread() is self._thread:
+            return fn()
+        box: list = []
+        done = threading.Event()
+        self._calls.put((fn, box, done))
+        with _suppress(OSError):
+            self._wake_w.send(b"\0")
+        if not done.wait(timeout):
+            raise TimeoutError("serial port did not answer")
+        ok, val = box[0]
+        if not ok:
+            raise val
+        return val
+
+    def command(self, line: str) -> list[str]:
+        """One control-socket command line (``RTS 0|1``, ``STATUS``); returns the lines a .ctl client gets back."""
+        out: list[str] = []
+        self.call(lambda: self._command(line, out.append))
+        return out
+
+    def write(self, data: bytes) -> int:
+        """Bytes into the TX buffer exactly as the pty takes them: only while CTS is high and only up to the free
+        room.  Returns how many were accepted."""
+        def go() -> int:
+            room = self.buf_size - len(self.txbuf)
+            if not self.cts or room <= 0 or not data:
+                return 0
+            self._accept(data[:room])
+            return min(len(data), room)
+        return self.call(go)
+
+    def status_lines(self) -> list[str]:
+        return self.call(self._status_lines)
+
+    def _run_calls(self) -> None:
+        with _suppress(OSError):
+            while self._wake_r.recv(256):
+                pass
+        while True:
+            try:
+                fn, box, done = self._calls.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                box.append((True, fn()))
+            except Exception as e:
+                box.append((False, e))
+            done.set()
 
     def _drop(self, c: socket.socket) -> None:
         if c in self._clients:
@@ -219,7 +324,7 @@ class SerialBridge:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            rfds = [self._srv, *self._clients]
+            rfds = [self._srv, self._wake_r, *self._clients]
             if self.cts and len(self.txbuf) < self.buf_size:
                 rfds.append(self.master)         # not reading = pty back-pressure on the host
             wfds = [self.master] if self._out else []
@@ -230,6 +335,8 @@ class SerialBridge:
                     self._clients.append(c); self._status(c)
                 elif f is self.master:
                     self._load()
+                elif f is self._wake_r:
+                    self._run_calls()
                 else:
                     self._control(f)
             if w:
@@ -244,11 +351,14 @@ class SerialBridge:
         except (BlockingIOError, OSError):
             return
         if data:
-            self.txbuf += data
-            self._last_byte = time.monotonic()
-            self._notify(f"BUF {len(self.txbuf)}/{self.buf_size}")
-            if self.fifo and not self.cts:
-                self._notify("CTS 0")
+            self._accept(data)
+
+    def _accept(self, data: bytes) -> None:
+        self.txbuf += data
+        self._last_byte = time.monotonic()
+        self._notify(f"BUF {len(self.txbuf)}/{self.buf_size}")
+        if self.fifo and not self.cts:
+            self._notify("CTS 0")
 
     def _control(self, c: socket.socket) -> None:
         try:
@@ -261,24 +371,29 @@ class SerialBridge:
         buf = self._inbuf.get(c, b"") + d
         *lines, self._inbuf[c] = buf.split(b"\n")
         for ln in lines:
-            cmd = ln.decode("ascii", "replace").split()
-            if cmd[:1] == ["RTS"] and len(cmd) == 2:
-                rising = cmd[1] == "1" and not self._rts
-                self._rts = cmd[1] == "1"
-                if rising:
-                    self._try_send(c)
-            elif cmd[:1] == ["STATUS"]:
-                self._status(c)
+            self._command(ln.decode("ascii", "replace"), lambda m, c=c: c.sendall((m + "\n").encode()))
 
-    def _try_send(self, c: socket.socket | None) -> None:
+    def _command(self, line: str, reply) -> None:
+        """The control-socket command handler; ``reply(line)`` answers the client that sent it."""
+        cmd = line.split()
+        if cmd[:1] == ["RTS"] and len(cmd) == 2:
+            rising = cmd[1] == "1" and not self._rts
+            self._rts = cmd[1] == "1"
+            if rising:
+                self._try_send(reply)
+        elif cmd[:1] == ["STATUS"]:
+            for ln in self._status_lines():
+                reply(ln)
+
+    def _try_send(self, reply=None) -> None:
         if self.fifo:                            # RTS means nothing on a FIFO port
             return
         if self.busy:
-            if c:
-                c.sendall(b"ERR busy\n")
+            if reply:
+                reply("ERR busy")
         elif not self.txbuf:
-            if c:
-                c.sendall(b"ERR empty\n")
+            if reply:
+                reply("ERR empty")
         else:
             self._transmit()
 
@@ -338,6 +453,10 @@ class SerialBridge:
     def _tx_job_mesh(self, data: bytes) -> None:
         try:
             dst = self.dst() if callable(self.dst) else self.dst      # mesh: the node to talk to is learned
+            if self.page_addr == "ascii":
+                to, data = parse_page_addr(data)
+                if to is not None:
+                    dst = to
             if dst is None:
                 raise RuntimeError("no neighbour heard yet")
             ok = self.link.send(dst, data)
@@ -407,6 +526,7 @@ class SerialBridge:
                 continue
             self._last_rx = key
             data = unframe(ev.payload)
+            self._tap(data)
             self._out += data
             self.rx_count += len(data)
             self.log(f"rx {len(data)}B snr={ev.snr_db:.1f}dB")
@@ -423,12 +543,20 @@ class SerialBridge:
                 data = self._rxq.get_nowait()
             except queue.Empty:
                 break
+            self._tap(data)
             self._out += data
             self.rx_count += len(data)
             self.log(f"rx {len(data)}B")
             self._notify(f"RX {len(data)}")
         if self._out:
             self._flush_out()
+
+    def _tap(self, data: bytes) -> None:
+        for fn in list(self._rx_taps):
+            try:
+                fn(data)
+            except Exception:
+                pass
 
     def _flush_out(self) -> None:
         try:

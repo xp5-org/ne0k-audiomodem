@@ -27,6 +27,11 @@ full-duplex (``mode="full"``, split band) mesh yet; that exists point-to-point o
 ``OfdmConfig.mode="full"`` and no announce round (GUI topology p2p) runs ONE mode-full link to the peer
 (``self.duplex``, ``_duplex_link``), both ends sending at once on their own sub-bands.
 
+HUB & SPOKE (``MeshConfig.topology`` "hub" / "hub_relay", ofdm_only): no announce round; ``hub_mac.HubMac`` takes its
+place.  The hub (``hub_id``) runs the channel -- beacon/join, one pairwise training per client, its own turn, then a
+poll per client -- and a client only ever answers the hub.  ``send`` becomes one page through the hub (``send_page``);
+"hub_relay" adds station -> station pages stored and forwarded by the hub.  See hub_mac.py.
+
 BLOCKOUT (``send_blockout``/``end_blockout``, ``self.blockout``): an on-demand exclusive window
 for two nodes, requiring OFDM -- CSS's baud rate cannot carry it, so it is only available under
 ``phy_mode="ofdm_only"`` (refused outright under ``css_only``/``css_then_ofdm`` for now; a
@@ -82,6 +87,8 @@ MESH_ACK_WAIT_S = 15.0
 _BO_REQ_BODY = "<BBH"          # announcer id, peer id, duration (BLOCKOUT_DUR_SCALE units)
 _BO_END_BODY = "<B"            # announcer id
 BLOCKOUT_DUR_SCALE = 0.1
+BLOCKOUT_ANNOUNCES = 3             # BLOCKOUT_REQ sent at most this often while the peer answers none of our probes
+BLOCKOUT_REANNOUNCE_MIN_S = 60.0   # ... and only while at least this much of the window is left
 _BLOCKOUT_DUR_MAX = 0xFFFF
 
 
@@ -138,6 +145,12 @@ class MeshConfig(_Config):
     ofdm_detect: bool = True             # passively listen for OFDM to re-arm an upgrade that was given up on
     ofdm_detect_period_s: float = 5.0
     ofdm_detect_thr: float = 0.5
+    topology: str = "mesh"               # mesh | hub | hub_relay
+    hub_id: int = 1                      # hub topologies: the leader's node id
+    hub_nodes: int = 3                   # hub topologies: participants, hub included
+    hub_turn_s: float = 60.0             # longest polled turn of one client
+    hub_cycle_s: float = 15.0            # least time between two of the hub's cycles
+    hub_page_timeout_s: float = 300.0    # a page not delivered within this fails
 
 
 class MeshNode:
@@ -154,6 +167,8 @@ class MeshNode:
         self.links: dict[tuple[int, str], OfdmLink] = {}      # (peer, "tx" | "rx") -> link
         self.events: collections.deque = collections.deque(maxlen=4000)
         self.rx_count = self.tx_count = self.css_fallbacks = self.reqs = 0
+        self.last_hs_fail = ""                      # fail_reason of our last requester handshake
+        self.ofdm_rx_bytes: dict[int, int] = {}       # payload bytes delivered over OFDM, per sender
         self._seq = 0
         self._acks: set[tuple[int, int]] = set()
         self._ack_evt = threading.Event()
@@ -194,6 +209,14 @@ class MeshNode:
         if self.duplex and mesh.announce_round:
             raise ValueError("ofdm mode full is point-to-point only (topology p2p): the mesh announce round is "
                              "half duplex")
+        self.hub = None                       # HubMac, topology hub / hub_relay
+        if mesh.topology not in ("mesh", "hub", "hub_relay"):
+            raise ValueError("topology must be mesh, hub or hub_relay")
+        if mesh.topology != "mesh":
+            if mesh.phy_mode != "ofdm_only" or self.duplex:
+                raise ValueError("hub topologies need phy_mode ofdm_only, OFDM half duplex (not mode full)")
+            if mesh.announce_round:
+                raise ValueError("hub topologies replace the mesh announce round: turn announce_round off")
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -218,7 +241,19 @@ class MeshNode:
         rx.data_first = self._data_on_air
         rx.on_msg = self._on_ofdm_msg               # hear BLOCKOUT_REQ/END whether we ever send one or not
         rx.on_level = self.ambient.add              # carrier sense and ambient come from the OFDM ear
-        if self.mesh.announce_round:
+        if self.mesh.topology != "mesh":
+            from .hub_mac import HubMac
+            m = self.mesh
+            self.hub = self.announce = h = HubMac(self, hub_id=m.hub_id, n_nodes=m.hub_nodes,
+                                                  relay=m.topology == "hub_relay", turn_s=m.hub_turn_s,
+                                                  cycle_s=m.hub_cycle_s, page_timeout_s=m.hub_page_timeout_s,
+                                                  log=lambda msg: self.log(msg))
+            h.on_data = lambda src, d: self.on_data(src, d) if self.on_data else None   # on_data is rebound later
+            rx.announce = h
+            rx.on_bcast = h.on_bcast
+            rx.extra_links = h.extra_links
+            h.start()
+        elif self.mesh.announce_round:
             from .ofdm_announce import AnnounceRound
             self.announce = a = AnnounceRound(self.session, self.ofdm_cfg, self.me, lambda m: self.log(m),
                                               bat_turn_s=self.mesh.announce_bat_turn_s,
@@ -362,6 +397,8 @@ class MeshNode:
             self.log(f"mesh rx: {self.rx.stats()}")
             self.rx.stop()
             self.rx = None
+        if self.hub is not None:
+            self.log(f"hub: stats {dict(self.hub.counts)}")
         if self.announce:
             self.announce.stop()
             self.announce = None
@@ -799,8 +836,12 @@ class MeshNode:
 
     def _ofdm_rx(self, src: int, data: bytes) -> None:
         self.rx_count += 1
+        self.ofdm_rx_bytes[src] = self.ofdm_rx_bytes.get(src, 0) + len(data)
         self.log(f"ofdm rx {len(data)}B from {src}")   # symmetry with the CSS DATA path below,
                                                         # which already logs its own delivery
+        if self.hub is not None:                        # hub topologies: frames carry pages
+            self.hub.on_link_data(src, data)
+            return
         if self.on_data:
             self.on_data(src, data)
 
@@ -919,21 +960,19 @@ class MeshNode:
         if not (0 <= dur / BLOCKOUT_DUR_SCALE <= _BLOCKOUT_DUR_MAX):
             raise ValueError(f"blockout duration {dur}s out of range "
                              f"[0..{_BLOCKOUT_DUR_MAX * BLOCKOUT_DUR_SCALE}]")
-        now = time.monotonic()
-        self.blockout.request(peer, dur, now)
-        H, _ = _ofdm_imports()
-        band = self._ofdm_band()
-        body = struct.pack(_BO_REQ_BODY, self.me, peer, int(round(dur / BLOCKOUT_DUR_SCALE)))
-        audio = H.make_msg_audio(self.ofdm_cfg.fs, H.MSG_BLOCKOUT_REQ, 0, body, band)
-        audio, _ = H.scale_hs_tx(audio, self.ofdm_cfg.amplitude, self.ofdm_cfg.fs, is_probe=False, band=band)
-        audio = keyup(self.session, audio, self.ofdm_cfg.fs)
-        self.log(f"blockout window with {peer}: {dur:.0f}s")
-        self.session.play(audio, ident=False)
-        pipe = self.session.pipe
-        if pipe:
-            pipe.wait_tx(len(audio) / self.ofdm_cfg.fs + 10)
+        t0 = time.monotonic()
         rx0 = self.rx_count
-        ok = self.send(peer, payload)
+        ok = False
+        for attempt in range(BLOCKOUT_ANNOUNCES):
+            left = dur - (time.monotonic() - t0)
+            if attempt and left < BLOCKOUT_REANNOUNCE_MIN_S:
+                break
+            self._announce_blockout(peer, left, again=attempt > 0)
+            self.last_hs_fail = ""
+            ok = self.send(peer, payload)
+            # The peer never answered a single probe: it most likely never heard the REQ, e.g. a jitter-buffer slip mid-message on a call that has just come up.  Say it again rather than probing a deaf peer for the rest of the window.
+            if ok or self._stop.is_set() or self.last_hs_fail != "timeout_i_wait_probe":
+                break
         self.release_link(peer)        # free the channel now for peer's own reply, don't idle-hold it
         if announce_end:
             self.end_blockout()
@@ -945,6 +984,21 @@ class MeshNode:
             self._ensure_rx_link(peer)
             threading.Thread(target=self._await_reply, args=(peer, rx0), daemon=True).start()
         return ok
+
+    def _announce_blockout(self, peer: int, dur: float, again: bool = False) -> None:
+        """Broadcast ``BLOCKOUT_REQ`` (``peer``, ``dur`` seconds from now) and wait until it is off the air."""
+        self.blockout.request(peer, dur, time.monotonic())
+        H, _ = _ofdm_imports()
+        band = self._ofdm_band()
+        body = struct.pack(_BO_REQ_BODY, self.me, peer, int(round(dur / BLOCKOUT_DUR_SCALE)))
+        audio = H.make_msg_audio(self.ofdm_cfg.fs, H.MSG_BLOCKOUT_REQ, 0, body, band)
+        audio, _ = H.scale_hs_tx(audio, self.ofdm_cfg.amplitude, self.ofdm_cfg.fs, is_probe=False, band=band)
+        audio = keyup(self.session, audio, self.ofdm_cfg.fs)
+        self.log(f"blockout window with {peer}: {dur:.0f}s" + (" (again: no answer to our probes)" if again else ""))
+        self.session.play(audio, ident=False)
+        pipe = self.session.pipe
+        if pipe:
+            pipe.wait_tx(len(audio) / self.ofdm_cfg.fs + 10)
 
     def _await_reply(self, peer: int, rx0: int) -> None:
         """Two-way window, announcer side: the replier ends the window once its leg is done
@@ -972,6 +1026,25 @@ class MeshNode:
             gone = [self.links.pop(k) for k in list(self.links) if k[0] == peer]
         for lk in gone:
             lk.stop()
+
+    drop_links = release_link
+
+    def preset_link(self, peer: int, tx: bool, mine: bytes, theirs: bytes) -> bool:
+        """Bring the ``tx`` or rx arq link to ``peer`` up on known wire tables, no handshake on
+        the air (``mine``: our transmissions as the peer measured them, ``theirs``: the peer's as we did)."""
+        key = (peer, "tx" if tx else "rx")
+        lk = self._new_link(peer, requester=tx)
+        lk.preset = (mine, theirs)
+        with self._lock:
+            old = self.links.pop(key, None)
+            self.links[key] = lk
+        if old is not None:
+            old.stop()
+        lk.start()
+        ok = lk.wait_settled(10.0)
+        if not ok:
+            self.log(f"preset link {key} did not come up: {lk.fail_reason}")
+        return ok
 
     def _ensure_rx_link(self, peer: int) -> None:
         """ofdm_only: open a responder link for ``peer`` right now, instead of waiting for a CSS
@@ -1011,6 +1084,7 @@ class MeshNode:
         pipe = self.session.pipe
         if pipe:
             pipe.wait_tx(len(audio) / self.ofdm_cfg.fs + 10)
+        self.log("blockout end sent")             # the test's session step ends on this
         self.blockout.on_end(time.monotonic())
 
     # -- send ---------------------------------------------------------------
@@ -1022,11 +1096,18 @@ class MeshNode:
         is just a failed ``send``, not a silent CSS delivery."""
         while time.monotonic() < self._hold_until and not self._stop.wait(1.0):
             pass                                         # someone else's handshake is on the air
+        if self.hub is not None:                         # one page through the hub, in this node's turn
+            ok = self.hub.send_page(dst, payload)
+            if ok:
+                self.tx_count += 1
+            return ok
         if self.duplex:                                  # the duplex link frames a payload of any size itself
             return self._send_duplex(dst, payload)
-        if len(payload) > 250:
-            raise ValueError("mesh payload over 250 bytes")
         ofdm_only = self.mesh.phy_mode == "ofdm_only"
+        if len(payload) > 250 and not ofdm_only:
+            # the CSS frame carries one length byte; ofdm_only never reaches CSS and the OFDM link
+            # cuts a payload of any size into frames itself
+            raise ValueError("mesh payload over 250 bytes")
         # ofdm_only is unconditional: it must attempt OFDM (regardless of want_ofdm/links state,
         # which exist only to steer the css_then_ofdm upgrade/downgrade dance) and must NEVER reach
         # _send_css below on any exit from this branch -- a data payload going out over CSS while
@@ -1119,6 +1200,7 @@ class MeshNode:
             lk.start()
             if not lk.wait_settled(lk.cfg.hs_timeout_s):
                 self.log(f"handshake with {dst} failed: {lk.fail_reason}")
+                self.last_hs_fail = str(lk.fail_reason or "")
                 lk.stop()
                 with self._lock:
                     self.links.pop(key, None)

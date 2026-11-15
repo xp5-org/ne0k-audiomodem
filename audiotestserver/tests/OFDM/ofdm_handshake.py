@@ -176,6 +176,7 @@ MSG_BLOCKOUT_END = 9    # mesh blockout window closed early: body = [announcer u
 MSG_BEACON = 11         # mesh beacon: body = [id u8]; an ofdm_only mesh node announces itself on the mesh beacon timer
 MSG_BAT_TABLES = 10     # mesh broadcast BAT round: measured tables, a report or the coordinator's confirm (see
                         # modemgui ofdm_announce.pack_tables) -- bootstrap ladder step, like BAT_REPORT
+MSG_HUB = 12            # hub & spoke MAC: body = [kind u8][from u8][to u8] + args
 
 # Band renegotiation.  Only the RECEIVER of a probe can judge which part of the
 # spectrum actually survives a path, so each direction's band is chosen by the
@@ -408,7 +409,7 @@ def bat_rle_unpack(blob: bytes) -> bytes:
 
 _MSG_NAMES = {1: "BAT_REPORT", 2: "BAT_ACK", 3: "GO", 4: "RETRY", 5: "FIN",
               6: "BAND", 7: "ANNOUNCE", 8: "BLOCKOUT_REQ", 9: "BLOCKOUT_END",
-              10: "BAT_TABLES", 11: "BEACON"}
+              10: "BAT_TABLES", 11: "BEACON", 12: "HUB"}
 
 
 def pack_band(lo_hz: float, hi_hz: float,

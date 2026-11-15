@@ -92,6 +92,14 @@ class CssConfig(_Config):
 class OfdmConfig(_Config):
     """OFDM link.  Both ends must agree on the PHY group, ``window_s``, ``guard_s``,
     ``chunk_bytes`` and the band; the BAT exchange only settles the bit loading."""
+    # settings saved before the carrier schedule got its name used the "melody_" keys
+    _LEGACY_KEYS = {"melody_tx": "schedule_tx", "melody_rx": "schedule_rx",
+                    "melody_note_carriers": "schedule_step_carriers", "melody_boost_db": "schedule_boost_db"}
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return super().from_dict({cls._LEGACY_KEYS.get(k, k): v for k, v in d.items()})
+
     node_id: int = F(1, "Node id", "Link", "", 0, 255)
     peer_id: int = F(2, "Peer id", "Link", "", 0, 255)
     channel: str = F("radio", "Channel", "Link",
@@ -181,6 +189,31 @@ class OfdmConfig(_Config):
                           "bandwidth itself.  Both ends must agree, like the share.", choices=["bits", "hz"])
     ack_wait_s: float = F(8.0, "Resend after (s)", "Full duplex / ARQ",
                           "Resend a frame when no ACK arrived within this.", 1, 120)
+    schedule_tx: str = F("", "Score for frames we send", "Carrier schedule",
+                       "Carrier score JSON (carrier_schedule_score.py, made from a MIDI file).  Each new DATA frame this end "
+                       "sends plays the next score step: its bit table is cut down to the carriers of that step's "
+                       "notes (+ overtones).  Frame and symbol sizes are unchanged; ACKs keep the full table.  "
+                       "arq mode (mesh P2P).  Empty = off.")
+    schedule_rx: str = F("", "Score for frames we receive", "Carrier schedule",
+                       "The peer's schedule_tx score: the receiver knows the sequence in advance, matches each burst's "
+                       "spectrum against the next expected steps and decodes with that step's table.  May differ "
+                       "per direction (A->B one tune, B->A another).  Empty = off.")
+    schedule_step_carriers: int = F(4, "Carriers per step", "Carrier schedule",
+                                  "Every note carries this many of the link's typical carrier's bits per symbol "
+                                  "(the note, its octave, the octave below, 3rd / 4th harmonic, the fifth ... until "
+                                  "they add up), so all notes last the same time whatever their pitch.  Both ends "
+                                  "must agree.", 1, 16)
+    tx_window_chunks: int = F(0, "TX window reservation (chunks)", "P2P window",
+                              "arq: reserve up to this many chunks with one control frame, then stream them back to "
+                              "back -- no ACKs, no pauses -- and take one status at the end (all in, or which chunks "
+                              "to stream again, each in its own slot).  Both ends must agree.  0 = stop-and-wait "
+                              "frames of up to 255 B.", 0, 100)
+    schedule_boost_db: float = F(12.0, "Step carrier boost (dB)", "Carrier schedule",
+                               "Level of the note carriers over the pilots in a scheduled frame.  Pilots, CE and sync stay at "
+                               "unit power; with only 2-4 note carriers against the pilots, 0 dB leaves the pilot chord "
+                               "louder than the tune.  CE / sync get the same boost there, so the receiver's channel "
+                               "estimate absorbs it: no receive setting, any QAM order.",
+                               0, 20)
     carrier_db: float = F(-55.0, "Carrier threshold (dBFS)", "Receive", "", -100, 0)
     hear_own: bool = F(False, "Decode own transmissions", "Receive", "")
     backend: str = F("python", "DSP backend", "Engine",
@@ -220,7 +253,22 @@ class GeneralConfig(_Config):
                    "beacons are OFDM frames.",
                    choices=["css", "css_promote_ofdm", "ofdm_only"])
     topology: str = F("p2p", "Topology", "Mode", "p2p = one pair of stations; mesh = N stations that discover "
-                      "each other with beacons.", choices=["p2p", "mesh"])
+                      "each other with beacons.  hub = hub & spoke: one leader (hub_id) polls, every other station "
+                      "answers it only, pages go station <-> hub (the hub may send one to every station at once).  "
+                      "hub_relay = hub, plus station -> station pages the hub stores and forwards.  Hub modes are "
+                      "ofdm_only; no failover: when the hub is gone the network is down.",
+                      choices=["p2p", "mesh", "hub", "hub_relay"])
+    hub_id: int = F(1, "Hub id", "Hub & spoke", "Hub topologies: the leader's node id.  A client knows this and "
+                    "the number of stations, nothing else.", 0, 14)
+    hub_nodes: int = F(3, "Stations", "Hub & spoke", "Hub topologies: stations in the network, the hub included.  "
+                       "The hub closes its join window once this many have joined.", 2, 15)
+    hub_turn_s: float = F(60.0, "Polled turn (s)", "Hub & spoke", "Longest turn the hub grants one station.",
+                          15.0, 600.0)
+    hub_cycle_s: float = F(15.0, "Least cycle (s)", "Hub & spoke", "An idle network polls every station at most "
+                           "this often.", 2.0, 600.0)
+    hub_page_timeout_s: float = F(300.0, "Page timeout (s)", "Hub & spoke", "A page not delivered within this "
+                                  "fails (TXFAIL on the serial port).  It waits for this station's next turn and, "
+                                  "relayed, for the hub's delivery report.", 30.0, 3600.0)
     node_id: int = F(1, "Node id", "Addressing", "This station's address, 0..15.", 0, 15)
     peer_id: int = F(15, "Peer id", "Addressing", "p2p only: the other station.  In a mesh the peer is "
                      "not configured: it is whoever answers.", 0, 15)
@@ -394,6 +442,12 @@ class SerialConfig(_Config):
     retries: int = F(3, "Retries", "Reliability", "Retransmissions before TXFAIL.", 0, 20)
     rx_host: int = F(0, "RX host filter", "Port", "Mesh only: only hand the host bytes received from this "
                      "station id; 0 = accept from any neighbour (CSS is mostly multicast/broadcast).", 0, 15)
+    page_addr: str = F("off", "Page address", "Port",
+                       "Hub topologies: one buffer is one page (load it, raise RTS, CTS stays low until it is "
+                       "delivered or failed -- nothing queues behind it).  ascii: a page may start with '@<id>:' "
+                       "(id one hex digit 0-E, or '*' = every station) naming where it goes, and a received page "
+                       "starts with '@<origin>:'.  off: pages go to the hub (from the hub: to every station), "
+                       "received pages arrive bare.", choices=["off", "ascii"])
 
 
 @dataclasses.dataclass

@@ -243,6 +243,79 @@ frames as the point-to-point modes) and the multi-host test rig. Not done anywhe
 (`MSG_BAND` is supported by the state machine but off), the C engine for modes other than `full`, a GUI tab for the
 link, over-the-air runs (everything was exercised on loop/mix buses and PulseAudio null sinks).
 
+#### Hub & spoke (General > Topology `hub` / `hub_relay`, ofdm_only)
+
+`engine/hub_mac.py`, in place of the mesh announce round. One leader, `hub_id`, runs the channel; every other
+station answers it and nothing else. A client is configured with `hub_id` and `hub_nodes` (stations, hub
+included) and is never sent a list of station ids. There is no failover: when the hub is gone the network is down.
+
+Each hub cycle: BEACON (join open while fewer than `hub_nodes - 1` clients are registered; clients JOIN in an
+own-id slot) -> per new client TRAIN + one pairwise handshake (both directions trained at once) -> BTAB, the
+broadcast table (per carrier the least bits of all hub -> client tables) -> the hub's turn (its pages, and under
+`hub_relay` the pages it stored for forwarding, each followed by a DLVR report to the source) -> POLL each client,
+which sends its page and then DONE. A broadcast frame is ACKed by every client (BACK, own-id slot) and resent to the
+missing ones; a client that still lacks it gets the page by unicast. Three silent polls drop a client and the join
+window reopens.
+
+The serial port in a hub topology is a page port, like a fax machine: one buffer is one page, RTS sends it, CTS stays
+low until it was delivered (TXDONE) or failed (TXFAIL), and nothing queues behind it. A relayed page reports TXDONE
+only once the hub has delivered it. With `serial.page_addr = ascii` a page may start with `@<id>:` (one hex digit)
+or `@*:` (every station) and a received page starts with `@<origin>:`; with `off` a client's pages go to the hub and
+the hub's to every station. Test: `tests/test_hub.py` (3 nodes on `mix:`), group tests `hub_sip_3node_group` and
+`hub_relay_sip_3node_group`.
+
+### TCP control port (remote control and debug)
+
+`engine/control.py` (+ `ui/control_host.py` for the desktop app). A line-based TCP port that lets another
+host drive the whole modem. It covers everything the virtual serial port does, reading and setting every
+settings key, the front-panel actions, and a status dump. It is **off unless you ask for it**:
+
+```bash
+python3 -m modemgui gui --control-port 7322                            # 127.0.0.1 only
+python3 -m modemgui gui --control-port 7322 --control-bind 0.0.0.0     # every interface: remote hosts
+python3 -m modemgui serial --link ~/modem0 ... --control-port 7322     # headless port; settings read-only
+```
+
+**The port has no authentication and no encryption.** Anyone who can reach it can key the transmitter,
+change the station's settings and read the received data. It binds to 127.0.0.1 unless `--control-bind`
+names another address. Open it to the network only on a trusted test LAN, or keep it on localhost and
+tunnel (`ssh -L 7322:127.0.0.1:7322 laptop`).
+
+From the remote host, `nc laptop 7322` is enough. Every command gets zero or more data lines, then one
+`OK [detail]` or `ERR <why>`. The greeting is `OK ne0k-control 1 <version>`. Up to 4 clients can connect at
+once; one more is told `ERR busy: 4 control clients already connected` and disconnected.
+
+| command | what it does |
+|---|---|
+| `RTS 0\|1`, `STATUS` | the serial port's control lines. Same handler as the pty's `.ctl` socket, so the same lines come back (`CTS n`, `CD n`, `BUF n/N`, `ERR empty`, `ERR busy`), plus the closing `OK`/`ERR`. RTS is one line shared with `.ctl` clients |
+| `WRITE <text>`, `WRITEHEX <hex>` | bytes into the TX buffer, as a tty write: only while CTS is up, only up to the free room. Answers `OK accepted/offered` |
+| `SEND <text>` / `SENDWAIT <text>` | load the whole text and trigger it (RTS edge in `rts` mode). `SENDWAIT` answers after `TXDONE`, or `ERR TXFAIL` |
+| `READ [n]` / `READTEXT [n]` | received bytes since the last read, as `DATA <hex>` / `TEXT <escaped>`. The pty still gets them too. Up to 1 MiB is kept, shared by all clients |
+| `EVENTS 1` | stream the `.ctl` event lines (`CTS`, `CD`, `BUF`, `RX n`, `TXDONE`, `TXFAIL`, `RETRY`, `ACK`), plus `PORT 1 <path>` / `PORT 0` when the serial port opens or closes. They arrive whenever they happen, so one can land between a command and its `OK`; tell them apart by their first word |
+| `SECTIONS`, `LIST [section]`, `GET s.key`, `DESCRIBE s.key` | the settings sections (`general`, `css`, `ofdm`, `serial`, `ham`, `diag`, ...: the `modemcfg` dataclasses, the same keys a `--settings` file holds). `LIST` prints `s.key=value<TAB>type=..<TAB>apply=live\|restart` plus `lo=`/`hi=`/`choices=` |
+| `SET s.key value` | checked against the field's type, range and choices. Answers `OK applied` (live), `OK pending-restart` (the modem is on, so the running link keeps its old copy until `RESTART`) or `OK next-start` (the modem is off). Not written to disk until `SAVE` |
+| `INFO`, `LOG [n]` | `key=value` status dump (audio, modem, link states, neighbours, serial counters, status bar text); the last n log lines |
+| `AUDIO OPEN <rx> [<tx>]`, `AUDIO CLOSE`, `DEVICES` | gui: open the sound devices (same addresses as `--rx/--tx`) |
+| `POWER ON\|OFF`, `RESTART` | gui: the Start modem button. `RESTART` power-cycles so pending settings apply, and reopens the serial port if it was open |
+| `PORT OPEN\|CLOSE`, `IDENT`, `TEXT <msg>`, `SAVE` | gui: the virtual serial port, send ID now, one message on the mesh link, persist settings |
+| `HELP`, `QUIT` | |
+
+Live sections are `ham` and `diag`. They apply at once, as the settings dialog applies them while the
+modem runs. Every other section is read when the modem starts. Under `modemgui serial` the link is built
+once from the command line, so `SET` is refused there (restart the process with new options). An
+unattended laptop run looks like this:
+
+```
+AUDIO OPEN sd:3 sd:3                 (DEVICES lists the addresses; no spaces in an address)
+SET general.node_id 3
+SET serial.mode auto
+POWER ON
+PORT OPEN
+EVENTS 1
+SENDWAIT hello from the test host
+READTEXT
+```
+
 Docker (`docker/Dockerfile` targets `engine` → `gui`):
 
 ```bash

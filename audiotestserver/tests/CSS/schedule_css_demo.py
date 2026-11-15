@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 XP5-ORG
 """
-melodic_css_demo.py  —  THROWAWAY proof-of-concept (not the real encoder).
+schedule_css_demo.py  —  THROWAWAY proof-of-concept (not the real encoder).
 
-Goal: hear what "melodic CSS chirps" sound like before committing to anything.
+Goal: hear what "carrier-schedule CSS chirps" sound like before committing to anything.
 Does NOT touch css_encoder.py / css_decoder.py.
 
 Idea
@@ -24,11 +24,11 @@ inputs at all.
 
 Usage
 -----
-  python melodic_css_demo.py                       # Fur Elise fallback -> wav
-  python melodic_css_demo.py song.mid              # your midi
-  python melodic_css_demo.py song.mid --message "hi there"
-  python melodic_css_demo.py --fmin 400 --fmax 4000 --dur 0.18 --bw 300
-  python melodic_css_demo.py --map linear          # stretch pitch range -> freq range
+  python schedule_css_demo.py                       # Fur Elise fallback -> wav
+  python schedule_css_demo.py song.mid              # your midi
+  python schedule_css_demo.py song.mid --message "hi there"
+  python schedule_css_demo.py --fmin 400 --fmax 4000 --dur 0.18 --bw 300
+  python schedule_css_demo.py --map linear          # stretch pitch range -> freq range
 
 Knobs worth turning by ear: --fmin/--fmax (range), --dur (note length),
 --bw (sweep width -> more/less "chirpy"), --map musical|linear, --gap.
@@ -257,7 +257,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("midi", nargs="?", help="input .mid (omit for Fur Elise demo)")
-    ap.add_argument("-o", "--out", default="melodic_css.wav")
+    ap.add_argument("-o", "--out", default="schedule_css.wav")
     ap.add_argument("--message", default=None,
                     help="data bytes to ride on the notes (cycled/truncated to fit)")
     ap.add_argument("--fmin", type=float, default=400.0)
