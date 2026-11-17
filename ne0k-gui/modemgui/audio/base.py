@@ -44,6 +44,18 @@ class StreamSpec:
     rate: int = 48000      # Hz; the connector asks the OS/device for exactly this
     block: int = 1024      # samples per callback (a hint; sinks may be exact)
     iq: bool = False       # complex64 baseband blocks instead of real float32 audio
+    tx_channels: str = "both"   # both | left | right: where a stereo sink plays the mono signal (OutputConfig)
+
+
+def spread(mono: np.ndarray, nch: int, mode: str) -> np.ndarray:
+    """The mono TX block as ``nch`` interleavable columns: on every channel ("both"), or on one with silence on the
+    other ("left" / "right", for an interface that keys the radio from the spare channel)."""
+    out = np.zeros((len(mono), nch), np.float32)
+    if nch == 1 or mode == "both":
+        out[:] = np.asarray(mono, np.float32)[:, None]
+    else:
+        out[:, 1 if mode == "right" else 0] = mono
+    return out
 
 
 @dataclasses.dataclass(frozen=True)

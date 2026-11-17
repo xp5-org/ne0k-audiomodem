@@ -153,6 +153,8 @@ class FileSink(Sink):
 class _Bus:
     """Bounded FIFO of samples shared by a loop: sink and a loop: source."""
 
+    WRITER_GONE_S = 1.0     # no put for this long: the sink has stopped, read zeros
+
     def __init__(self, cap_s: float = 30.0, rate: int = 48000) -> None:
         self.q: deque[np.ndarray] = deque()
         self.n = 0
@@ -175,9 +177,12 @@ class _Bus:
         with self.lock:
             # The sink and source are paced by separate timers, so on a host with coarse timers
             # (Windows) the source can ask a hair before the sink delivers.  Zero-padding then would
-            # splice a silent gap into a live burst; wait briefly while the writer is streaming.
-            if self.n < n and time.monotonic() - self.last_put < 0.25:
-                self.lock.wait_for(lambda: self.n >= n, timeout=0.1)
+            # splice a silent gap into a live burst; wait while the writer is streaming.  The sink
+            # delivers silence too, so a live writer is never idle for long: a stall of a few hundred
+            # ms (a loaded VM; the macOS build VM's selfloop lost the tail of its frame) is the writer
+            # running late, not gone.  Only a writer that has stopped putting gets zeros.
+            if self.n < n and time.monotonic() - self.last_put < self.WRITER_GONE_S:
+                self.lock.wait_for(lambda: self.n >= n, timeout=self.WRITER_GONE_S)
             while got < n and self.q:
                 head = self.q[0]
                 take = min(n - got, len(head))

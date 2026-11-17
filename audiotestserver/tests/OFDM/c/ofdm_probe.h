@@ -54,6 +54,12 @@ extern "C" {
 #define OFDM_COH_SCAN_SYMS   8     /* probe symbols averaged per candidate    */
 #define OFDM_COH_GATE     0.70     /* min peak coherence for a valid probe    */
 #define OFDM_COH_MATCH    0.60     /* per-symbol H match to count as "probe"  */
+/* Tone guard (ofdm_modem.py _TONE_*): a coarse winner whose 8-symbol coherent mean keeps over OFDM_TONE_FRAC of
+ * its energy in OFDM_TONE_CARRIERS carriers is a steady tone (the 1 kHz keyup at n_fft 1024 / cp 0.5 is exactly
+ * 32 cycles per symbol), not a probe: it is masked and the next best taken. */
+#define OFDM_TONE_CARRIERS   8
+#define OFDM_TONE_FRAC    0.80
+#define OFDM_TONE_TRIES     64
 
 /* Probe symbols needed before the ISI ratio is trustworthy.  A 25-30 symbol
  * fragment gave beta 1.7-1.9 on a link a full 170-symbol run graded at 0.25 --

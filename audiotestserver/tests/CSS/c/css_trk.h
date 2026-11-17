@@ -112,6 +112,11 @@ int    css_trk_tx(css_trk *t, long abs_first, int nsym, const unsigned char *dir
 void   css_trk_decoder_peak(css_trk *t, long abs_peak);
 /* The decoder just decoded a frame from node `src` (labels the linked grid). */
 void   css_trk_decoder_frame(css_trk *t, int src);
+/* Staged receive: `n` samples were not pushed (the host's chirp detector saw
+ * nothing in them).  The RX index advances by n, so grids keep predicting on
+ * the stream's own timebase and css_trk_tx() indices stay valid; the analysis
+ * window restarts empty and the carrier flag drops. */
+void   css_trk_skip(css_trk *t, long n);
 int    css_trk_busy(const css_trk *t);
 double css_trk_score(const css_trk *t);
 long   css_trk_abs(const css_trk *t);

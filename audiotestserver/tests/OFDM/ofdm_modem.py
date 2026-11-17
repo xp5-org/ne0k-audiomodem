@@ -266,6 +266,23 @@ _COH_CARRIERS = 40    # strongest carriers used to score coherence
 _COH_SCAN_SYMS = 8    # probe symbols averaged per candidate start
 _COH_GATE     = 0.70  # min peak coherence to declare a valid probe
 _COH_MATCH    = 0.60  # per-symbol H match to count a symbol as "probe"
+# A steady tone is a perfect "identical repeated symbol" whenever it fits a whole number of cycles in one OFDM
+# symbol: ofdm_link.keyup()'s 1 kHz at n_fft 1024 / cp 0.5 is 1536 samples = 32 cycles at 48 kHz, so it scores
+# coherence 1.0 and, 16 dB above the probe behind it, won the coarse scan; the real probe was never measured (Mac
+# initiator OTA, 2026-11-16).  A probe spreads its energy over the band, a tone puts it in a few leakage bins:
+# measured top-8 share 0.96 for the keyup tone against 0.22-0.44 for real probes over the air.  A winner over
+# _TONE_FRAC is masked (+-_COH_SCAN_SYMS symbols) and the next best taken, up to _TONE_TRIES times.
+_TONE_CARRIERS = 8
+_TONE_FRAC     = 0.80
+_TONE_TRIES    = 64
+
+
+def _tonal(Hm: np.ndarray) -> bool:
+    """True when the coherent mean H row ``Hm`` keeps over _TONE_FRAC of its energy in _TONE_CARRIERS carriers."""
+    e = np.abs(Hm) ** 2
+    tot = float(e.sum())
+    k = min(_TONE_CARRIERS, len(e))
+    return tot > 0 and float(np.partition(e, -k)[-k:].sum()) > _TONE_FRAC * tot
 
 # Minimum normalised correlation with the known SC preamble for an SC-metric
 # peak to be allowed to SUPPRESS its neighbours (see _find_sc_peaks).
@@ -1267,13 +1284,24 @@ class ChannelProbe:
             _COH_SCAN_SYMS, step, q=None, top_k=_COH_CARRIERS)
         if not len(cands):
             return {'valid': False, 'error': 'too_short'}
-        best  = int(cands[int(np.argmax(coh))])
-        peak  = float(coh.max())
+        # skip tone-like winners (the keyup tone; see _TONE_FRAC)
+        coh, cands = np.array(coh, dtype=np.float64), np.asarray(cands)
+        reach = _COH_SCAN_SYMS * SYM
+        for tries in range(_TONE_TRIES + 1):                 # same loop shape as ofdm_probe.c
+            bi = int(np.argmax(coh))
+            best, peak = int(cands[bi]), float(coh[bi])
+            if tries == _TONE_TRIES or peak < gate:
+                break
+            Hm = self._probe_H(rx, best, _COH_SCAN_SYMS)
+            if Hm is None or not _tonal(Hm.mean(axis=0)):
+                break
+            coh[(cands >= best - reach) & (cands <= best + reach)] = 0.0
         # Noise floor = low percentile of candidate coherence (positions that
         # missed the probe).  Reported as a diagnostic only; the absolute gate
         # is the discriminator.  A relative peak/floor test is wrong here: when
         # the probe fills most of the capture, most candidates land inside it
         # and score high, so the floor legitimately approaches the peak.
+        # Taken after the tone masking, as the C port does (it sorts in place).
         floor = float(np.percentile(coh, 25))
         if peak < gate:
             return {'valid': False, 'error': 'sync_fail',

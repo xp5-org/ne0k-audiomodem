@@ -183,8 +183,50 @@ def test_gui_host_settings_actions_and_serial_port(tmp_path):
         assert ask("SET css.decoder auto")[1] == "OK next-start"   # Python decoder: no libcsspll needed here
         assert ask("POWER ON")[1].startswith("ERR audio is not open")
         assert ask("AUDIO OPEN loop:ctl loop:ctl")[1] == "OK audio open rx=loop:ctl tx=loop:ctl"
+        # the front-page level meter is on the control port too (peak / rms / noise floor / clipping)
+        assert spin(lambda: "audio.rx.peak_dbfs" in "".join(ask("INFO")[0]), 10), "INFO never showed the RX level"
+        info = "\n".join(ask("INFO")[0])
+        for key in ("audio.rx.rms_dbfs=", "audio.rx.noise_floor_dbfs=", "audio.rx.clipped_total="):
+            assert key in info, key
+        # host OS mixer: a loop: device has none, and says so instead of failing
+        assert "audio.host.in.backend=none" in info and "audio.host.out.backend=none" in info
+        lines, ok = ask("MIXER")
+        assert ok == "OK" and "audio.host.in.backend=none" in lines
+        assert ask("MIXER SET in 0.5")[1].startswith("ERR cannot set the mixer")
+        assert ask("MIXER SET in 7")[1].startswith("ERR level 7 out of range")
+        assert ask("MIXER RESTORE")[1].startswith("ERR no snapshot")
+        assert ask("MIXER SNAPSHOT")[1] == "OK"
+        assert ask("MIXER RESTORE") == (["restore in skipped (not settable)", "restore out skipped (not settable)"],
+                                        "OK")
+        # acoustic calibration over the loopback: a perfect channel, so the probe is found and nothing is limited
+        assert ask("CALIBRATE BOGUS")[1].startswith("ERR CALIBRATE NOISE")
+        lines, ok = ask("CALIBRATE NOISE 0.5")
+        assert ok == "OK" and any(ln.startswith("cal.floor_rms_dbfs=") for ln in lines)
+        assert ask("CALIBRATE SELF band=9000-400")[1].startswith("ERR bad band")
+        lines, ok = ask("CALIBRATE SELF band=400-4000 css=400-6000", timeout=90)
+        cal = dict(ln.split("=", 1) for ln in lines)
+        assert ok == "OK" and cal.get("cal.ok") == "yes", lines
+        assert cal["cal.agc"] == "none" and "cal.rec_cp_ratio" in cal and "cal.current_ceiling_db" in cal, lines
+        assert cal["cal.ofdm_tx_mask_db"] == "flat" and "cal.band.1k" in cal and "cal.css_reason" in cal, lines
+        # two-way ranging: SOLVE is pure arithmetic; INIT over the loopback hears its own burst but nobody answers
+        assert ask("RANGE BOGUS")[1].startswith("ERR RANGE RESPOND")
+        assert ask("RANGE SOLVE rtt=1.0")[1].startswith("ERR turn= is required")
+        lines, ok = ask("RANGE SOLVE rtt=0.517492711 turn=0.5")
+        assert ok == "OK" and "range.distance_m=3.000" in lines, lines
+        assert ask("RANGE INIT sym=5")[1].startswith("ERR symbol_dur 5")
+        lines, ok = ask("RANGE INIT 2 sym=0.05", timeout=30)
+        assert ok == "OK" and "range.ok=no" in lines and any("no reply within" in ln for ln in lines), lines
         assert w.session.is_open
         assert ask("POWER ON")[1].startswith("OK")
+        assert ask("CALIBRATE SELF")[1].startswith("ERR modem is on")
+        assert ask("RANGE RESPOND 1")[1].startswith("ERR modem is on")
+        lines, ok = ask("CAPTURE 2")                                # works with the modem on
+        cap = dict(ln.split("=", 1) for ln in lines)
+        import base64, io as _io, wave as _wave
+        with _wave.open(_io.BytesIO(base64.b64decode(cap["capture.wav_b64"]))) as wf:
+            assert ok == "OK" and wf.getframerate() == int(cap["capture.fs"]) and wf.getsampwidth() == 2
+            assert wf.getnframes() == int(cap["capture.samples"]) > 0
+        assert ask("CAPTURE x")[1].startswith("ERR CAPTURE [secs]")
         assert w.modem_on and w.link is not None and w.link.me == 7
         assert ask("SET general.node_id 5")[1] == "OK pending-restart"
         assert w.link.me == 7                                       # the running node keeps its copy ...

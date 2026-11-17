@@ -24,6 +24,7 @@ KINDS = {
     "rx":    ("#3fb950", "RX"),
     "err":   ("#f85149", "ERR"),
     "lock":  ("#e3b341", "PLL lock"),
+    "sync":  ("#9e8a3c", "sync"),         # CSS preamble sync / tracker grid lock: a candidate, not a decode
     "ack":   ("#39c5cf", "ACK"),
     "retry": ("#d070d0", "retry"),
     "fail":  ("#ff7b00", "FAIL"),

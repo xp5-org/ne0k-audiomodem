@@ -34,6 +34,7 @@ from typing import Callable
 
 import numpy as np
 
+from . import cca
 from .ofdm_link import BROADCAST_ID, _Capture, _imports, _quiet, unpack_frame
 
 BURST_END_S = 0.8          # quiet that closes a burst (as AnnounceRound)
@@ -61,7 +62,7 @@ class MeshReceiver:
         self._in_burst = False
         self.bursts = self.frames = self.foreign = self.undecodable = self.msgs = 0
         self.decode_s = 0.0
-        self._cap = _Capture(cfg.fs, keep_s=60.0)
+        self._cap = _Capture(cfg.fs, keep_s=60.0, sense=cca.for_session(session))
         self._tap = None
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -106,12 +107,7 @@ class MeshReceiver:
 
     def _busy_blocks(self, i0: int, i1: int) -> np.ndarray:
         """Per GATE_S block of capture [i0, i1): above the carrier threshold?"""
-        blk = int(GATE_S * self.cfg.fs)
-        x = self._cap.get(i0, i1)
-        k = len(x) // blk
-        if not k:
-            return np.zeros(0, bool)
-        return np.sqrt(np.mean(x[:k * blk].reshape(k, blk) ** 2, axis=1)) > self._thr()
+        return self._cap.busy_blocks(i0, i1, self._thr(), int(GATE_S * self.cfg.fs))[1]
 
     def _run(self) -> None:
         """Burst gate.  It scans the capture from where it left off, not just the last poll's 100 ms: a decode takes
@@ -126,7 +122,7 @@ class MeshReceiver:
                 n = self._cap.n
                 x = self._cap.get(n - win)
                 lvl = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
-                busy = lvl > self._thr()
+                busy = self._cap.busy(0.1, self._thr())
                 if self.announce:
                     self.announce.rx_air(busy)
                 if busy:
@@ -196,20 +192,32 @@ class MeshReceiver:
 
     def _burst(self, a: int, b: int) -> None:
         fs = self.cfg.fs
+        t = time.monotonic()
+        lag = (self._cap.n - b) / fs             # how far behind the air this decode runs
+        what = self._burst_inner(a, b)
+        if what != "click":
+            # one line per gated burst: what the receiver made of it (frames and messages also log themselves)
+            self.log(f"mesh rx: burst {(b - a) / fs:.2f}s ending {lag:.1f}s ago -> {what} "
+                     f"({time.monotonic() - t:.1f}s)")
+
+    def _burst_inner(self, a: int, b: int) -> str:
+        fs = self.cfg.fs
         self.bursts += 1
         end_t = self._cap.t_of(b)
         msg_cap = self._cap.get(a - int(MSG_PRE_S * fs), b + int(POST_S * fs))
         if b - a < fs // 10:                     # shorter than any frame (preamble + CE + 1 symbol): a click.
                                                  # Not 0.25 s: a full-band 64-QAM ACK airs in 0.2 s
-            return
+            return "click"
         if self._ident(msg_cap):                 # a bare ID part (no keyup, so no frame after it): nothing to decode
-            return
+            return "ident"
         if self.data_first() and self._data(a, b):
-            return
-        if self._msgs(msg_cap, end_t):
-            return
-        if not self.data_first():
-            self._data(a, b)
+            return "frame"
+        n = self._msgs(msg_cap, end_t)
+        if n:
+            return f"{n} msg"
+        if not self.data_first() and self._data(a, b):
+            return "frame"
+        return "nothing decoded"
 
     def _msgs(self, cap: np.ndarray, end_t: float) -> int:
         """Decode the message(s) in one part.  Two stations can follow each other closer than SPLIT_GAP_S (a GO keyed
@@ -221,7 +229,7 @@ class MeshReceiver:
         while n < MAX_MSGS_PER_PART and len(cap) >= fs:
             st: dict = {}
             t = time.monotonic()
-            with _quiet():
+            with _quiet("decode"):
                 got = H.try_decode_msg(cap, fs, rates=(fs,), band=band, stats_out=st)
             self.decode_s += time.monotonic() - t
             if not got:
@@ -234,7 +242,7 @@ class MeshReceiver:
                 self.on_msg(got)
             if st.get("frame_start") is None:
                 break
-            with _quiet():
+            with _quiet("encode"):
                 air = len(H.make_msg_audio(fs, got[1], got[2], got[3], band, n_groups=st.get("n_groups")))
             cap = cap[int(st["frame_start"]) + air:]
             if not self._busy_in(cap):
@@ -243,6 +251,8 @@ class MeshReceiver:
 
     def _busy_in(self, x: np.ndarray) -> bool:
         """Any GATE_S block of ``x`` above the carrier threshold for 0.25 s or more in all?"""
+        if self._cap.sense is not None:
+            return cca.present_s(self._cap.sense.spec, x) >= 0.25
         blk = int(GATE_S * self.cfg.fs)
         k = len(x) // blk
         if not k:
@@ -300,7 +310,7 @@ class MeshReceiver:
                     return True
         for lk, dem in self._demods(cands, x):
             t = time.monotonic()
-            with _quiet():
+            with _quiet("decode"):
                 stats, chunks = dem.decode_samples(x)
             dt = time.monotonic() - t
             self.decode_s += dt
@@ -356,4 +366,5 @@ class MeshReceiver:
 
     def stats(self) -> str:
         return (f"bursts={self.bursts} frames={self.frames} foreign={self.foreign} msgs={self.msgs} "
-                f"undecodable={self.undecodable} decode={self.decode_s:.1f}s")
+                f"undecodable={self.undecodable} decode={self.decode_s:.1f}s"
+                + (f" {self._cap.sense.stats()}" if self._cap.sense is not None else ""))

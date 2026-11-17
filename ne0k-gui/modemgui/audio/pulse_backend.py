@@ -29,8 +29,9 @@ from typing import Callable
 
 import numpy as np
 
+from .sysenv import host_env
 from .base import (SINK, SOURCE, AudioError, Connector, DeviceInfo, Sink,
-                   Source, StreamSpec, as_mono_f32)
+                   Source, StreamSpec, as_mono_f32, spread)
 
 _TOOLS = ("pactl", "parec", "pacat")
 
@@ -55,7 +56,7 @@ def _die_with_parent():
 
 
 def _spawn(argv: list[str], **kw) -> subprocess.Popen:
-    return subprocess.Popen(argv, preexec_fn=_die_with_parent(),
+    return subprocess.Popen(argv, preexec_fn=_die_with_parent(), env=host_env(),
                             stderr=subprocess.PIPE, **kw)
 
 
@@ -87,7 +88,7 @@ def _stop_proc(p: subprocess.Popen | None) -> None:
 
 
 def _pactl(*args: str, timeout: float = 4.0) -> str:
-    r = subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=timeout, env=host_env())
     if r.returncode != 0:
         raise AudioError(f"pactl {' '.join(args)}: {r.stderr.strip() or r.returncode}")
     return r.stdout
@@ -179,9 +180,14 @@ class PulseSink(Sink):
         self._stop = threading.Event()
 
     def start(self, pull: Callable[[int], np.ndarray]) -> None:
-        argv = ["pacat", "--playback", "--raw", "--format=float32le", "--channels=1",
+        # both: one channel, which Pulse upmixes to every speaker.  left / right: a stereo stream with the other
+        # channel silent, so an interface can key the radio from it.
+        self._nch = 1 if self.spec.tx_channels == "both" else 2
+        argv = ["pacat", "--playback", "--raw", "--format=float32le", f"--channels={self._nch}",
                 f"--rate={self.spec.rate}", f"--latency-msec={self._lat}",
                 "--client-name=modemgui"]
+        if self._nch == 2:
+            argv.append("--channel-map=front-left,front-right")
         if self._dev:
             argv.append(f"--device={self._dev}")
         try:
@@ -198,6 +204,8 @@ class PulseSink(Sink):
         try:
             while not self._stop.is_set():
                 blk = as_mono_f32(pull(n))
+                if self._nch == 2:
+                    blk = spread(blk, 2, self.spec.tx_channels)
                 p.stdin.write(blk.astype("<f4", copy=False).tobytes())
                 p.stdin.flush()                  # the blocking write is the pacing
         except (BrokenPipeError, ValueError, OSError):

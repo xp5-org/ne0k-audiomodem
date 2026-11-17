@@ -53,6 +53,8 @@ struct css_pll {
     int sync_found, frames_decoded, frames_errored, consec_errors;
     long sym_count, last_resync_sym; int last_resync_soft;
     int quiet_run;
+    double onset_floor; int have_onset_floor;   /* onset guard's room floor (rms) */
+    int quiet_rel_run;                          /* symbols under that floor + onset_rel_db */
     /* phase-step recovery */
     double step_ref_snr; int step_ref_ok;
     int step_cand, step_cand_d, step_cand_idx; double step_cand_conf;
@@ -264,6 +266,7 @@ int css_pll_init(css_pll **pp, void *mem, size_t memlen, const css_pll_cfg *c,
     p->sym_count = 0; p->timing_err = 0; p->n_read = c->sps_eff; p->acq_left = 0;
     p->last_resync_sym = 0; p->last_resync_soft = 0;
     p->quiet_run = 0;
+    p->onset_floor = 0.0; p->have_onset_floor = 0; p->quiet_rel_run = 0;
     p->step_ref_ok = 0; p->step_cand = 0; p->step_fix_pending = 0;
     p->terr_n = 0; p->terr_head = 0; p->acqdev_n = 0; p->acqdev_head = 0;
     p->have_snap = 0; p->one_shot = 0;
@@ -795,12 +798,35 @@ int css_pll_symbol(css_pll *p, const float *raw_in, int nr)
     if (p->cb.on_symbol) p->cb.on_symbol(p->cb.user, &S);
 
     /* transmission onset anchors the early-sync guard (decode() onset guard) */
-    if (!p->sync_found && c->onset_guard_silence_syms > 0 && signal_present
-            && p->quiet_run >= c->onset_guard_silence_syms) {
-        p->last_resync_sym = p->sym_count - 2;
-        p->last_resync_soft = 0;
+    {
+        /* "silent" for the onset guard is relative to the room (2026-11-17: a MacBook mic floor of
+         * -55..-44 dBFS sat over silence_thr 0.002, no symbol was ever silent, the guard never anchored
+         * and the training run-in locked at ~0.5, 3-4 s early -> FRAME_ERROR) */
+        double othr = c->silence_thr;
+        int onset_sig;
+        if (c->onset_rel_db > 0.0 && p->have_onset_floor) {
+            double rel = p->onset_floor * pow(10.0, c->onset_rel_db / 20.0);
+            if (rel > othr) othr = rel;
+        }
+        onset_sig = rms > othr;
+        if (!p->sync_found && c->onset_guard_silence_syms > 0) {
+            if (signal_present && p->quiet_run >= c->onset_guard_silence_syms) {
+                p->last_resync_sym = p->sym_count - 2;     /* silence -> signal: hard anchor */
+                p->last_resync_soft = 0;
+            } else if (onset_sig && p->quiet_rel_run >= c->onset_guard_silence_syms) {
+                /* room-relative onset: soft, so a high-score or non-alternating (real preamble)
+                 * window stays eligible -- noise can pass floor+rel mid-burst at low SNR */
+                p->last_resync_sym = p->sym_count - 2;
+                p->last_resync_soft = 1;
+            }
+        }
+        p->quiet_run = signal_present ? 0 : p->quiet_run + 1;
+        p->quiet_rel_run = onset_sig ? 0 : p->quiet_rel_run + 1;
+        if (!p->sync_found) {
+            if (!p->have_onset_floor || rms < p->onset_floor) { p->onset_floor = rms; p->have_onset_floor = 1; }
+            else p->onset_floor *= pow(10.0, c->onset_floor_rise_db / 20.0);
+        }
     }
-    p->quiet_run = signal_present ? 0 : p->quiet_run + 1;
 
     /* §X: preamble detection */
     if (!p->sync_found) {
@@ -1129,6 +1155,14 @@ int css_pll_mark_onset(css_pll *p, long abs_onset)
 void css_pll_rearm(css_pll *p)
 {
     if (p->sync_found || p->bs_n > 0) do_resync(p, CSS_RS_REARM, 0);
+}
+
+void css_pll_skip(css_pll *p, long n)
+{
+    if (n <= 0) return;
+    css_pll_rearm(p);
+    p->fifo_n = 0;
+    p->abs_pos += n;
 }
 
 void css_pll_get_diag(const css_pll *p, css_pll_diag *d)

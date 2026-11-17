@@ -207,6 +207,18 @@ def generate_chirp(f0, f1, duration, fs):
     return sig.astype(np.float32)
 
 
+def edge_taper(x, fs, taper_s):
+    """Raised-cosine fade-in and fade-out of ``taper_s`` seconds on a copy of ``x`` (both edges)."""
+    n = min(int(round(taper_s * fs)), len(x) // 2)
+    if n < 2:
+        return x
+    y = np.array(x, dtype=np.float32, copy=True)
+    ramp = (0.5 - 0.5 * np.cos(np.pi * (np.arange(n) + 0.5) / n)).astype(np.float32)
+    y[:n] *= ramp
+    y[-n:] *= ramp[::-1]
+    return y
+
+
 # ---------------------------------------------------------------------------
 # Convolutional coding  (K=7, rate 1/2, NASA standard)
 # ---------------------------------------------------------------------------
@@ -459,6 +471,14 @@ def encode(cfg):
         else:
             up_chirp   = generate_chirp(f_min, f_max, symbol_dur, fs)
             down_chirp = generate_chirp(f_max, f_min, symbol_dur, fs)
+        # Optional edge taper (edge_taper_cycles, default 0 = the rectangular reference): each chirp starts and
+        # stops at an arbitrary phase, a step a speaker plays as a click/pop at every symbol edge.  A raised
+        # cosine over a few cycles of the top frequency (3 at 6 kHz = 0.5 ms) removes it and costs the matched
+        # filter well under 1 % of the symbol's energy.
+        _taper_cyc = float(cfg.get("edge_taper_cycles", 0) or 0)
+        if _taper_cyc > 0:
+            up_chirp = edge_taper(up_chirp, fs, _taper_cyc / max(f_min, f_max))
+            down_chirp = edge_taper(down_chirp, fs, _taper_cyc / max(f_min, f_max))
         # Payload source: a raw-bytes path for the modem layer (binary packets
         # whose bytes must survive intact), falling back to the UTF-8 text path
         # for plain-text messages.  message_bytes accepts bytes/bytearray or a

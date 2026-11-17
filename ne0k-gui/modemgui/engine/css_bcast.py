@@ -307,7 +307,7 @@ class CssBcastPort:
         """One session event (the GUI forwards them all; headless, ``_pump`` does)."""
         if self.send_role:
             return
-        if isinstance(ev, LinkEvent) and ev.kind == "lock" and not self.pll_ever and self.pll_locked:
+        if isinstance(ev, LinkEvent) and ev.kind in ("lock", "sync") and not self.pll_ever and self.pll_locked:
             self.pll_ever = True
             self.log("bcast pll lock")
             self._notify("PLL 1")

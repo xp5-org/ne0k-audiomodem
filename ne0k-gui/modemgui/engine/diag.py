@@ -56,6 +56,8 @@ class Diagnostics:
         self._tx: _WavOut | None = None
         self._tap = self._thread = None
         self._session = None
+        self._db = None                  # EventDb while diag.event_db is on and audio is open
+        self._pipe = self._want = None   # what the current capture was started for (attach)
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.on_line = None              # f(str): live log line (the UI mirrors it)
@@ -68,6 +70,9 @@ class Diagnostics:
             self.ring.append(line)
             if self._log_f:
                 self._log_f.write(line + "\n"); self._log_f.flush()
+            db = self._db
+        if db is not None:
+            db.log(line)
         if self.on_line:
             self.on_line(line)
 
@@ -101,13 +106,29 @@ class Diagnostics:
     # -- audio -------------------------------------------------------------
 
     def attach(self, session) -> None:
-        """Start the recordings that are switched on; call after the session opened."""
+        """Start the recordings that are switched on; call after the session opened.  Called again after any
+        settings change: if this session's capture switches are unchanged, the files already open carry on."""
+        want = (self.cfg.wav_rx, self.cfg.wav_tx, getattr(self.cfg, "event_db", False), self.cfg.out_dir)
+        if self._session is session and session.pipe is not None and session.pipe is self._pipe \
+                and want == self._want:
+            return
         self.detach()
-        self._session = session
+        self._session, self._pipe, self._want = session, session.pipe, want
         pipe = session.pipe
         if not pipe:
             return
         rate = session.spec.rate
+        if getattr(self.cfg, "event_db", False):
+            from .eventdb import EventDb
+            path = self._ensure_dir() / f"events_{time.strftime('%H%M%S')}.sqlite"
+            db = EventDb(path, dict(self.header, rate=rate, wav_rx_start=pipe.stats.rx_samples))
+            db.rx_index = lambda p=pipe: p.stats.rx_samples
+            with self._lock:
+                for line in self.ring:                  # what was logged before it was switched on
+                    db.log(line)
+                self._db = db
+            session.event_hooks.append(db.event)
+            self.log(f"event log -> {path}")
         if self.cfg.wav_rx or self.cfg.wav_tx:
             d = self._ensure_dir()
             stamp = time.strftime("%H%M%S")
@@ -144,11 +165,18 @@ class Diagnostics:
                 s.tx_hooks.remove(self._on_play)
             if self._tap and s.pipe:
                 s.pipe.unsubscribe(self._tap)
+            if self._db is not None and self._db.event in s.event_hooks:
+                s.event_hooks.remove(self._db.event)
+        with self._lock:
+            db, self._db = self._db, None
+        if db is not None:
+            db.close()
+            self.log(f"wrote {db.path} ({db.rows} rows)")
         for w in (self._rx, self._tx):
             if w:
                 w.close()
                 self.log(f"wrote {w.path} ({w.n / max(1, s.spec.rate if s else 48000):.1f} s)")
-        self._rx = self._tx = self._tap = self._thread = self._session = None
+        self._rx = self._tx = self._tap = self._thread = self._session = self._pipe = self._want = None
 
     def close(self) -> None:
         self.detach()

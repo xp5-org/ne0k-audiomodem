@@ -55,6 +55,10 @@ class CssConfig(_Config):
                           0.005, 2.0, step=0.01)
     symbol_gap_frac: float = F(0.05, "Symbol gap (fraction)", "Band and timing",
                                "Silence between chirps, as a fraction of the symbol.", 0.0, 0.5, step=0.01)
+    edge_taper_cycles: float = F(3.0, "Chirp edge taper (cycles)", "Band and timing",
+                                 "Fade each chirp in and out over this many cycles of the highest frequency "
+                                 "(3 at 6 kHz = 0.5 ms), so a speaker does not click at every symbol edge.  "
+                                 "0 = hard edges.", 0.0, 50.0, step=1.0)
     amplitude: float = F(0.8, "TX amplitude", "Band and timing", "Peak level, 0..1.", 0.01, 1.0, step=0.05)
     chunk_size: int = F(8, "Payload bytes per frame", "Framing and FEC", "", 1, 255)
     short_frames: bool = F(True, "Short header-only frames", "Framing and FEC",
@@ -73,6 +77,10 @@ class CssConfig(_Config):
                        "k7r12 = rate 1/2, constraint 7, Viterbi decoded.", choices=["none", "k7r12"])
     carrier_db: float = F(-55.0, "Carrier threshold (dBFS)", "Receive",
                           "A burst starts when 50 ms RMS passes this.", -100, 0)
+    carrier_margin_db: float = F(10.0, "Carrier margin over room (dB)", "Receive",
+                                 "Level carrier sense: the threshold rises to the measured room floor plus this, so "
+                                 "room noise above the fixed threshold does not read busy forever.  0 = fixed "
+                                 "threshold only.", 0.0, 40.0, step=1.0)
     hang_s: float = F(1.0, "Burst end after quiet (s)", "Receive", "", 0.1, 10)
     hear_own: bool = F(False, "Decode own transmissions", "Receive",
                        "For self-loop through a null sink.")
@@ -283,12 +291,29 @@ class GeneralConfig(_Config):
     first_beacon_s: float = F(20.0, "Listen before first beacon (s)", "Mesh beacons",
                               "Stay silent and listen for up to this long (random, plus 1 s per node id) before "
                               "the first beacon, so nodes started together do not collide.", 0.0, 600.0)
-    ignore_busy: bool = F(False, "Transmit without waiting for silence", "Transmit",
+    ignore_busy: bool = F(False, "Transmit without waiting for silence", "Carrier sense",
                           "Skip the checks that wait for a quiet channel before keying up: mesh carrier sense, OFDM "
                           "handshake turns and data frames, the announce round.  For a microphone and speaker, where "
                           "room noise always reads as someone transmitting and the modem would never send.  Protocol "
                           "holds stay: blockout windows, our own handshake in progress.  With it on, two stations can "
                           "key over each other.")
+    carrier_detect: str = F("level", "Carrier detect", "Carrier sense",
+                            "What counts as a station on the air, for the wait before keying up and for finding the "
+                            "start and end of a received burst.  level = sound above the carrier threshold: right for "
+                            "a wire line (SIP, phone), where silence is silence.  signal = one of this modem's own "
+                            "signals recognised in the sound (OFDM by its cyclic prefix, CSS by its chirps, the "
+                            "key-up tone and CW ID by pitch), at any level, also under louder noise: for a "
+                            "microphone and speaker or a radio, where noise never drops below a threshold.  A small "
+                            "detector then runs all the time and the decoders only on what it finds.",
+                            choices=["level", "signal"])
+    sense_ofdm_thr: float = F(0.12, "OFDM detect threshold", "Carrier sense",
+                              "signal detect: cyclic-prefix correlation (0..1) above which sound counts as OFDM.  A "
+                              "clean burst reads cp/(1+cp), 0.2-0.33; noise reads under 0.05.  Lower hears weaker "
+                              "stations and wakes the decoder on noise more often.", 0.03, 0.6, step=0.01)
+    sense_chirp_thr: float = F(30.0, "CSS detect threshold", "Carrier sense",
+                               "signal detect: how far the dechirped peak must stand above the noise (a ratio) for "
+                               "sound to count as a CSS chirp.  Noise reads about 10.  Lower hears weaker stations "
+                               "and wakes the decoder on noise more often.", 10.0, 500.0, step=1.0)
     slot_s: float = F(2.5, "Backoff slot (s)", "Mesh channel access",
                       "CSMA/CA: before sending, wait a random whole number of these slots, plus 0.1 s per "
                       "node id.  Must be longer than it takes to hear another node key up (path delay + "
@@ -359,6 +384,11 @@ class OutputConfig(_Config):
     libsdr fields are stored for the connectors still to come."""
     io_type: str = F("audio", "I/O type", "Output", "Audio uses the sound devices on the front page.",
                      choices=["audio", "gnuradio", "libsdr"])
+    tx_channels: str = F("both", "TX channels", "Output",
+                         "both = the modem signal on left and right (built-in stereo speakers); left / right = that "
+                         "channel only and silence on the other, for an interface that keys the radio from the spare "
+                         "channel.  Applies when audio is next opened.",
+                         choices=["both", "left", "right"])
     location: str = F("local", "Location", "GNURadio / libsdr", "local = on this machine, remote = over the network.",
                       choices=["local", "remote"])
     host: str = F("127.0.0.1", "Remote IP", "GNURadio / libsdr", "Address of the remote GNURadio / libsdr end.")
@@ -374,12 +404,27 @@ class DiagConfig(_Config):
                      "Everything the input device delivers, while audio is open.")
     wav_tx: bool = F(False, "Record transmitted audio (WAV)", "Capture",
                      "What we played, time-aligned to the RX file.")
+    event_db: bool = F(False, "Save event log (SQLite)", "Capture",
+                       "Every log line and every link event (TX, RX, decodes, probes, ACKs) in events.sqlite, each "
+                       "with its time and its position in the received-audio WAV.  For long runs: query it instead "
+                       "of reading the log.")
     out_dir: str = F(str(Path.home() / "modemgui-diagnostics"), "Folder", "Capture", "")
     detail: str = F("detailed", "Event log detail", "Logging",
                     "basic = one short line per packet; detailed = SNR, frame and RS error counts too.",
                     choices=["basic", "detailed"])
     log_serial: bool = F(True, "Log serial port activity", "Logging",
                          "Put the virtual serial port's tx/rx lines in the log.")
+
+
+@dataclasses.dataclass
+class RemoteConfig(_Config):
+    """TCP/IP remote control: drive the whole modem from another program or host, one text line per command."""
+    enabled: bool = F(False, "Enable TCP/IP remote control", "Remote control",
+                      "Listen for control connections.  Takes effect as soon as you press OK.  "
+                      "There is no authentication: anyone who can reach the port controls the modem.")
+    bind: str = F("127.0.0.1", "Listen address", "Remote control",
+                  "127.0.0.1 = this computer only.  0.0.0.0 opens it to the whole network; do that only on a network you trust.")
+    port: int = F(5555, "TCP port", "Remote control", "", 1, 65535)
 
 
 @dataclasses.dataclass

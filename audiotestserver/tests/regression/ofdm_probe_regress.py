@@ -115,7 +115,11 @@ GEOMS = [
     (1024, 0.25,  400.0, 8000.0,  8, 48000, 2.0,  96, 24),
     (2048, 0.375, 400.0, 8000.0,  8, 48000, 2.0,  80, 32),
     ( 512, 0.25,  400.0, 3600.0,  8, 20000, 2.0, 120, 24),
+    # the laptop OTA setting: 1536-sample symbols hold exactly 32 cycles of the 1 kHz keyup tone
+    (1024, 0.5,   400.0, 9000.0,  8, 48000, 2.0, 154, 32),
 ]
+
+KEYUP_HZ, KEYUP_S, KEYUP_DB = 1000.0, 2.0, 16.0   # ofdm_link.keyup(); tone level over the probe as heard OTA 2026-11-16
 
 
 def build_cfg(lib, g):
@@ -328,6 +332,33 @@ def main() -> int:
                           f"dSNR {dsnr:.2f}dB  BAT diff {nb_diff}  "
                           f"beta C={info.isi_ratio:.4f} "
                           f"py={pres.get('isi_ratio')}")
+
+        # keyup tone right ahead of the probe, louder than it: both must lock on the probe, not the tone
+        # (a whole-cycles-per-symbol tone scores coherence 1.0; ofdm_modem._TONE_FRAC)
+        t = np.arange(int(KEYUP_S * fs)) / fs
+        amp = math.sqrt(2.0 * float(np.mean(py_sig ** 2))) * 10 ** (KEYUP_DB / 20)
+        lead = int(0.3 * fs)
+        x = np.concatenate([amp * np.sin(2 * np.pi * KEYUP_HZ * t), py_sig])
+        air = sim_room(x, fs, 7, *ROOMS["desk"], 25.0)
+        rx = np.concatenate([np.zeros(lead), air, np.zeros(lead)])
+        rxa, prx = arr(rx)
+        outs = [np.zeros(py["n_occupied"]) for _ in range(5)]
+        ptrs = [o.ctypes.data_as(D) for o in outs]
+        info = Info()
+        lib.ofdm_probe_estimate(h, prx, len(rxa), 0.25, ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4],
+                                ctypes.byref(info))
+        pres = probe.estimate(rx, threshold=0.25)
+        t2 = f"{tag}/keyup+{KEYUP_DB:.0f}dB"
+        tone_end = lead + len(t) - py["symbol_samples"]
+        for who, valid, start, syms in (("C", info.valid, info.frame_start, info.n_syms),
+                                        ("py", pres.get("valid"), pres.get("frame_start", 0),
+                                         pres.get("n_syms", 0))):
+            if not valid or start < tone_end or syms < 0.8 * nps:
+                print(f"  FAIL [{t2}] {who}: valid={valid} start={start} (tone ends {tone_end}) "
+                      f"syms={syms}/{nps}")
+                bad += 1
+            elif a.verbose:
+                print(f"  ok   [{t2}] {who}: start={start} syms={syms}")
 
     print("\nOFDM PROBE REGRESS " + ("PASS" if bad == 0 else f"FAIL ({bad})"))
     return 1 if bad else 0

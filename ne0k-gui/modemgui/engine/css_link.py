@@ -28,8 +28,11 @@ from pathlib import Path
 
 import numpy as np
 
+from . import cpustats
 from .events import Decoded, LinkEvent
 from .modemcfg import CssConfig
+from . import cca
+from .levelfloor import LevelFloor
 from .ofdm_link import KEYUP_LEAD_S
 
 BACKEND = "python"                 # what set_backend last selected
@@ -80,6 +83,7 @@ def set_backend(name: str) -> str:
 def _enc_cfg(c: CssConfig, raw: bytes, base: Path) -> dict:
     return dict(fs=c.fs, f_min=c.f_min, f_max=c.f_max, symbol_dur=c.symbol_dur,
                 amplitude=c.amplitude, symbol_gap_frac=c.symbol_gap_frac,
+                edge_taper_cycles=float(getattr(c, "edge_taper_cycles", 0.0)),
                 chunk_size=c.chunk_size, diff_encode=c.diff_encode, rs_t=c.rs_t,
                 crc_bytes=int(getattr(c, "crc_bytes", 4)),
                 conv_code=(None if c.conv_code in ('', 'none') else c.conv_code),
@@ -108,7 +112,7 @@ def encode_packet(c: CssConfig, raw: bytes, tag: str = "tx", short: bool | None 
     if sc is not None and (short if short is not None else len(raw) <= SHORT_CHUNK):
         c = sc
     out = io.StringIO()
-    with contextlib.redirect_stdout(out):
+    with contextlib.redirect_stdout(out), cpustats.stage("encode"):
         enc.encode(_enc_cfg(c, raw, _work / tag))
     last_codec["enc"] = "c" if "ENC_BACKEND=c" in out.getvalue() else "python"
     with wave.open(str(_work / tag) + ".wav", "rb") as w:
@@ -178,7 +182,7 @@ def decode_samples(c: CssConfig, pcm: np.ndarray) -> list[Decoded]:
     pad = np.zeros(c.fs, np.float32)
     cap = np.concatenate([pad, np.asarray(pcm, np.float32), pad])
     ov = {"mf_longsym": True, "mf_longsym_min_dur": 0.0} if c.decoder == "mf" else None
-    with _decode_lock, _no_signals():
+    with _decode_lock, _no_signals(), cpustats.stage("decode"):
         res = tl.decode_array(cap, c.fs, _info(c), ov)
         if not res.get("frames") and short_cfg(c) is not None:      # a header-only packet's short frame
             res = tl.decode_array(cap, c.fs, _info(c, short=True), ov)
@@ -211,6 +215,11 @@ def decode_samples(c: CssConfig, pcm: np.ndarray) -> list[Decoded]:
                     grid_sps=frames[0].get("grid_sps"))]
 
 
+MIN_BURST_FRAC = 0.5     # a burst under this fraction of the shortest frame (the ACK) is not decoded
+GATE_WARM_S = 5.0       # staged receive: decoders run this long from the start (the chirp tracker calibrates on 3 s)
+GATE_TX_HOLD_S = 2.0     # ... and this long after our own audio (its echo returns within the tracker's 1 s)
+
+
 class CssLink:
     """TX + burst RX on a Session's pipe.  Carrier sense is a 50 ms RMS gate; a
     burst ends after ``hang_s`` of quiet and is decoded on this thread."""
@@ -223,13 +232,19 @@ class CssLink:
         self._thread: threading.Thread | None = None
         self._last_busy = -1e9
         self._in_burst = False
-        self.on_level = None             # f(rms) per 50 ms block: feeds the ambient estimate
+        # staged receive: True while the streaming decoders are not being fed, so the tracker's busy flag is
+        # frozen at whatever it was when the gate closed (usually True: it closed right after a burst)
+        self._gated = False
+        self.level_floor: LevelFloor | None = None   # level carrier sense threshold (set by _rx)
+        self.on_level = None            # f(rms) per 50 ms block: feeds the ambient estimate
         self.backend = ""                # set_backend's description, once applied
         self._codec_logged: dict = {}
         self.stream = None               # CssStreamRx when decoder == "pll_c"
         self.stream_short = None         # its twin on the short header-only frame geometry
         self._tx_onsets: collections.deque = collections.deque()
         self._pipe_hooked = None
+        self._min_frame_s: float | None = None
+        self.short_bursts = 0            # bursts too short for any frame, not decoded (see _decode)
 
     def _ensure_backend(self) -> None:
         if self.backend:
@@ -250,10 +265,23 @@ class CssLink:
             self.log("css codec: " + " ".join(f"{k}={v}" for k, v in now.items()))
 
     def channel_busy(self, settle_s: float = 0.4) -> bool:
-        """Carrier sense: a burst is being received, or the gate was open within ``settle_s``."""
-        if self.stream is not None and self.stream.busy():
+        """Carrier sense: a burst is being received, or the gate was open within ``settle_s``.  While the staged
+        receive withholds samples from the streaming decoders, the tracker's state is stale: the detector
+        (``_in_burst``) is then the only judge."""
+        if self.stream is not None and not self._gated and self.stream.busy():
             return True
         return self._in_burst or time.monotonic() - self._last_busy < settle_s
+
+    def cs_state(self) -> str:
+        """Carrier sense, part by part, for INFO: which of them is holding the channel busy."""
+        st = self.stream
+        trk = None if st is None or st.trk is None else int(st.busy())
+        return (f"busy={int(self.channel_busy())} trk={'-' if trk is None else trk} gated={int(self._gated)} "
+                f"in_burst={int(self._in_burst)} last_busy_age={time.monotonic() - self._last_busy:.1f}s "
+                f"trk_changes={getattr(st, 'busy_changes', 0)} short_bursts={self.short_bursts}"
+                + ("" if self.level_floor is None else
+                   f" lvl_thr={self.level_floor.threshold_db():.1f}dB floor="
+                   f"{'-' if self.level_floor.floor_db is None else f'{self.level_floor.floor_db:.1f}'}dB"))
 
     def start(self) -> None:
         pipe = self.session.pipe
@@ -350,13 +378,29 @@ class CssLink:
         self._ensure_backend()
         return len(encode_ack(self.cfg, self.cfg.peer_id, 0)) / self.cfg.fs
 
+    def min_frame_s(self) -> float:
+        """Airtime of the shortest frame this config sends (the header-only ACK), computed once."""
+        if self._min_frame_s is None:
+            self._min_frame_s = self.ack_airtime()
+        return self._min_frame_s
+
     def _rx(self, tap) -> None:
         c = self.cfg
         win = int(0.05 * c.fs)
-        thr = 10 ** (c.carrier_db / 20)
+        self.level_floor = LevelFloor(0.05, c.carrier_db, float(getattr(c, "carrier_margin_db", 0.0)))
         buf: list[np.ndarray] = []
         quiet = 0
-        pre: collections.deque = collections.deque(maxlen=4)   # pre-roll: the gate opens late
+        # signal sense: "busy" is a chirp (or another of our signals) found by cca, not a level.  A chirp is
+        # confirmed after two looks half a symbol apart, so the pre-roll has to reach back over them.
+        sense = cca.for_session(self.session)
+        self.sense = sense
+        # staged receive (_feed_streams): pre-roll handed to the streaming decoders when a burst opens
+        self._held: collections.deque = collections.deque()
+        self._held_n = self._skip_n = self._seen = 0
+        self._pre_n = int((0.2 + 5.0 * c.symbol_dur * (1 + c.symbol_gap_frac)) * c.fs)
+        self._gate_until = int(GATE_WARM_S * c.fs)
+        late = 4 if sense is None else 4 + int(np.ceil(3.0 * c.symbol_dur * (1 + c.symbol_gap_frac) / 0.05))
+        pre: collections.deque = collections.deque(maxlen=late)   # pre-roll: the gate opens late
         rem = np.zeros(0, np.float32)
         while not self._stop.is_set():
             b = tap.get(timeout=0.2)
@@ -370,10 +414,7 @@ class CssLink:
                         self.log(f"css rx: tx schedule failed: {e}")
             if b is None:
                 continue
-            if st is not None:
-                st.feed(b.samples, b.tx_active)
-            if self.stream_short is not None:
-                self.stream_short.feed(b.samples, b.tx_active)
+            self._feed_streams(b)
             if b.tx_active and not c.hear_own:
                 continue
             x = np.concatenate([rem, b.samples])
@@ -381,7 +422,11 @@ class CssLink:
             rem = x[n:]
             for seg in x[:n].reshape(-1, win):
                 lvl = float(np.sqrt(np.mean(seg * seg)))
-                busy = lvl > thr
+                if sense is None:
+                    busy = lvl > self.level_floor.update(lvl, bool(buf))
+                else:
+                    sense.push(seg)
+                    busy = bool(sense.flags(sense.n - win, sense.n, win).any())
                 if busy:
                     self._last_busy = time.monotonic()
                 elif not buf and self.on_level:
@@ -403,6 +448,42 @@ class CssLink:
                 else:
                     pre.append(seg)
 
+    def _feed_streams(self, b) -> None:
+        """Hand one RX block to the streaming decoders.  Level sense: every block, as always.  Signal sense (staged
+        receive): only while the chirp detector has a burst open, around our own transmissions (the tracker has to
+        see our chirps come back) and while the tracker calibrates; otherwise the block waits in a short pre-roll
+        and, once older than that, is skipped -- the decoders' sample index moves on without the DSP running."""
+        streams = [s for s in (self.stream, self.stream_short) if s is not None]
+        if not streams:
+            return
+        n = len(b.samples)
+        self._seen += n
+        if self.sense is not None and all(s.can_skip for s in streams):
+            fs = self.cfg.fs
+            if b.tx_active:
+                self._gate_until = self._seen + int(GATE_TX_HOLD_S * fs)
+            if not (self._in_burst or self._seen < self._gate_until):
+                self._gated = True
+                self._held.append(b)
+                self._held_n += n
+                while self._held_n > self._pre_n and len(self._held) > 1:
+                    old = self._held.popleft()
+                    self._held_n -= len(old.samples)
+                    self._skip_n += len(old.samples)
+                return
+            self._gated = False
+            if self._skip_n:
+                for s in streams:
+                    s.skip(self._skip_n)
+                self._skip_n = 0
+            while self._held:
+                hb = self._held.popleft()
+                for s in streams:
+                    s.feed(hb.samples, hb.tx_active)
+            self._held_n = 0
+        for s in streams:
+            s.feed(b.samples, b.tx_active)
+
     def _decode(self, burst: np.ndarray, t0: float, t1: float) -> None:
         me = self.cfg.node_id
         # OFDM and CSS never intermix: this listener keeps running under ofdm_only (CssLink.start
@@ -422,6 +503,15 @@ class CssLink:
             # frames came off the streaming decoder as they arrived; the burst
             # boundary only finishes the packet and re-arms the decoder
             self.stream.burst_end()
+            return
+        if t1 - t0 < self.min_frame_s() * MIN_BURST_FRAC:
+            # Too short to hold even a header-only frame (an ACK: 13 s at 0.15 s symbols, 43 s at 0.5 s), so
+            # do not decode it.  A missed long-symbol decode costs 4 matched-filter passes -- 23 s for a 0.2 s
+            # noise blip at 0.5 s symbols, longer on a slow CPU -- and runs on this thread with the channel
+            # counted busy, so every ACK and DATA of this node waited behind it (2026-11-17 m6600: ACK 40 s
+            # late, DATA keyed 170 s after the send) and the 22 s tap queue dropped audio meanwhile.
+            self.short_bursts += 1
+            self.session._emit(LinkEvent("err", me, -1, t0, t1, "burst shorter than a frame: not decoded"))
             return
         out: list[Decoded] = []
         # The reference decoder reads in symbol-sized chunks and misses the preamble when the

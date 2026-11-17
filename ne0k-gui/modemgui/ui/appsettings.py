@@ -12,9 +12,9 @@ import dataclasses
 
 from PySide6.QtCore import QSettings
 
-from ..engine.modemcfg import CssBcastConfig, CssConfig, DiagConfig, GeneralConfig, HamConfig, OfdmConfig, OutputConfig, SerialConfig, UdpConfig
+from ..engine.modemcfg import CssBcastConfig, CssConfig, DiagConfig, GeneralConfig, HamConfig, OfdmConfig, OutputConfig, RemoteConfig, SerialConfig, UdpConfig
 
-SECTIONS = {"general": GeneralConfig, "output": OutputConfig, "css": CssConfig, "ofdm": OfdmConfig, "ham": HamConfig, "serial": SerialConfig, "udp": UdpConfig, "cssbcast": CssBcastConfig, "diag": DiagConfig}
+SECTIONS = {"general": GeneralConfig, "output": OutputConfig, "css": CssConfig, "ofdm": OfdmConfig, "ham": HamConfig, "serial": SerialConfig, "udp": UdpConfig, "cssbcast": CssBcastConfig, "diag": DiagConfig, "remote": RemoteConfig}
 
 
 class AppSettings:
@@ -29,6 +29,7 @@ class AppSettings:
         self.udp: UdpConfig
         self.cssbcast: CssBcastConfig
         self.diag: DiagConfig
+        self.remote: RemoteConfig
         for name, cls in SECTIONS.items():
             setattr(self, name, self._load(name, cls))
 

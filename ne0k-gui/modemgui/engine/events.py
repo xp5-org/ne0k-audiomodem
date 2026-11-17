@@ -83,7 +83,8 @@ class LinkEvent(Event):
     observed or did it, ``peer`` the other end (-1 unknown).  ``t0``/``t1`` are
     time.monotonic() seconds: the airtime span for tx/rx bursts, t0 == t1 for points.
     ``lock`` = the decoder acquired the preamble and recovered frames (the CSS
-    receiver has no separate PLL state to report).  ``blockout`` = an exclusive mesh-wide quiet
+    receiver has no separate PLL state to report).  ``sync`` = a CSS preamble sync or tracker grid lock with
+    nothing decoded yet (noise and own-TX echoes do this; the lock bar ignores it).  ``blockout`` = an exclusive mesh-wide quiet
     window opened or closed (``MeshNode.blockout``); ``t0``..``t1`` spans the announced window
     (``t0``==``t1`` for the END/resume point), ``peer`` is the OTHER participant when this node
     is one of the two, else -1 (muted bystander)."""

@@ -208,7 +208,7 @@ class HubMac:
 
     def start(self) -> None:
         H, _ = _imports()
-        with _quiet():
+        with _quiet("encode"):
             a = H.make_msg_audio(self.fs, H.MSG_HUB, 0, pack_hub(K_DLVR, 0, 0, b"\0\0\0\0"), self.band)
         self.msg_air_s = len(a) / self.fs
         self.log(f"hub: {'HUB' if self.is_hub else 'client'} id={self.me} hub={self.hub_id} nodes={self.n_nodes} "
@@ -326,7 +326,7 @@ class HubMac:
 
     def _msg_audio(self, kind: int, to: int, args: bytes) -> np.ndarray:
         H, _ = _imports()
-        with _quiet():
+        with _quiet("encode"):
             audio = H.make_msg_audio(self.fs, H.MSG_HUB, 0, pack_hub(kind, self.me, to, args), self.band)
             return H.scale_hs_tx(audio, self.cfg.amplitude, self.fs, is_probe=False, band=self.band)[0]
 
@@ -788,7 +788,7 @@ class HubMac:
                 seq = self._bseq
                 self._back_seq, self._backs = seq, set()
             body = pack_frame(seq, 0, piece, self.me, BROADCAST_ID)
-            with _quiet():
+            with _quiet("encode"):
                 audio = H.make_data_audio(self.fs, body, bat, self.band, self.cfg.chunk_bytes)
                 audio = H.scale_hs_tx(audio, self.cfg.amplitude, self.fs, is_probe=False, band=self.band)[0]
             want = set(clients)

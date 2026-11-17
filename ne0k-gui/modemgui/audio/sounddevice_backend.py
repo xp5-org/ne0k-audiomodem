@@ -18,7 +18,7 @@ from typing import Callable
 import numpy as np
 
 from .base import (SINK, SOURCE, AudioError, Connector, DeviceInfo, Sink,
-                   Source, StreamSpec, as_mono_f32)
+                   Source, StreamSpec, as_mono_f32, spread)
 
 try:
     import sounddevice as _sd
@@ -77,6 +77,17 @@ class SdSource(Source):
             print(f"sd input closed: {getattr(self, 'overflows', 0)} overflow callbacks", flush=True)
 
 
+def _out_channels(dev) -> int:
+    """Channels to open a sink with: 2 on a stereo (or wider) device, so ``StreamSpec.tx_channels`` decides where the
+    mono signal plays.  A one-channel stream reaches the left channel only on CoreAudio (a MacBook played the modem
+    on one speaker, quieter than a stereo file at the same volume, 2026-11-16), while PulseAudio upmixes it to both."""
+    try:
+        n = int(_sd.query_devices(dev, "output")["max_output_channels"])
+    except Exception:
+        return 1
+    return 2 if n >= 2 else 1
+
+
 class SdSink(Sink):
     def __init__(self, dev, spec: StreamSpec) -> None:
         self.spec, self._dev, self._st = spec, dev, None
@@ -85,10 +96,11 @@ class SdSink(Sink):
         def cb(outdata, frames, t, status):
             if status:
                 self.error = str(status)
-            outdata[:, 0] = pull(frames)
+            outdata[:] = spread(pull(frames), outdata.shape[1], self.spec.tx_channels)
         try:
+            self.channels = _out_channels(self._dev)
             self._st = _sd.OutputStream(device=self._dev, samplerate=self.spec.rate,
-                                        blocksize=self.spec.block, channels=1,
+                                        blocksize=self.spec.block, channels=self.channels,
                                         dtype="float32", callback=cb)
             self._st.start()
         except Exception as e:

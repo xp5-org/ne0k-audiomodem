@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import queue
+import dataclasses
 import threading
 import time
 
@@ -42,12 +43,21 @@ class Session:
         self._lock = threading.Lock()
         self.ident = Identifier(self)       # ham-mode station ID; inert until HamConfig.enabled
         self.tx_hooks: list = []            # f(samples, rx_sample_index): called for every play()
+        self.event_hooks: list = []         # f(event): every event as it is emitted, on the emitting thread
         self.ignore_busy = False            # GeneralConfig.ignore_busy: skip the energy checks before TX
+        self.sense_mode = "level"           # GeneralConfig.carrier_sense: level | signal (off = ignore_busy)
+        self.sense_spec = None              # cca.SenseSpec: what "our signal" is, for sense_mode signal
+        self.tx_channels = "both"           # OutputConfig.tx_channels, taken into the spec at the next open()
         self.keyup_tone = True              # OfdmConfig.channel == radio: ofdm_link.keyup() leads each burst with a tone
 
     # -- events -------------------------------------------------------------
 
     def _emit(self, ev: Event) -> None:
+        for h in self.event_hooks:          # diagnostics (EventDb): must be quick and never raise
+            try:
+                h(ev)
+            except Exception:
+                pass
         while True:
             try:
                 self.events.put_nowait(ev)
@@ -91,6 +101,8 @@ class Session:
         with self._lock:
             if self._pipe:
                 self._close_locked()
+            if self.spec.tx_channels != self.tx_channels:
+                self.spec = dataclasses.replace(self.spec, tx_channels=self.tx_channels)
             pipe = AudioPipe(self.registry, self.spec)
             try:
                 pipe.open(rx, tx).start()

@@ -46,6 +46,7 @@ from typing import Callable
 import numpy as np
 
 from .ident import KEYUP_TONE_HZ
+from . import cca
 from .ofdm_link import _Capture, _imports, _quiet, keyup, KEYUP_LEAD_S
 
 FLAG_CATCHUP = 1
@@ -143,7 +144,7 @@ class AnnounceRound:
         self.go_count = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._cap = _Capture(cfg.fs, keep_s=40.0)
+        self._cap = _Capture(cfg.fs, keep_s=40.0, sense=cca.for_session(session))
         self._tap = None
         self._threads: list[threading.Thread] = []
         self._tx_until = 0.0
@@ -267,9 +268,8 @@ class AnnounceRound:
         return 10 ** (self.cfg.carrier_db / 20)
 
     def _clear(self, quiet_s: float = 0.8) -> bool:
-        x = self._cap.get(self._cap.n - int(quiet_s * self.cfg.fs))
-        return time.monotonic() >= self._tx_until and (getattr(self.session, "ignore_busy", False) or len(x) == 0
-                                                        or float(np.sqrt(np.mean(x * x))) <= self._thr())
+        return time.monotonic() >= self._tx_until and (getattr(self.session, "ignore_busy", False)
+                                                        or not self._cap.busy(quiet_s, self._thr()))
 
     # -- receive: driven by _rx below, or by the node's MeshReceiver (shared_rx) -----------------
 
@@ -314,7 +314,7 @@ class AnnounceRound:
         H, _ = _imports()
         fs = self.cfg.fs
         full = int(H.hs_cfg(fs, self._band)["n_probe_syms"])
-        with _quiet():
+        with _quiet("decode"):
             got = H.try_decode_probe(cap, fs, rates=(fs,), min_syms=max(12, int(0.6 * full)), band=self._band)
         if not got or got[2].get("n_active", 1) == 0:
             with self._lock:
@@ -404,16 +404,14 @@ class AnnounceRound:
         burst_from = None
         while not self._stop.wait(0.25):
             n = self._cap.n
-            x = self._cap.get(n - win)
-            busy = len(x) > 0 and float(np.sqrt(np.mean(x * x))) > self._thr()
+            busy = self._cap.busy(0.1, self._thr())
             self.rx_air(busy)
             if busy and burst_from is None:
                 burst_from = n - int(1.0 * fs)
                 self.rx_open()
             if burst_from is None or busy:
                 continue
-            tail = self._cap.get(n - int(0.8 * fs))
-            if len(tail) and float(np.sqrt(np.mean(tail * tail))) > self._thr():
+            if self._cap.busy(0.8, self._thr()):
                 continue
             cap = self._cap.get(max(burst_from - int(0.5 * fs), n - int(40 * fs)))
             burst_from = None
@@ -421,7 +419,7 @@ class AnnounceRound:
                 self.rx_done(None, 0.0)
                 continue
             end_t = time.monotonic() - 0.8
-            with _quiet():
+            with _quiet("decode"):
                 got = H.try_decode_msg(cap, fs, rates=(fs,), band=self._band)
             self._check_ident(cap)
             self.rx_done(got, end_t)

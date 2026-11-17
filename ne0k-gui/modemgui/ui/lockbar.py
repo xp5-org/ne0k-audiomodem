@@ -25,6 +25,7 @@ class LockBar(QWidget):
         lay.addStretch(1)
         self._open = False
         self._t_lock: float | None = None
+        self.last_why = ""                 # what last set "locked" (INFO ui.pll)
         self._acq: list[float] = []
         self._timer = QTimer(self); self._timer.setInterval(250)
         self._timer.timeout.connect(self._paint)
@@ -40,8 +41,9 @@ class LockBar(QWidget):
         self._timer.start() if on else self._timer.stop()
         self._paint()
 
-    def locked(self, acq_s: float | None = None, score: float | None = None) -> None:
+    def locked(self, acq_s: float | None = None, score: float | None = None, why: str = "") -> None:
         self._t_lock = time.monotonic()
+        self.last_why = why
         if acq_s is not None:
             self._acq = (self._acq + [acq_s])[-20:]
         if score is not None:
@@ -51,6 +53,11 @@ class LockBar(QWidget):
     def unlocked(self) -> None:
         self._t_lock = None
         self._paint()
+
+    def describe(self) -> str:
+        age = "-" if self._t_lock is None else f"{time.monotonic() - self._t_lock:.1f}s"
+        return f"{self.state.text()} | last lock {age} ago ({self.last_why or '-'}) | open={int(self._open)} " \
+               f"timer={int(self._timer.isActive())}"
 
     def _paint(self) -> None:
         if not self._open:

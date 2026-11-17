@@ -55,6 +55,15 @@ class ControlError(Exception):
     """A refused command; the message becomes ``ERR <message>``."""
 
 
+def direct(fn):
+    """Mark a host action to run on the control thread instead of through ``ControlHost.run``: for actions that
+    wait on subprocesses or the OS and hop to the modem's thread themselves only for the state they need."""
+    def wrapper(a):
+        return fn(a)
+    wrapper.direct = True
+    return wrapper
+
+
 # -- values -------------------------------------------------------------------
 
 def fmt_value(v) -> str:
@@ -121,6 +130,11 @@ class ControlHost:
         return "live" if section in self.live_sections else "restart"
 
     def info(self) -> list[tuple[str, object]]:
+        return []
+
+    def info_offthread(self) -> list[tuple[str, object]]:
+        """More INFO rows, called on the control thread rather than through ``run``: for slow reads (the host OS
+        mixer shells out to pactl / amixer) that must not stall the modem's thread."""
         return []
 
     def actions(self) -> dict:
@@ -353,7 +367,9 @@ class ControlServer:
                 acts = self.host.actions()
                 if word not in acts:
                     raise ControlError(f"unknown command {word!r} (HELP lists them)")
-                detail = self.host.run(lambda: acts[word][1](rest.strip()))
+                act = acts[word][1]
+                detail = (act(rest.strip()) if getattr(act, "direct", False)
+                          else self.host.run(lambda: act(rest.strip())))
                 if isinstance(detail, list):        # an action that answers with data lines
                     out.extend(detail); detail = None
             for ln in out:
@@ -558,6 +574,7 @@ class ControlServer:
                                           ("control.rx_buffered", len(self._rx)),
                                           ("control.rx_dropped", self.rx_dropped)]
         rows += self.host.run(self.host.info)
+        rows += self.host.info_offthread()
         br = self._sync_bridge()
         if br is None:
             rows.append(("serial", "closed"))

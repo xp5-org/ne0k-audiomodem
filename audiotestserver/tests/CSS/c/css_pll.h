@@ -96,6 +96,11 @@ typedef struct {
      * early-sync guard like css_pll_mark_onset(); 0 = off
      * (decode() onset_guard_silence_syms) */
     int    onset_guard_silence_syms;
+    /* the onset guard's "silent" is relative to the room: rms under
+     * max(silence_thr, pre-sync noise floor + onset_rel_db); 0 = silence_thr only.
+     * The floor follows the quietest symbol down at once and rises
+     * onset_floor_rise_db per symbol (decode() onset_rel_db / onset_floor_rise_db) */
+    double onset_rel_db, onset_floor_rise_db;
     /* phase-step recovery while synced (decode() step_recover): settled, the
      * narrow MF snr dropping step_drop_db under the frame's running snr triggers
      * a +-search_range search; in acquisition a peak beyond post_acq_search is
@@ -197,6 +202,14 @@ int    css_pll_align(css_pll *p, long abs_peak, double period);
  * false-locks on a Barker sidelobe in the training.  This re-anchors the
  * guard at the real onset. */
 int    css_pll_mark_onset(css_pll *p, long abs_onset);
+
+/* Staged receive (NOT in the reference): the host's cheap chirp detector saw
+ * nothing for `n` samples and did not push them.  Advance the RX sample index
+ * by n so every abs position stays the stream's own, drop the partial read and
+ * re-arm (as css_pll_rearm).  The ring keeps the audio from before the gap;
+ * the host pushes a pre-roll of real audio ahead of the next burst, which
+ * flushes it.  Costs nothing per skipped sample. */
+void   css_pll_skip(css_pll *p, long n);
 
 /* Diagnostics the reference puts in its result dict. */
 typedef struct {

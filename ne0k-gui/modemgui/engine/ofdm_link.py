@@ -64,6 +64,9 @@ Two phases:
   the listener answers every frame with a pure-ACK frame on the same (full) band, the sender
   resends after ``ack_wait_s``.  Turns are enforced by the protocol (the sender waits for the
   ACK), not by a clock.  This is the data plane the mesh node uses for a src -> dst transfer.
+  With ``sender="both"`` (the mesh node's links) it is connected-mode ARQ: once the handshake has
+  exchanged both tables, either end sends DATA on the one link (sequence and ack numbers are per
+  direction), listening before it talks and backing a resend off at random.
 
 The mesh node (``mesh_node``) sits on top: it brings these links up on demand.
 """
@@ -74,6 +77,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import random
 import sys
 import struct
 import threading
@@ -83,9 +87,10 @@ from pathlib import Path
 import numpy as np
 
 from .events import ProbeReport, LinkEvent
-from . import carrier_schedule
+from . import carrier_schedule, cpustats
 from .ident import KEYUP_TONE_HZ
 from .modemcfg import OfdmConfig
+from . import cca
 
 BACKEND = "python"
 HDR = 6                             # addr, seq, ack, len, crc16
@@ -116,7 +121,31 @@ def _imports():
         os.environ.setdefault("RS_BACKEND", "c")
     import ofdm_handshake
     import ofdm_modem
+    _stage_wrap(ofdm_handshake)
     return ofdm_handshake, ofdm_modem
+
+
+# Charged to a CPU stage wherever they are called from, inside _quiet or not (the handshake messages, beacons and
+# announce rounds build their audio outside it).  Nested inside a labelled _quiet they count once, for the outer label.
+_STAGED = {"make_msg_audio": "encode", "make_probe_audio": "encode", "make_data_audio": "encode",
+           "scale_hs_tx": "encode", "try_decode_msg": "decode", "try_decode_probe": "decode"}
+
+
+def _stage_wrap(mod) -> None:
+    if getattr(mod, "_cpu_staged", False):
+        return
+    for name, what in _STAGED.items():
+        fn = getattr(mod, name, None)
+        if fn is None:
+            continue
+
+        def staged(*a, _fn=fn, _what=what, **kw):
+            with cpustats.stage(_what):
+                return _fn(*a, **kw)
+        staged.__wrapped__ = fn
+        staged.__name__ = name
+        setattr(mod, name, staged)
+    mod._cpu_staged = True
 
 
 
@@ -223,9 +252,10 @@ def apply_phy(c: OfdmConfig) -> dict:
 
 
 @contextlib.contextmanager
-def _quiet():
-    """The reference modules print a progress line per call; keep them out of the CLI log."""
-    with _dsp_lock, contextlib.redirect_stdout(io.StringIO()):
+def _quiet(what: str = "dsp"):
+    """The reference modules print a progress line per call; keep them out of the CLI log.  ``what`` is the CPU stage
+    the call is charged to ("decode" / "encode", cpustats.py), timed inside the lock so waiting for it is not counted."""
+    with _dsp_lock, cpustats.stage(what), contextlib.redirect_stdout(io.StringIO()):
         yield
 
 
@@ -259,8 +289,9 @@ def unpack_frame(raw: bytes):
 class _Capture:
     """Rolling mono capture with absolute sample indices and a monotonic-time mapping."""
 
-    def __init__(self, fs: int, keep_s: float = 120.0) -> None:
+    def __init__(self, fs: int, keep_s: float = 120.0, sense=None) -> None:
         self.fs, self.keep = fs, int(keep_s * fs)
+        self.sense = sense                  # cca.Presence: "busy" = one of our signals, not a level (or None)
         self._chunks: collections.deque = collections.deque()
         self._start = 0
         self.n = 0
@@ -274,6 +305,28 @@ class _Capture:
             self._ref = (self.n, time.monotonic())
             while self.n - self._start > self.keep and len(self._chunks) > 1:
                 self._start += len(self._chunks.popleft())
+        if self.sense is not None:
+            self.sense.push(x)              # stage 1 runs on every sample, once, here
+
+    def busy_blocks(self, i0: int, i1: int | None, thr: float, blk: int) -> tuple[int, np.ndarray]:
+        """(first index, busy flag per ``blk`` samples) for capture [i0, i1): one of our signals is there (signal
+        sense), or the block's RMS is above ``thr`` (level sense)."""
+        i0 = max(i0, self._start)
+        i1 = self.n if i1 is None else min(i1, self.n)
+        if self.sense is not None:
+            return i0, self.sense.flags(i0, i1, blk) > 0
+        x = self.get(i0, i1)
+        k = len(x) // blk
+        if not k:
+            return i0, np.zeros(0, bool)
+        return i0, np.sqrt(np.mean(x[:k * blk].reshape(k, blk) ** 2, axis=1)) > thr
+
+    def busy(self, look_s: float, thr: float) -> bool:
+        """The last ``look_s``: one of our signals in it (signal sense), or its RMS above ``thr`` (level sense)."""
+        if self.sense is not None:
+            return self.sense.busy(look_s)
+        x = self.get(self.n - int(look_s * self.fs))
+        return len(x) > 0 and float(np.sqrt(np.mean(x * x))) > thr
 
     def get(self, i0: int, i1: int | None = None) -> np.ndarray:
         with self._lock:
@@ -338,7 +391,7 @@ class OfdmLink:
         self._go_end = None                             # monotonic time the responder saw GO (set by the handshake; None when up from a preset)
         self.tx_frames = self.rx_frames = 0
         self.foreign_frames = 0                        # good frames between other stations (shared channel)
-        self._cap = _Capture(c.fs)
+        self._cap = _Capture(c.fs, sense=cca.for_session(session))
         self._tap = None
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -501,16 +554,19 @@ class OfdmLink:
         _is_ident's _id_seen).  Callers must call _is_ident themselves, only once a span is
         actually closed."""
         fs = self.cfg.fs
-        x = self._rx_get(i0, i1)
         win = int(0.05 * fs)
-        n = len(x) // win
-        if not n:
-            return []
-        rms = np.sqrt(np.mean(x[:n * win].reshape(n, win) ** 2, axis=1))
-        busy = np.flatnonzero(rms > self._thr())
+        base = max(i0, self._cap._start)
+        if self._cap.sense is not None and not self._filt:
+            busy = np.flatnonzero(self._cap.busy_blocks(i0, i1, 0.0, win)[1])
+        else:                                # level sense; fdd always: our own carrier is in the raw capture
+            x = self._rx_get(i0, i1)
+            n = len(x) // win
+            if not n:
+                return []
+            rms = np.sqrt(np.mean(x[:n * win].reshape(n, win) ** 2, axis=1))
+            busy = np.flatnonzero(rms > self._thr())
         out: list[list[int]] = []
         gap = int(gap_s / 0.05)
-        base = max(i0, self._cap._start)
         for k in busy:
             if out and k - out[-1][1] <= gap:
                 out[-1][1] = int(k)
@@ -552,8 +608,7 @@ class OfdmLink:
     def _air_busy(self, look_s: float = 0.4) -> bool:
         if getattr(self.session, "ignore_busy", False):
             return False                          # GeneralConfig.ignore_busy: microphone use, noise always present
-        x = self._cap.get(self._cap.n - int(look_s * self.cfg.fs))
-        return len(x) > 0 and float(np.sqrt(np.mean(x * x))) > self._thr()
+        return self._cap.busy(look_s, self._thr())
 
     def _note_rx(self, i0: int, i1: int, detail: str) -> None:
         t0, t1 = self._cap.t_of(i0), self._cap.t_of(i1)
@@ -739,7 +794,7 @@ class OfdmLink:
             return listen
         rates, band = (c.fs,), self._band
         if "msg" in expect:
-            with _quiet():
+            with _quiet("decode"):
                 got = H.try_decode_msg(cap, c.fs, rates=rates, band=band)
             if got:
                 _, mtype, proof, body = got
@@ -752,7 +807,7 @@ class OfdmLink:
             full = int(H.hs_cfg(c.fs, band)["n_probe_syms"])
             near_full = max(12, int(0.6 * full))
             min_syms = near_full if sm.state == "r_wait_ack" else 12
-            with _quiet():
+            with _quiet("decode"):
                 got = H.try_decode_probe(cap, c.fs, rates=rates, min_syms=min_syms, band=band)
                 if got and got[2]["n_syms"] < near_full and got[2].get("tail_s", 99.0) < 6.0:
                     got = None                   # still playing: wait for the full train
@@ -845,7 +900,7 @@ class OfdmLink:
         c = self.cfg
         usable = c.window_s - 2 * c.guard_s
         n = 0
-        with _quiet():
+        with _quiet("encode"):
             while n < 64:
                 air = len(H.make_data_audio(c.fs, b"\0" * ((n + 1) * c.chunk_bytes), self._tx_bat,
                                             self._band, c.chunk_bytes)) / c.fs
@@ -944,7 +999,7 @@ class OfdmLink:
         if fr is None:
             return
         seq, ack, data = fr
-        with _quiet():
+        with _quiet("encode"):
             audio = self._frame_audio(H, self._pack(seq, ack, data))
         self.tx_frames += 1
         self._play(audio, f"DATA seq={seq} ack={ack} {len(data)}B" if data
@@ -959,7 +1014,7 @@ class OfdmLink:
             return
         a, b = spans[0][0], spans[-1][1]
         cap = self._cap.get(i0, i1)
-        with _quiet():
+        with _quiet("decode"):
             dem = H_dem(H, c, self._rx_bat, self._rx_band)
             stats, chunks = dem.decode_samples(cap)
         fr = self._frame_from(chunks)
@@ -987,7 +1042,7 @@ class OfdmLink:
         """Responder only: an undecodable window may be the initiator re-asking for GO."""
         if self.role != "responder" or not self.sm:
             return
-        with _quiet():
+        with _quiet("decode"):
             got = H.try_decode_msg(cap, self.cfg.fs, rates=(self.cfg.fs,), band=self._band)
         if got and got[1] in (H.MSG_RETRY, H.MSG_BAT_ACK):
             self.log("initiator missed GO -- resending in the next window")
@@ -1039,7 +1094,7 @@ class OfdmLink:
             self.feed(bytes(data))
             return True
         if self.cfg.mode in ("full", "arq"):
-            if self.role != self.cfg.sender and self.cfg.mode == "arq":
+            if self.cfg.sender not in (self.role, "both") and self.cfg.mode == "arq":
                 raise RuntimeError(f"mode arq: this end ({self.role}) only listens")
             return self._send_full(bytes(data))
         if self.cfg.mode != "half":
@@ -1086,7 +1141,7 @@ class OfdmLink:
                 pad = int(os.environ.get("OFDM_TRAILER", "0"))       # experiment: padding chunks past the CRC, never delivered
                 if pad:
                     body += b"\0" * (pad * c.chunk_bytes)
-                with _quiet():
+                with _quiet("encode"):
                     audio = self._frame_audio(H, body)
                 self.tx_frames += 1
                 self._play(audio, f"STREAM {len(data)}B", ident=True)
@@ -1094,7 +1149,7 @@ class OfdmLink:
             for i in range(0, len(data), self.capacity):
                 piece = data[i:i + self.capacity]
                 seq, self._tx_seq = self._tx_seq, (self._tx_seq + 1) & 0xFF
-                with _quiet():
+                with _quiet("encode"):
                     audio = self._frame_audio(H, self._pack(seq, 0, piece))
                 self.tx_frames += 1
                 self._play(audio, f"DATA seq={seq} {len(piece)}B", ident=True)
@@ -1133,7 +1188,7 @@ class OfdmLink:
         c = self.cfg
         base = max(i0, self._cap._start)
         dem = H_dem(H, c, self._rx_bat, self._rx_band)
-        with _quiet():
+        with _quiet("decode"):
             stats, chunks = dem.decode_samples(self._rx_get(i0, i1))
             if raw_retry and self._filt and (sorted(chunks) != list(range(len(chunks))) or not chunks):
                 # the filter's ringing can cost the first frame; clean audio decodes unfiltered
@@ -1259,7 +1314,7 @@ class OfdmLink:
         band = self._tx_band if band is None else band
         body = len(piece).to_bytes(BCAST_HDR, "big") + piece
         body += b"\0" * (c.chunk_bytes - len(body))
-        with _quiet():
+        with _quiet("encode"):
             audio = self._bcast_cmod_encode(H, body, seq, bat, band, gap)
             if audio is None:
                 audio = H.make_data_audio(c.fs, body, bat, band, c.chunk_bytes, seq0=seq, gap=gap)
@@ -1642,7 +1697,7 @@ class OfdmLink:
                    f"[{' '.join(sc.describe(step + k) for k in range(n))}] "
                    f"{'/'.join(str(int((b > 0).sum())) for b in bat)} carriers")
         with self._txlock:
-            with _quiet():
+            with _quiet("encode"):
                 audio = self._frame_audio(H, self._pack(seq, ack, data), bat)
             self.tx_frames += 1
             self._play(audio, (f"DATA seq={seq} ack={ack} {len(data)}B" if data
@@ -1669,7 +1724,7 @@ class OfdmLink:
         body = body + b"\0" * (c.chunk_bytes - len(body))
         bat = self._tx_bat if bat is None else bat
         band = self._tx_band if band is None else band
-        with _quiet():
+        with _quiet("encode"):
             audio = H.make_data_audio(c.fs, body, bat, band, c.chunk_bytes, seq0=cseq, gap=False)
             return H.scale_hs_tx(audio, c.amplitude, c.fs, is_probe=False, band=band)[0]
 
@@ -1896,7 +1951,7 @@ class OfdmLink:
                 x = self._rx_get(pos - pad, pos + L + pad)
                 if x is None or len(x) < L + pad:
                     continue
-                with _quiet():
+                with _quiet("decode"):
                     start, _score = dem._sc_match(x, pad)
                     fr = dem._decode_frame(x, start)
                 if fr is None or fr.get("seq") != cs or "_chunk" not in fr:
@@ -2108,6 +2163,14 @@ class OfdmLink:
                     self._ev("retry", now, now, f"attempt {attempt}")
                     if self.on_retry:
                         self.on_retry(attempt)
+                if c.sender == "both":
+                    # both ends may send DATA on this link: listen before talking, and back a resend off by a random
+                    # fraction of a frame gap so two ends that collided do not collide again on the same timer
+                    if attempt:
+                        self._stop.wait(random.uniform(0.0, 2.0 * c.gap_s + 1.0))
+                    end = time.monotonic() + 30.0
+                    while self._air_busy(c.hang_s) and time.monotonic() < end and not self._stop.is_set():
+                        self._stop.wait(0.1)
                 with self._lock:
                     nxt = self._rx_next
                 self._tx_frame_full(seq, nxt, piece, step)
@@ -2217,7 +2280,7 @@ class OfdmLink:
         cfg = H.hs_data_cfg(c.fs, self._tx_band, cb)
         parts = []
         with self._txlock:
-            with _quiet():
+            with _quiet("encode"):
                 for i, k in enumerate(todo):
                     body = win[k * cb:(k + 1) * cb].ljust(cb, b"\0")
                     if sc is not None:
@@ -2308,7 +2371,7 @@ class OfdmLink:
             else:
                 y0 = max(0, at - lead)
                 y = x[y0:at + air + lead]
-            with _quiet():
+            with _quiet("decode"):
                 st, ch = self._rsv_dem(step).decode_samples(y)
             if k in ch:
                 if not got and unpack_frame(ch[k]) is not None and ch[k][HDR:HDR + 4] in (RSV_MAGIC, STA_MAGIC):

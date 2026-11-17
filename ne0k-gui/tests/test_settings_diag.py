@@ -60,6 +60,49 @@ def test_diag_log_wav_and_bundle(tmp_path):
         assert w.getnframes() >= 24000                        # the loop returned what we played
 
 
+def test_event_db_holds_log_lines_and_link_events_on_the_rx_wav_timeline(tmp_path):
+    # 2026-11-17: long on-air runs (OFDM p2p laptops) need TX/RX WAVs plus an event log that can be queried
+    import sqlite3
+    import time
+    from modemgui.audio import Registry
+    from modemgui.engine import Session
+    from modemgui.engine.events import LinkEvent, ProbeReport
+    cfg = DiagConfig(wav_rx=True, wav_tx=True, event_db=True, out_dir=str(tmp_path))
+    d = Diagnostics(cfg, header={"modemgui": "test"})
+    d.log("logged before audio opened")
+    s = Session(Registry(), 48000, 1024)
+    s.open("loop:edb", "loop:edb")
+    d.attach(s)
+    time.sleep(0.5)
+    d.attach(s)                 # any SET re-applies the diag settings: the open recordings must carry on
+    s.play(np.sin(np.arange(24000) * 0.2).astype(np.float32) * 0.5)
+    t = time.monotonic()
+    s._emit(LinkEvent("tx", 1, 2, t, t + 0.5, "DATA seq=0 28B"))
+    s._emit(ProbeReport("measured", 2, 1, np.array([500.0, 600.0]), np.array([12.5, np.nan]),
+                        np.array([2, -1]), "active=1"))
+    s.pipe.wait_tx(5)
+    time.sleep(0.5)
+    d.log("after the burst")
+    d.detach(); s.close(); d.close()
+    dbs = [p for p in d.dir.iterdir() if p.suffix == ".sqlite"]
+    assert len(dbs) == 1 and len([p for p in d.dir.iterdir() if p.name.startswith("rx_")]) == 1
+    db = dbs[0]
+    con = sqlite3.connect(str(db))
+    meta = dict(con.execute("select key, value from meta"))
+    assert meta["rate"] == "48000" and meta["modemgui"] == "test"
+    lines = [r[0] for r in con.execute("select line from log order by id")]
+    assert any("logged before audio opened" in l for l in lines) and any("after the burst" in l for l in lines)
+    kind, node, peer, detail, rx_index = con.execute(
+        "select kind, node, peer, detail, rx_index from events where type='LinkEvent'").fetchone()
+    assert (kind, node, peer, detail) == ("tx", 1, 2, "DATA seq=0 28B")
+    # the row's place in the rx WAV: about 0.5 s in (it was emitted ~0.5 s after recording started)
+    pos = (rx_index - int(meta["wav_rx_start"])) / 48000
+    assert 0.2 < pos < 1.5
+    data = con.execute("select data from events where type='ProbeReport'").fetchone()[0]
+    assert '"snr_db": [12.5, null]' in data
+    assert con.execute("select count(*) from events where type in ('Levels', 'Spectrum')").fetchone()[0] == 0
+
+
 def test_ui_settings_survive_restart_and_tab_switch(tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6")
@@ -179,7 +222,7 @@ def test_menus_follow_the_sheet(tmp_path):
         "&Open Settings...", "&Save Settings...", "E&xit"]
     assert [a.text() for a in menu("&Settings").actions()] == [
         "&Output Device Settings...", "&Modem Mode Settings...", "&CSS Modem Settings...", "O&FDM Modem Settings...",
-        "&Ident Settings...", "&Debug && Logging..."]
+        "&Ident Settings...", "&Ports (serial, UDP, broadcast)...", "&Remote Control (TCP/IP)...", "&Debug && Logging..."]
     w.close()
 
 
@@ -188,7 +231,7 @@ def test_dialog_has_the_six_pages_and_opens_on_the_requested_one(tmp_path):
     w = _window(tmp_path)
     dlg = SettingsDialog(w.app, w, "diag", io=w.io)
     assert [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())] == [
-        "Output Device", "Modem Mode", "CSS Modem", "OFDM Modem", "Ident", "Debug && Logging"]
+        "Output Device", "Modem Mode", "CSS Modem", "OFDM Modem", "Ident", "Ports", "Remote Control", "Debug && Logging"]
     assert dlg.tabs.tabText(dlg.tabs.currentIndex()) == "Debug && Logging"
     assert {"wav_rx", "wav_tx", "detail", "log_serial"} <= set(dlg.pages["diag"].w)
     assert "link_path" in dlg.pages["serial"].w            # serial lives on the Debug & Logging page

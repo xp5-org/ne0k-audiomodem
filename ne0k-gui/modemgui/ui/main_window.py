@@ -2,6 +2,7 @@
 # Copyright (c) 2026 XP5-ORG
 from __future__ import annotations
 
+import collections
 import dataclasses
 import json
 import os
@@ -24,6 +25,7 @@ from ..engine.mesh_node import MeshConfig, MeshNode
 from .appsettings import AppSettings
 from .bridge import EngineBridge
 from .control_column import ControlColumn
+from . import context_help
 from .inspector import Inspector, name_widgets
 from .io_panel import IoPanel
 from .lockbar import LockBar
@@ -139,6 +141,8 @@ class MainWindow(QMainWindow):
         self.io.power_clicked.connect(self._toggle_power)
         self.bridge.status.connect(self.io.on_status)
         self.bridge.levels.connect(self.io.on_levels)
+        self.level_hist: collections.deque = collections.deque(maxlen=200)     # ~10 s of Levels, for INFO / the control port
+        self.bridge.levels.connect(lambda lv: self.level_hist.append((time.monotonic(), lv)))
         self.bridge.levels.connect(self.strip.on_levels)
         self.bridge.spectrum.connect(self.spectro.on_spectrum)
         self.bridge.status.connect(lambda st: st.state == "closed" and self.spectro.clear())
@@ -156,13 +160,19 @@ class MainWindow(QMainWindow):
         self.bridge.link.connect(self.feed.on_link)
         self.bridge.status.connect(self._on_status)
         self.io.message.connect(self.statusBar().showMessage)
-        self.statusBar().addPermanentWidget(self._backend_label())
+        self.libs_lbl = self._backend_label()
+        self.statusBar().addPermanentWidget(self.libs_lbl)
+        self.statusBar().setObjectName("statusbar")
 
         self._build_menus(dock)
         name_widgets(self)
         self.inspector = Inspector(self)
         self.inspect_action.setShortcut("Ctrl+Shift+I")
-        self.inspect_action.toggled.connect(self.inspector.toggle)
+        self.help_action.setShortcut("Ctrl+Shift+H")
+        self.inspect_action.triggered.connect(lambda on: self.inspector.toggle(on, Inspector.NAMES))
+        self.help_action.triggered.connect(lambda on: self.inspector.toggle(on, Inspector.HELP))
+        self.inspector.mode_changed = self._inspect_mode_changed
+        context_help.install()                          # right-click anything for its help
         self.feed.set_link(None)
         self._apply_view_settings()
         self._show_mode()
@@ -334,6 +344,8 @@ class MainWindow(QMainWindow):
         self.settings_actions = {}
         for key, text in (("output", "&Output Device Settings..."), ("mode", "&Modem Mode Settings..."), ("css", "&CSS Modem Settings..."),
                           ("ofdm", "O&FDM Modem Settings..."), ("ham", "&Ident Settings..."),
+                          ("ports", "&Ports (serial, UDP, broadcast)..."),
+                          ("remote", "&Remote Control (TCP/IP)..."),
                           ("diag", "&Debug && Logging...")):
             self.settings_actions[key] = m.addAction(text, lambda k=key: self._open_settings(k))
 
@@ -366,6 +378,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         self.inspect_action = m.addAction("&Inspect UI names")
         self.inspect_action.setCheckable(True)
+        self.help_action = m.addAction("Setting &help (click a setting)")
+        self.help_action.setCheckable(True)
 
         m = mb.addMenu("&Help")
         m.addAction("&C library inventory", self._show_inventory)
@@ -373,10 +387,14 @@ class MainWindow(QMainWindow):
         m.addAction("Save &diagnostic bundle...", self._save_bundle)
         m.addAction(f"&About {APP_NAME}", self._about)
 
+    def _inspect_mode_changed(self, mode) -> None:
+        self.inspect_action.setChecked(mode == Inspector.NAMES)
+        self.help_action.setChecked(mode == Inspector.HELP)
+
     # -- settings ----------------------------------------------------------
 
     def _open_settings(self, page: str | None = None) -> None:
-        if self.modem_on and page not in ("ham", "diag"):
+        if self.modem_on and page not in ("ham", "diag", "remote"):
             self.statusBar().showMessage("Stop the modem to change its settings (power it off and on again).")
             return
         dlg = SettingsDialog(self.app, self, page if isinstance(page, str) else None, io=self.io)
@@ -388,7 +406,35 @@ class MainWindow(QMainWindow):
 
     def _after_settings(self) -> None:
         self._apply_diag()
+        self._apply_remote()
         self._show_mode()
+
+    def _apply_remote(self) -> str | None:
+        """Start, restart or stop the TCP control port to match Settings > Remote Control.
+        Returns an error text when the port cannot be opened."""
+        r = self.app.remote
+        want = (r.bind, r.port) if r.enabled else None
+        cur = getattr(self, "control", None)
+        if cur is not None and want == getattr(self, "_control_at", None):
+            return None
+        if cur is not None:
+            cur.stop(); self.control = None; self._control_at = None
+        if want is None:
+            return None
+        from ..engine.control import ControlServer
+        from .control_host import GuiHost
+        if getattr(self, "_control_host", None) is None:
+            self._control_host = GuiHost(self)
+        srv = ControlServer(self._control_host, r.port, r.bind,
+                            log=lambda m: (self.diag.log("control: " + m), _echo("control: " + m)))
+        try:
+            srv.start()
+        except OSError as e:
+            msg = f"remote control port {r.bind}:{r.port}: {e}"
+            self.statusBar().showMessage(msg)
+            return msg
+        self.control, self._control_at = srv, want
+        return None
 
     # -- modem power -----------------------------------------------------------
 
@@ -466,6 +512,7 @@ class MainWindow(QMainWindow):
 
     def _apply_view_settings(self) -> None:
         self.feed.detailed = self.app.diag.detail == "detailed"
+        self.session.tx_channels = self.app.output.tx_channels      # used when audio is next opened
         # numeric mode: only the 0-15 node ids identify stations, nothing is announced
         self.session.ident.cfg = dataclasses.replace(
             self.app.ham, enabled=self.app.ham.enabled and self.app.ham.ident_mode == "ham")
@@ -669,6 +716,7 @@ class MainWindow(QMainWindow):
     def _restart_link(self) -> None:
         self.session.ignore_busy = bool(self.app.general.ignore_busy)   # read by every pre-TX silence check
         self.session.keyup_tone = self.app.ofdm.channel != "line"       # read by ofdm_link.keyup() on every burst
+        self._apply_sense()
         if self.link:
             self.link.stop(); self.link = None
             self.feed.set_link(None)
@@ -686,6 +734,25 @@ class MainWindow(QMainWindow):
         self.diag.log(f"mesh node {link.me} started ({self.app.general.modem})")
         self._listen_rx_host(link)
         self._schedule_blockout(link)
+
+    def _apply_sense(self) -> None:
+        """general.carrier_detect -> the session: every capture made from here on finds bursts, and judges the
+        channel busy, by recognising the modem's own signals (engine/cca.py) instead of by level."""
+        from ..engine import cca
+        from ..engine.ident import KEYUP_TONE_HZ
+        g, ham = self.app.general, self.app.ham
+        self.session.sense_mode = g.carrier_detect
+        tones = ([KEYUP_TONE_HZ] if self.session.keyup_tone and g.modem != "css" else []) + \
+                ([ham.cw_tone_hz] if ham.enabled and ham.ident_mode == "ham" and ham.id_mode in ("cw", "both") else [])
+        try:
+            self.session.sense_spec = cca.spec_from_config(
+                self.app.ofdm if g.modem != "css" else None, self.app.css if g.modem != "ofdm_only" else None,
+                tones=tuple(tones), ofdm_thr=g.sense_ofdm_thr, chirp_thr=g.sense_chirp_thr)
+        except Exception as e:                       # never keep the link from starting
+            self.session.sense_mode, self.session.sense_spec = "level", None
+            self.diag.log(f"carrier detect: falling back to level ({type(e).__name__}: {e})")
+        if g.carrier_detect == "signal":
+            self.diag.log(f"carrier detect: signal {self.session.sense_spec}")
 
     def _listen_rx_host(self, mesh: MeshNode) -> None:
         """ofdm_only, outside a blockout window: there is no broadcast to trigger a responder link
@@ -839,6 +906,8 @@ class MainWindow(QMainWindow):
         return QLabel(text)
 
     def closeEvent(self, ev) -> None:
+        if getattr(self, "control", None) is not None:
+            self.control.stop(); self.control = None
         if self.serial:
             self._stop_serial()
         if self.link:

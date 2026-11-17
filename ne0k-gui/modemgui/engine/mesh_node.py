@@ -285,8 +285,8 @@ class MeshNode:
                     except Exception as e:
                         self.log(f"duplex link to {dst}: {type(e).__name__}: {e}")
                 continue
-            if not self.mesh.auto_link or self.announce is not None:
-                continue
+            if not self.mesh.auto_link or self.announce is not None or self.mesh.phy_mode == "css_only":
+                continue                          # css_only has no OFDM link to keep (no CSS->OFDM promotion yet)
             dst = self.ring_dst_fn()
             if not dst:
                 continue
@@ -557,16 +557,31 @@ class MeshNode:
                 self.csma.awaiting -= 1
 
     def _wait_ack_inner(self, peer: int, seq: int) -> bool:
-        end = time.monotonic() + self._ack_wait(peer)
+        wait = self._ack_wait(peer)
+        end = time.monotonic() + wait
+        hard = end + wait          # the deadline stretches while a burst is in (see below), at most this far
         while not self._stop.is_set():
             if (peer, seq) in self._acks:
                 self._acks.discard((peer, seq))
                 return True
             self._ack_evt.clear()
-            if time.monotonic() >= end:
-                return False
-            self._ack_evt.wait(min(0.5, end - time.monotonic()))
+            now = time.monotonic()
+            if now >= end:
+                # A burst still being received or decoded may be the ACK.  At 0.5 s symbols the long-symbol
+                # decoder needs ~10 s after a 43 s ACK ends (2026-11-17 laptops: the wait expired 1 s before
+                # the ACK decoded, and a 191 s DATA went out again for nothing).
+                if now < hard and self._css_rx_busy():
+                    end = now + 0.5
+                else:
+                    return False
+            self._ack_evt.wait(max(0.05, min(0.5, end - time.monotonic())))
         return False
+
+    def _css_rx_busy(self) -> bool:
+        try:
+            return bool(self.css.channel_busy())
+        except Exception:
+            return False
 
     def _next_seq(self) -> int:
         with self._lock:
@@ -818,8 +833,12 @@ class MeshNode:
 
     def _new_link(self, peer: int, requester: bool) -> OfdmLink:
         role = "initiator" if requester else "responder"
+        # arq links are connected-mode: whichever end handshook, both send DATA on the one link once it is up
+        # (_send_ofdm), so a pair never needs a second link -- two links to one peer take each other's
+        # handshake messages (2026-11-17 laptops)
         cfg = dataclasses.replace(self.ofdm_cfg, node_id=self.me, peer_id=peer, role=role,
-                                  mode="full" if self.duplex else "arq", sender="initiator",
+                                  mode="full" if self.duplex else "arq",
+                                  sender="initiator" if self.duplex else "both",
                                   ack_wait_s=max(self.ofdm_cfg.ack_wait_s, MESH_ACK_WAIT_S))
         lk = OfdmLink(self.session, cfg, log=lambda m, p=peer: self.log(f"ofdm[{p}] {m}"))
         lk.shared_rx = self.rx is not None                     # ofdm_only: data frames come from self.rx, decoded once
@@ -828,8 +847,8 @@ class MeshNode:
             return lk
         if self.announce:                                      # a link coming up ends the current BAT turn, once
             lk.on_state = lambda st, an=self.announce: an.note_own_go() if st == "up" else None
+        lk.on_data = lambda d, p=peer: self._ofdm_rx(p, d)     # either end may receive data on it
         if not requester:
-            lk.on_data = lambda d, p=peer: self._ofdm_rx(p, d)
             lk.rx_gate = lambda p=peer: (self.announce.responder_may_listen(p) if self.announce
                                          else (self.air is None or self.air.open(self.me, p)))
         return lk
@@ -1166,7 +1185,10 @@ class MeshNode:
     def _open_tx_link(self, dst: int):
         """The up tx link to ``dst``, handshaking it first if needed (None on failure).  Called from a send and
         from this node's BAT turn; the gate is passed BEFORE the lock so a send waiting for its turn cannot
-        block the announce thread that opens that turn."""
+        block the announce thread that opens that turn.  css_only never opens one: an OFDM_HS_REQ on the air
+        there is the unbuilt CSS->OFDM promotion leaking into plain CSS."""
+        if self.mesh.phy_mode == "css_only":
+            return None
         key = (dst, "tx")
         with self._lock:
             lk = self.links.get(key)
@@ -1209,14 +1231,53 @@ class MeshNode:
                 self.announce.note_own_go()
             return lk
 
+    def _up_link(self, dst: int):
+        """The up arq link to ``dst``, whichever end opened it (our tx link first), or None."""
+        with self._lock:
+            for key in ((dst, "tx"), (dst, "rx")):
+                lk = self.links.get(key)
+                if lk is not None and lk.up and lk.cfg.sender == "both":
+                    return key, lk
+        return None
+
+    def _await_rx_link(self, dst: int):
+        """ofdm_only with auto_link, and ``dst`` is the pair's initiator: its keeper trains the link, so wait for that
+        instead of handshaking a second one (both ends initiating at once deadlocks: each takes the other's probe
+        for its reply).  A failed responder is replaced at once."""
+        end = time.monotonic() + self.ofdm_cfg.hs_timeout_s
+        key = (dst, "rx")
+        while time.monotonic() < end and not self._stop.is_set():
+            got = self._up_link(dst)
+            if got is not None:
+                return got
+            with self._lock:
+                lk = self.links.get(key)
+                stale = lk if lk is not None and lk.state in ("failed", "closed") else None
+                if stale is not None:
+                    self.links.pop(key, None)
+            if stale is not None:
+                stale.stop()
+            self._ensure_rx_link(dst)
+            self._stop.wait(0.5)
+        self.log(f"ofdm send: the link from {dst} did not come up within {self.ofdm_cfg.hs_timeout_s:.0f}s")
+        return None
+
     def _send_ofdm(self, dst: int, payload: bytes) -> bool:
-        key = (dst, "tx")
         if self.announce and not self.announce.wait_data_window(self.mesh.announce_cycle_s + 120.0):
             self.log("ofdm send: no data window (round / BAT turns still running)")
             return False
-        lk = self._open_tx_link(dst)
-        if lk is None:
-            return False
+        got = self._up_link(dst)
+        if got is None and (self.mesh.phy_mode == "ofdm_only" and self.mesh.auto_link and self.announce is None
+                            and not self._is_initiator(dst)):
+            got = self._await_rx_link(dst)
+            if got is None:
+                return False
+        if got is None:
+            lk = self._open_tx_link(dst)
+            if lk is None:
+                return False
+            got = ((dst, "tx"), lk)
+        key, lk = got
         try:
             ok = lk.send(payload)
         except Exception as e:
@@ -1225,7 +1286,8 @@ class MeshNode:
         if not ok:
             lk.stop()
             with self._lock:
-                self.links.pop(key, None)
+                if self.links.get(key) is lk:
+                    self.links.pop(key, None)
         return ok
 
     def _send_css(self, dst: int, payload: bytes) -> bool:

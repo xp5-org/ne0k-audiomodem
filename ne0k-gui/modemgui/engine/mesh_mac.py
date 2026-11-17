@@ -101,6 +101,14 @@ class Csma:
     def pending(self, prefix: str = "") -> bool:
         return any(t.startswith(prefix) for _, t, _ in self.outbox)
 
+    def state(self, now: float) -> str:
+        """Outbox and countdown, for INFO: why a queued packet has not keyed up yet."""
+        q = ", ".join(f"{t}@{max(0.0, ra - now):.1f}s" for _, t, ra in self.outbox) or "empty"
+        idle = "-" if self._idle_since is None else f"{now - self._idle_since:.1f}s"
+        bo = "-" if self._backoff is None else f"{self._backoff:.1f}s"
+        return (f"outbox=[{q}] backoff_left={bo} idle_for={idle} cw={self.cw} awaiting={self.awaiting} "
+                f"tail_left={max(0.0, self._tail_until - now):.1f}s")
+
     def _draw(self) -> float:
         return self.rng.randrange(self.cw) * self.slot_s + (self.id % STAGGER_MOD) * self.id_slot_s
 

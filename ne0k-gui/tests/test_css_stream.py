@@ -299,3 +299,73 @@ def test_short_frames_off_keeps_one_decoder_and_full_size_acks(css):
     _link_feed(link, _g711(np.concatenate([np.zeros(630, np.float32), cl.encode_ack(c, 2, 2),
                                            np.zeros(2 * FS, np.float32)])))
     assert _decoded(sess) == [(3, "ACK", 2, b"")], logs
+
+
+# -- staged receive: the streaming decoders run only on what the chirp detector marks (carrier_detect = signal) ------
+
+class _Tap:
+    def __init__(self, x, link):
+        self.x, self.i, self.link = np.asarray(x, np.float32), 0, link
+
+    def get(self, timeout=0.0):
+        from modemgui.audio.pipe import Block
+        if self.i >= len(self.x):
+            self.link._stop.set()
+            return None
+        s = self.x[self.i:self.i + BLK]
+        b = Block(s, self.i, False, float(np.abs(s).max()), 0)
+        self.i += BLK
+        return b
+
+
+def _staged(css, x, mode):
+    import types
+    from modemgui.engine import cca
+    cl, _, _ = css
+    c = _cfg(2, crc_bytes=2)
+    out, logs = [], []
+    ses = types.SimpleNamespace(
+        pipe=types.SimpleNamespace(tx_onset_hooks=[]), _emit=out.append, _emit_raw_error=logs.append,
+        ident=types.SimpleNamespace(note_heard=lambda *a, **k: False),
+        sense_mode=mode, sense_spec=cca.spec_from_config(None, c))
+    link = cl.CssLink(ses, c, log=logs.append)
+    link._ensure_backend()
+    link._start_stream(ses.pipe)
+    link._rx(_Tap(x, link))
+    pk = [e for e in out if type(e).__name__ == "Decoded"]
+    return link, pk, logs
+
+
+def _room(css, snr_db=10.0, lead_s=25.0, tail_s=12.0):
+    """A DATA frame from node 3 in room noise at -45 dBFS: above the -55 dBFS carrier threshold all the time."""
+    cl, _, _ = css
+    sig = np.asarray(cl.encode_bytes(_cfg(3, crc_bytes=2), b"hi", 1, 2), np.float64)
+    r = np.random.default_rng(11)
+    n0, n1 = int(lead_s * FS), int(tail_s * FS)
+    nz = r.standard_normal(n0 + len(sig) + n1) * 10 ** (-45 / 20)
+    nz[n0:n0 + len(sig)] += sig / np.sqrt(np.mean(sig ** 2)) * 10 ** ((-45 + snr_db) / 20)
+    return nz.astype(np.float32)
+
+
+def test_staged_receive_decodes_the_frame_and_skips_the_noise(css):
+    cl, _, _ = css
+    if not __import__("css_pll_c").load(False).has_skip:
+        pytest.skip("libcsspll built before css_pll_skip")
+    x = _room(css)
+    link, pk, logs = _staged(css, x, "signal")
+    assert [(d.src, d.type_name, d.text) for d in pk] == [(3, "DATA", "hi")], logs[-12:]
+    st = link.stream
+    idle = st.skipped + link._skip_n                      # the tail's skip is applied when the gate next opens
+    assert idle + st.fed <= len(x) and idle > 0.45 * len(x), (idle, st.fed, len(x))   # the frame is 36 % of it
+    assert st.trk.abs == st.fed + st.skipped              # one timebase: nothing lost between skip and feed
+    # 2026-11-17 on the laptops: the gate closed right after the frame, the unfed tracker kept reporting busy and
+    # the node never sent its ACK (or anything else).  Once the gate is closed, carrier sense is the detector's.
+    assert link._gated and not link._in_burst
+    link._last_busy = -1e9
+    assert not link.channel_busy()
+
+
+def test_level_sense_still_feeds_every_sample(css):
+    x = _room(css, lead_s=6.0, tail_s=6.0)
+    link, pk, logs = _staged(css, x, "level")
+    assert link.stream.skipped == 0 and link.stream.fed == len(x)

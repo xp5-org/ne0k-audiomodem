@@ -12,12 +12,14 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
                                QPushButton, QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from ..engine.modemcfg import OFDM_PRESETS, PRESETS, CssConfig, describe
-from .appsettings import AppSettings
+from .appsettings import SECTIONS, AppSettings
+
+SECTION_OF = {c: k for k, c in SECTIONS.items()}      # config class -> its inspector / help prefix
 
 # Settings-menu pages -> the config sections each one edits.
 TABS = (("output", "Output Device"), ("mode", "Modem Mode"), ("css", "CSS Modem"), ("ofdm", "OFDM Modem"),
-        ("ham", "Ident"), ("diag", "Debug && Logging"))
-SECTIONS_OF = {"diag": ("diag", "serial", "udp", "cssbcast"), "mode": ("general",)}
+        ("ham", "Ident"), ("ports", "Ports"), ("remote", "Remote Control"), ("diag", "Debug && Logging"))
+SECTIONS_OF = {"ports": ("serial", "udp", "cssbcast"), "mode": ("general",)}
 KEEP_ON_PRESET = ("node_id", "peer_id", "role", "mode", "sender", "hear_own", "backend", "fs")
 
 
@@ -88,10 +90,13 @@ class _Page(QWidget):
                 box = QGroupBox(d["group"]); form = QFormLayout(box); col.addWidget(box)
                 forms[d["group"]] = form
             w = _make(d)
+            key = f"{SECTION_OF[cls]}.{d['name']}"
+            w.setObjectName(d["name"]); w.setProperty("helpKey", key)
             if d.get("tip"):
                 w.setToolTip(d["tip"])
             self.w[d["name"]] = w
             label = QLabel(d["label"]); label.setToolTip(d.get("tip") or "")
+            label.setObjectName(d["name"] + "_label"); label.setProperty("helpKey", key)
             if d["name"] == "out_dir":
                 b = QPushButton("Browse..."); row = QHBoxLayout()
                 row.addWidget(w, 1); row.addWidget(b)

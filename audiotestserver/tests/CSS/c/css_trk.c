@@ -599,6 +599,15 @@ int css_trk_push(css_trk *t, const float *x, int n)
     return ran;
 }
 
+void css_trk_skip(css_trk *t, long n)
+{
+    if (n <= 0) return;
+    t->abs_end += n;
+    t->win_n = 0; t->pend = 0;
+    t->nsh = 0; t->shh = 0;
+    t->busy_ref = 0; t->below_since = -1;
+}
+
 int css_trk_tx(css_trk *t, long abs_first, int nsym, const unsigned char *dirs)
 {
     int k;

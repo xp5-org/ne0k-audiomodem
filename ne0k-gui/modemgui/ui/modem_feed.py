@@ -45,9 +45,9 @@ class ModemFeed(QObject):
 
     def on_link(self, ev: LinkEvent) -> None:
         if ev.kind == "lock":
-            self.lockbar.locked()                  # on_decoded() refines it with timing
-        elif ev.kind == "rx":
-            self.lockbar.locked()                  # every decoded frame (each bcast chunk) proves the lock still holds
+            self.lockbar.locked(why=f"lock: {ev.detail}")   # on_decoded() refines it with timing
+        elif ev.kind == "rx" and ev.peer >= 0:    # peer -1 = a CW ident guess on any burst, noise included
+            self.lockbar.locked(why=f"rx: {ev.detail}")   # every decoded frame (each bcast chunk) proves the lock still holds
         elif ev.kind == "err" and ev.detail == "bcast carrier lost":
             self.lockbar.unlocked()
 
@@ -58,14 +58,14 @@ class ModemFeed(QObject):
         if l.state == "handshake" and self._t_hs is None:
             self._t_hs = time.monotonic()
         elif l.state == "up" and self._t_hs is not None:
-            self.lockbar.locked(time.monotonic() - self._t_hs)   # handshake -> link up
+            self.lockbar.locked(time.monotonic() - self._t_hs, why="handshake up")   # handshake -> link up
             self._t_hs = None
         elif l.state not in ("handshake", "up"):
             self._t_hs = None
 
     def on_decoded(self, d: Decoded) -> None:
         self.count += 1
-        self.lockbar.locked(d.acq_s, d.sync_score)
+        self.lockbar.locked(d.acq_s, d.sync_score, why=f"decoded {d.type_name} from {d.src}")
         print(f"css rx: {d.text!r} ok={d.ok} snr={d.snr_db:.1f}", flush=True)   # demo greps the log
         flag = "OK " if d.ok else "ERR"
         if not self.detailed:

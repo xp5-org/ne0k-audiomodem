@@ -30,6 +30,8 @@ from typing import Callable
 
 import numpy as np
 
+from . import cpustats
+
 
 class CssStreamRx:
     def __init__(self, cfg, info: dict, *, node_id: int, hear_own: bool,
@@ -62,6 +64,7 @@ class CssStreamRx:
         self.trk = None if not track else css_pll_c.TrkStream(ex["fs"], ex["dur"], ex["f_min"], ex["f_max"],
                                        ex["gap_samps"] / ex["sps"] if ex["sps"] else 0.0,
                                        on_chirp=self._on_chirp, on_event=self._on_trk_event)
+        self.busy_changes = 0                  # tracker carrier BUSY/idle transitions (INFO css.cs)
         self._pkt: list | None = None          # [bytearray, [frame dicts], last_seq]
         self._pkt_t: float | None = None
         self._sync_score = 0.0
@@ -69,13 +72,16 @@ class CssStreamRx:
         self.locked_peer = None
         self.counts = {"OWN": 0, "PEER": 0, "ECHO": 0, "UNKNOWN": 0}
         self._synced = False
+        self.skipped = 0                       # samples never decoded (staged receive)
+        self.fed = 0
         self.log(f"css rx: C streaming PLL decoder{' (short frames)' if quiet else ''} (workspace {self.pll.workspace_bytes / 1e6:.0f} MB) "
                  f"+ chirp tracker, sps={self.sps} sps_eff={self.sps_eff}")
 
     # -- feeding -------------------------------------------------------------
     def feed(self, samples: np.ndarray, tx_active: bool) -> None:
         x = np.asarray(samples, np.float32)
-        with self.lock:
+        self.fed += len(x)
+        with self.lock, cpustats.stage("pll"):
             if self.trk is not None:
                 self.trk.push(x)
             # The decoder hears the line continuously (its preamble score is
@@ -84,6 +90,22 @@ class CssStreamRx:
             # transmission is blanked, unless we are meant to hear it.
             live = self.hear_own or not tx_active
             self.pll.push(x if live else np.zeros_like(x))
+
+    @property
+    def can_skip(self) -> bool:
+        return bool(getattr(self.lib, "has_skip", False))
+
+    def skip(self, n: int) -> None:
+        """Staged receive: ``n`` samples were withheld (no chirp in them, says the detector).  Both timebases move
+        past them, so tracked grids, our own TX schedule and decoder peaks still line up."""
+        if n <= 0:
+            return
+        with self.lock:
+            self._finish()
+            if self.trk is not None:
+                self.trk.skip(n)
+            self.pll.skip(n)
+        self.skipped += n
 
     def tx_onset(self, rx_index: int, pcm: np.ndarray) -> None:
         """Our transmission ``pcm`` entered the sink at RX index rx_index: register its
@@ -125,7 +147,9 @@ class CssStreamRx:
             self._sync_score = e["x"]
             self._sync_mono = time.monotonic()
             now = time.monotonic()
-            self.emit_link("lock", -1, now, now, f"preamble sync score {e['x']:.2f}")
+            # "sync", not "lock": room noise acquires at ~0.5 and own-TX echoes lock grids; neither is a
+            # peer, so the lock bar waits for a decoded frame (2026-11-17 Mac showed LOCKED for minutes idle)
+            self.emit_link("sync", -1, now, now, f"preamble sync score {e['x']:.2f}")
             self.log(f"css rx: PLL sync acquired score={e['x']:.2f} lag={e['a']}")
         elif e["event"] == "RESYNC":
             self.log(f"css rx: decoder resync ({'hard' if e['a'] else 'soft'})")
@@ -197,7 +221,7 @@ class CssStreamRx:
         now = time.monotonic()
         if k == "LOCK":
             self.log(f"css pll: grid {e['a']} locked, {e['x']:+.0f} ppm vs our clock")
-            self.emit_link("lock", -1, now, now, f"grid {e['a']} locked {e['x']:+.0f} ppm")
+            self.emit_link("sync", -1, now, now, f"grid {e['a']} locked {e['x']:+.0f} ppm")
         elif k == "LOST":
             self.log(f"css pll: grid {e['a']} lost after {e['b']} chirps")
         elif k == "PHASE_STEP":
@@ -216,6 +240,9 @@ class CssStreamRx:
             self.log(f"css pll: grid {e['a']} is node {e['b']} ({e['x']:+.0f} ppm)")
         elif k == "NEW":
             self.log(f"css pll: new grid {e['a']}")
+        elif k == "BUSY":                         # carrier sense transitions (CssLink.channel_busy reads trk.busy)
+            self.busy_changes += 1
+            self.log(f"css pll: carrier {'BUSY' if e['a'] else 'idle'} (score {e['x']:.3f})")
 
 
 def chirp_dirs(pcm: np.ndarray, fs: int, f_min: float, f_max: float, dur: float,

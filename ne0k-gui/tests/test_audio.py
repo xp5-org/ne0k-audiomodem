@@ -157,6 +157,27 @@ def test_loop_roundtrip_preserves_samples_and_index_is_contiguous():
     assert np.allclose(rx[pos:pos + len(x)], x, atol=1e-6)
 
 
+def test_loop_bus_waits_out_a_stalled_writer_instead_of_splicing_silence():
+    # 2026-11-17: the macOS build VM's smoke selfloop decoded 'one cl' for 'one click' (and sometimes nothing):
+    # the sink thread stalled for a few hundred ms, the reader zero-padded, and the gap cut the burst in two.
+    import threading
+    from modemgui.audio.file_backend import _Bus
+    bus = _Bus(rate=48000)
+    x = np.arange(1, 4801, dtype=np.float32)
+    bus.put(x[:480])
+
+    def late():
+        time.sleep(0.4)
+        bus.put(x[480:])
+    threading.Thread(target=late, daemon=True).start()
+    got = np.concatenate([bus.get(480) for _ in range(10)])
+    assert np.array_equal(got, x)
+    # a writer that has stopped is not waited for
+    time.sleep(_Bus.WRITER_GONE_S + 0.1)
+    t = time.monotonic()
+    assert not bus.get(480).any() and time.monotonic() - t < 0.1
+
+
 # -- pipe behaviour ---------------------------------------------------------
 
 def test_slow_tap_drops_own_blocks_without_starving_others():

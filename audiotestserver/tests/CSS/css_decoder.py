@@ -2265,6 +2265,13 @@ def decode(cfg, stop_event=None):
     # search sees a burst's first chirp, and [silence, training] onset windows
     # then scored 0.45 against the Barker tail and false-locked.  0 = off.
     onset_guard_silence_syms = int(cfg.get("onset_guard_silence_syms", 2))
+    # The guard's "silent" is relative to the room: symbol rms under max(silence_thr, pre-sync floor +
+    # onset_rel_db).  2026-11-17 MacBook mic: floor -55..-44 dBFS over silence_thr 0.002 (-54 dBFS), so no
+    # symbol was ever silent, the guard never anchored, and the training run-in locked at ~0.5 3-4 s before
+    # the preamble -> FRAME_ERROR on most packets.  The floor follows the quietest pre-sync symbol down at
+    # once and rises onset_floor_rise_db per symbol.  0 = silence_thr only (the old behaviour).
+    onset_rel_db        = float(cfg.get("onset_rel_db", 6.0))
+    onset_floor_rise_db = float(cfg.get("onset_floor_rise_db", 0.2))
     # Phase-step recovery while synced.  A jitter buffer that inserts or
     # drops a packet's worth of audio mid-frame (measured on the SIP conference:
     # +1026 smp, 21.4 ms) moves every later chirp outside the +-post_acq_search
@@ -2532,6 +2539,8 @@ def decode(cfg, stop_event=None):
     _last_resync_sym = 0   # sym_count at the most recent resync (or 0 at start)
     _last_resync_soft = False  # True if last resync was a soft re-arm (preamble imminent)
     _quiet_run = 0         # consecutive symbols without signal (onset guard)
+    _onset_floor = None    # onset guard's room floor (symbol rms, pre-sync)
+    _quiet_rel_run = 0     # consecutive symbols under that floor + onset_rel_db
     _step_ref_snr = None   # running tracked-symbol snr (phase-step recovery)
     _step_cand = None      # (offset, wide conf, bit_stream index) awaiting confirmation
     _step_fix = None       # (bit_stream index, conf) to re-decide at the next append
@@ -3679,11 +3688,27 @@ def decode(cfg, stop_event=None):
                         "wpk_strong": int(bool(_wpk_strong)),
                         "signal_present": int(bool(signal_present)),
                         "whitened": int(_whiten_fir is not None)})
-                if (not sync_found and onset_guard_silence_syms > 0 and signal_present
-                        and _quiet_run >= onset_guard_silence_syms):
-                    _last_resync_sym = sym_count - 2     # css_pll_mark_onset(), ahead 0
-                    _last_resync_soft = False
+                _sym_rms = float(np.sqrt(np.mean(np.square(raw, dtype=SIG), dtype=np.float64)))
+                _othr = silence_thr
+                if onset_rel_db > 0.0 and _onset_floor is not None:
+                    _othr = max(_othr, _onset_floor * 10.0 ** (onset_rel_db / 20.0))
+                _onset_sig = _sym_rms > _othr
+                if not sync_found and onset_guard_silence_syms > 0:
+                    if signal_present and _quiet_run >= onset_guard_silence_syms:
+                        _last_resync_sym = sym_count - 2     # css_pll_mark_onset(), ahead 0
+                        _last_resync_soft = False
+                    elif _onset_sig and _quiet_rel_run >= onset_guard_silence_syms:
+                        # room-relative onset: soft, so a high-score or non-alternating (real preamble)
+                        # window stays eligible -- noise can pass floor+rel mid-burst at low SNR
+                        _last_resync_sym = sym_count - 2
+                        _last_resync_soft = True
                 _quiet_run = 0 if signal_present else _quiet_run + 1
+                _quiet_rel_run = 0 if _onset_sig else _quiet_rel_run + 1
+                if not sync_found:
+                    if _onset_floor is None or _sym_rms < _onset_floor:
+                        _onset_floor = _sym_rms
+                    else:
+                        _onset_floor *= 10.0 ** (onset_floor_rise_db / 20.0)
                 if not sync_found:
                     tim_flush_thr = int(cfg.get("syndet_flush_terr", sps // 2))
                     if abs(timing_err) <= tim_flush_thr:

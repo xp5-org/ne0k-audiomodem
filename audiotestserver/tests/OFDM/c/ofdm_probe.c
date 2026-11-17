@@ -313,6 +313,30 @@ static double coh_energy(ofdm_probe *p, const double *rx, int n, int start,
     return e;
 }
 
+/* 1 when the coherent mean over OFDM_COH_SCAN_SYMS symbols at `start` keeps over OFDM_TONE_FRAC of its energy
+ * in its OFDM_TONE_CARRIERS strongest carriers (a steady tone, see ofdm_probe.h); 0 otherwise or out of range.
+ * Uses p->mre/mim (via coh_energy) and p->pdb as scratch. */
+static int tonal_at(ofdm_probe *p, const double *rx, int n, int start)
+{
+    const ofdm_cfg *c = &p->c;
+    int    i, j, k = OFDM_TONE_CARRIERS < c->n_occupied ? OFDM_TONE_CARRIERS : c->n_occupied;
+    double tot = 0.0, top = 0.0;
+
+    if (coh_energy(p, rx, n, start, OFDM_COH_SCAN_SYMS) <= 0.0) return 0;
+    for (i = 0; i < c->n_occupied; i++) {
+        double a = p->mre[i] / OFDM_COH_SCAN_SYMS, b = p->mim[i] / OFDM_COH_SCAN_SYMS;
+        p->pdb[i] = a * a + b * b;
+        tot += p->pdb[i];
+    }
+    for (j = 0; j < k; j++) {                    /* k largest by selection: k is 8 */
+        int m = 0;
+        for (i = 1; i < c->n_occupied; i++) if (p->pdb[i] > p->pdb[m]) m = i;
+        top += p->pdb[m];
+        p->pdb[m] = -1.0;
+    }
+    return tot > 0.0 && top > OFDM_TONE_FRAC * tot;
+}
+
 /* Linear-interpolated percentile of a[0..n), destroying a.  Matches numpy's
  * default: sort, then interpolate between the two straddling ranks. */
 static double pctile(double *a, int n, double q)
@@ -634,11 +658,20 @@ int ofdm_probe_estimate(ofdm_probe *p, const double *rx, int n,
     rc = ofdm_acq_run(p->acq, rx, n, p->metric, p->metric_cap, &ai);
     if (rc != 0 || ai.n_cand < 1) { info->error = OFDM_PROBE_TOO_SHORT; return 1; }
     n_cand = ai.n_cand;
-    bc = 0;
-    peak = p->metric[0];
-    for (i = 1; i < n_cand; i++)
-        if (p->metric[i] > peak) { peak = p->metric[i]; bc = i; }
-    best = bc * p->acq_step;
+    /* skip tone-like winners (the keyup tone; OFDM_TONE_FRAC in ofdm_probe.h) */
+    for (cnt = 0; ; cnt++) {
+        long reach = (long)OFDM_COH_SCAN_SYMS * SYM;
+        bc = 0;
+        peak = p->metric[0];
+        for (i = 1; i < n_cand; i++)
+            if (p->metric[i] > peak) { peak = p->metric[i]; bc = i; }
+        best = bc * p->acq_step;
+        if (cnt >= OFDM_TONE_TRIES || peak < gate || !tonal_at(p, rx, n, best)) break;
+        for (i = 0; i < n_cand; i++) {
+            long d = (long)i * p->acq_step - best;
+            if (d >= -reach && d <= reach) p->metric[i] = 0.0;
+        }
+    }
     /* Noise floor = low percentile of candidate coherence, a DIAGNOSTIC only;
      * the absolute gate is the discriminator.  A relative peak/floor test is
      * wrong here: when the probe fills most of the capture, most candidates

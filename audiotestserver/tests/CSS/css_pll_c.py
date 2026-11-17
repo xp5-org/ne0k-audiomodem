@@ -109,6 +109,7 @@ class Cfg(ctypes.Structure):
         ("ring_lookahead", ctypes.c_int),
         ("presync_full_period", ctypes.c_int),
         ("onset_guard_silence_syms", ctypes.c_int),
+        ("onset_rel_db", ctypes.c_double), ("onset_floor_rise_db", ctypes.c_double),
         ("step_recover", ctypes.c_int),
         ("step_drop_db", ctypes.c_double), ("step_accept_db", ctypes.c_double),
         ("step_min_conf", ctypes.c_double),
@@ -202,6 +203,12 @@ def load(f64: bool = False):
     lib.css_pll_mark_onset.argtypes = [ctypes.c_void_p, ctypes.c_long]
     lib.css_pll_rearm.restype = None
     lib.css_pll_rearm.argtypes = [ctypes.c_void_p]
+    lib.has_skip = hasattr(lib, "css_pll_skip") and hasattr(lib, "css_trk_skip")   # a library built before staged RX
+    if lib.has_skip:
+        lib.css_pll_skip.restype = None
+        lib.css_pll_skip.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        lib.css_trk_skip.restype = None
+        lib.css_trk_skip.argtypes = [ctypes.c_void_p, ctypes.c_long]
     lib.css_pll_get_diag.restype = None
     lib.css_pll_get_diag.argtypes = [ctypes.c_void_p, ctypes.POINTER(Diag)]
     _LIBS[key] = lib
@@ -393,6 +400,8 @@ def build_cfg(cfg: dict, conf: dict) -> tuple[Cfg, dict]:
     c.ring_lookahead = min(_rl, max(gap_samps, buf_size - 1 - sps - _sr))
     c.presync_full_period = int(bool(cfg.get("presync_full_period", True)))
     c.onset_guard_silence_syms = int(cfg.get("onset_guard_silence_syms", 2))
+    c.onset_rel_db = float(cfg.get("onset_rel_db", 6.0))
+    c.onset_floor_rise_db = float(cfg.get("onset_floor_rise_db", 0.2))
     c.step_recover = int(bool(cfg.get("step_recover", True)))
     c.step_drop_db = float(cfg.get("step_drop_db", 10.0))
     c.step_accept_db = float(cfg.get("step_accept_db", 6.0))
@@ -480,6 +489,10 @@ class PllStream:
 
     def rearm(self) -> None:
         self.lib.css_pll_rearm(self._h)
+
+    def skip(self, n: int) -> None:
+        """``n`` samples were not pushed: advance the RX index past them (see css_pll_skip)."""
+        self.lib.css_pll_skip(self._h, int(n))
 
     def diag(self) -> dict:
         d = Diag()
@@ -765,6 +778,9 @@ class TrkStream:
         x = np.ascontiguousarray(x, dtype=np.float32)
         if len(x):
             self.lib.css_trk_push(self._h, x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(x))
+
+    def skip(self, n):
+        self.lib.css_trk_skip(self._h, int(n))
 
     def tx(self, abs_first, dirs):
         d = (ctypes.c_ubyte * max(1, len(dirs)))(*[1 if b else 0 for b in dirs])

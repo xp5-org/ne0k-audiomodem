@@ -37,19 +37,12 @@ def main(rx: str | None = None, tx: str | None = None, autosend: str | None = No
         except Exception as e:
             w.statusBar().showMessage(f"open failed: {e}")
     w.show()
-    ctl = None
-    if control_port is not None:         # TCP control/debug port, off unless asked for
-        from ..engine.control import ControlServer
-        from .control_host import GuiHost
-        from .main_window import _echo
-        ctl = ControlServer(GuiHost(w), control_port, control_bind,
-                            log=lambda m: (w.diag.log("control: " + m), _echo("control: " + m)))
-        try:
-            ctl.start()
-        except OSError as e:
-            print(f"error: control port {control_bind}:{control_port}: {e}", file=sys.stderr)
-            return 2
-        app.aboutToQuit.connect(ctl.stop)
+    if control_port is not None:         # --control-port: on for this run only, not stored
+        w.app.remote.enabled, w.app.remote.port, w.app.remote.bind = True, control_port, control_bind
+    err = w._apply_remote()              # the control port, from the flag or from Settings > Remote Control
+    if err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
     if autosend:                         # demo hook: send once the window is up
         from PySide6.QtCore import QTimer
 
