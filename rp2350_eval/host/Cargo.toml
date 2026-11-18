@@ -1,0 +1,11 @@
+[package]
+name = "rp2350-eval"
+version = "0.1.0"
+edition = "2021"
+description = "Cycle-budget bench: runs NE0K DSP kernels on the emulated RP2350 (picoem) and reports load/RAM/USB-link feasibility"
+publish = false
+
+[dependencies]
+rp2350-emu = { path = "../../../picoem/crates/rp2350-emu" }
+
+[workspace]

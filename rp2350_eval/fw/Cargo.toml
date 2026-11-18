@@ -1,0 +1,17 @@
+[package]
+name = "rp2350-eval-fw"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Bare-metal RP2350 (Cortex-M33, hard-float) kernel-bench firmware. The DSP kernels are
+# the unmodified NE0K C sources (ofdm_dos/core) compiled by clang in build.rs; Rust only
+# supplies startup, the mailbox loop and compiler_builtins (soft double, memcpy).
+[dependencies]
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[workspace]
