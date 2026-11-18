@@ -195,6 +195,16 @@ static const double qpsk_re[4] = {  1.0 / R2, -1.0 / R2, -1.0 / R2,  1.0 / R2 };
 static const double qpsk_im[4] = {  1.0 / R2,  1.0 / R2, -1.0 / R2, -1.0 / R2 };
 static const unsigned char qpsk_bits[8] = { 0,0,  0,1,  1,1,  1,0 };
 
+/* 8-PSK, Gray coded round the circle, unit amplitude, point k at k*45 degrees.
+ * Sits between QPSK (7 dB floor) and 16-QAM (14 dB floor): 3 bits per carrier.
+ * Mirrors _PSK8_TABLE in ofdm_modem.py -- order is wire format. */
+#define RH 0.70710678118654752
+static const double p8_re[8] = { 1.0,  RH, 0.0, -RH, -1.0, -RH,  0.0,  RH };
+static const double p8_im[8] = { 0.0,  RH, 1.0,  RH,  0.0, -RH, -1.0, -RH };
+static const unsigned char p8_bits[24] = {
+    0,0,0,  0,0,1,  0,1,1,  0,1,0,  1,1,0,  1,1,1,  1,0,1,  1,0,0
+};
+
 /* 16-QAM, in _QAM16_TABLE's insertion order, scaled by 1/sqrt(10). */
 static const double q16_re[16] = {
     -3/R10, -3/R10, -3/R10, -3/R10, -1/R10, -1/R10, -1/R10, -1/R10,
@@ -251,6 +261,7 @@ int ofdm_mod_table(int bits, const double **pts_re, const double **pts_im,
     switch (bits) {
     case 1: re = bpsk_re; im = bpsk_im; bt = bpsk_bits; n = 2;  break;
     case 2: re = qpsk_re; im = qpsk_im; bt = qpsk_bits; n = 4;  break;
+    case 3: re = p8_re;   im = p8_im;   bt = p8_bits;   n = 8;  break;
     case 4: re = q16_re;  im = q16_im;  bt = q16_bits;  n = 16; break;
     case 6:
         if (!q64_ready) q64_build();
@@ -312,11 +323,11 @@ int ofdm_mod_tables_flat(const int *want, int n_want,
 
 int ofdm_bat_widths(const int *bits_per_bin, int n, int *out, int cap)
 {
-    static const int order[4] = { 1, 2, 4, 6 };
+    static const int order[5] = { 1, 2, 3, 4, 6 };
     int i, j, cnt = 0;
 
     if (!bits_per_bin || n < 0 || !out) return -1;
-    for (j = 0; j < 4; j++) {
+    for (j = 0; j < 5; j++) {
         for (i = 0; i < n; i++) {
             if (bits_per_bin[i] == order[j]) {
                 if (cnt >= cap) return -1;

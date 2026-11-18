@@ -94,7 +94,7 @@ static size_t al8(size_t v) { return (v + 7u) & ~(size_t)7u; }
 
 static int width_ok(int b)
 {
-    return b == 0 || b == 1 || b == 2 || b == 4 || b == 6;
+    return b == 0 || b == 1 || b == 2 || b == 3 || b == 4 || b == 6;
 }
 
 /* Same plan as ofdm_cxmod: the frame arithmetic only reads counts. */

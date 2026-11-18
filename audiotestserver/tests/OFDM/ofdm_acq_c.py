@@ -245,7 +245,8 @@ _PLANS: dict = {}
 
 def grid_coherence_scan_c(rx, n_fft, cp_len, bin_lo, n_occupied, known, nsyms,
                           step, q=None, top_k=40):
-    key = (n_fft, cp_len, bin_lo, n_occupied, nsyms, step, top_k,
+    top_k = min(int(top_k), int(n_occupied))   # as the numpy reference (k = min(top_k, n_occupied)): small FFTs
+    key = (n_fft,                               # have fewer occupied carriers than 40 and plan_ok refuses top_k > n_occ cp_len, bin_lo, n_occupied, nsyms, step, top_k,
            None if q is None else tuple(np.asarray(q, dtype=float).tolist()),
            known.tobytes())
     plan = _PLANS.get(key)

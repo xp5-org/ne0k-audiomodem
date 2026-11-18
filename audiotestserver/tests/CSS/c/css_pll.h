@@ -101,6 +101,10 @@ typedef struct {
      * The floor follows the quietest symbol down at once and rises
      * onset_floor_rise_db per symbol (decode() onset_rel_db / onset_floor_rise_db) */
     double onset_rel_db, onset_floor_rise_db;
+    /* the floor rises only onset_floor_rise_busy_db per symbol while symbols are over it; a
+     * relative onset needs onset_sustain_syms symbols over it in a row and anchors hard */
+    double onset_floor_rise_busy_db;
+    int    onset_sustain_syms;
     /* phase-step recovery while synced (decode() step_recover): settled, the
      * narrow MF snr dropping step_drop_db under the frame's running snr triggers
      * a +-search_range search; in acquisition a peak beyond post_acq_search is

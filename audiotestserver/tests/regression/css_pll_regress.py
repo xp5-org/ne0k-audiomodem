@@ -111,6 +111,10 @@ def _cases():
     # wrong data).  "j" (0x6A) opens frame 1; the broadcast port's TIME payload hit it every second.
     add("pll_015_anchor_frame1_j", dict(symbol_dur=0.15, f_min=400, f_max=3500, chunk_size=2, amplitude=0.6,
                                         crc_bytes=2), dict(snr_db=30, seed=23), msg="ABjkLo")
+    # room-relative onset guard (2026-11-17): 8 s of room noise far over silence_threshold before the burst, so the
+    # absolute guard never anchors and the floor tracker + sustained relative onset do
+    add("pll_015_room_lead", dict(symbol_dur=0.15, f_min=400, f_max=6000, chunk_size=8, amplitude=0.2,
+                                  crc_bytes=2), dict(lead_s=8.0, snr_db=12, seed=24))
     return C
 
 

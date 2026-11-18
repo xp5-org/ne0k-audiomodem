@@ -110,6 +110,7 @@ class Cfg(ctypes.Structure):
         ("presync_full_period", ctypes.c_int),
         ("onset_guard_silence_syms", ctypes.c_int),
         ("onset_rel_db", ctypes.c_double), ("onset_floor_rise_db", ctypes.c_double),
+        ("onset_floor_rise_busy_db", ctypes.c_double), ("onset_sustain_syms", ctypes.c_int),
         ("step_recover", ctypes.c_int),
         ("step_drop_db", ctypes.c_double), ("step_accept_db", ctypes.c_double),
         ("step_min_conf", ctypes.c_double),
@@ -402,6 +403,8 @@ def build_cfg(cfg: dict, conf: dict) -> tuple[Cfg, dict]:
     c.onset_guard_silence_syms = int(cfg.get("onset_guard_silence_syms", 2))
     c.onset_rel_db = float(cfg.get("onset_rel_db", 6.0))
     c.onset_floor_rise_db = float(cfg.get("onset_floor_rise_db", 0.2))
+    c.onset_floor_rise_busy_db = float(cfg.get("onset_floor_rise_busy_db", 0.02))
+    c.onset_sustain_syms = int(cfg.get("onset_sustain_syms", 2))
     c.step_recover = int(bool(cfg.get("step_recover", True)))
     c.step_drop_db = float(cfg.get("step_drop_db", 10.0))
     c.step_accept_db = float(cfg.get("step_accept_db", 6.0))

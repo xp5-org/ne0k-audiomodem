@@ -217,7 +217,7 @@ def _band_cfg(band_hz, sample_rate: int) -> dict:
         pilot_spacing    = int(PARAMS.get("pilot_spacing", 8)),  # group: OFDM
         probe_duration_s = float(PARAMS.get("probe_duration_s", 5.0)),  # group: OFDM
         snr_margin_db    = float(PARAMS.get("snr_margin_db", 6.0)),  # group: OFDM
-        max_bits_per_bin = int(PARAMS.get("max_bits_per_bin", 6)),  # choices: 1, 2, 4, 6  # group: OFDM
+        max_bits_per_bin = int(PARAMS.get("max_bits_per_bin", 6)),  # choices: 1, 2, 3, 4, 6  # group: OFDM
         probe_meas_syms  = int(PARAMS.get("probe_meas_syms", 32)),  # group: OFDM
         # ON by default here, unlike the other OFDM tests -- see ofdm_fdd.band_cfg.
         isi_derate       = float(PARAMS.get("isi_derate", 1)),  # choices: 0, 1  # group: OFDM

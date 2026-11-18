@@ -253,10 +253,11 @@ def rs_decode_interleaved(rsc, buf: bytes, depth: int, msg_len: int):
 SNR_FLOOR_DB: dict[int, float] = {
     1:  4.0,   # BPSK    (AWGN threshold measured at 3 dB)
     2:  7.0,   # QPSK    (AWGN threshold measured at 6 dB)
+    3: 12.5,   # 8-PSK   (QPSK 7 dB + 5.3 dB for d_min 1.414 -> 0.765, + 0.2; C: OFDM_FLOOR_8PSK)
     4: 14.0,   # 16-QAM  (AWGN threshold 10 dB; the rest covers unmeasured ISI)
     6: 21.0,   # 64-QAM  (AWGN threshold 15 dB; same reason)
 }
-VALID_BIT_LEVELS = [0, 1, 2, 4, 6]
+VALID_BIT_LEVELS = [0, 1, 2, 3, 4, 6]
 
 # -
 # Probe acquisition (coherence search -- replaces Schmidl-Cox, which
@@ -333,6 +334,17 @@ _QPSK_TABLE: dict[tuple, complex] = {
 QPSK_POINTS = np.array(list(_QPSK_TABLE.values()))
 QPSK_BITS   = np.array(list(_QPSK_TABLE.keys()), dtype=np.uint8)
 
+# 8-PSK  (Gray coded round the circle, unit amplitude, point k at k*45 deg; between QPSK and 16-QAM.
+# Order is wire format: C ofdm_cfg.c p8_* is the same table.)
+_PSK8_TABLE: dict[tuple, complex] = {
+    (0,0,0): 1+0j,                  (0,0,1): (1+1j)/_R2,
+    (0,1,1): 0+1j,                  (0,1,0): (-1+1j)/_R2,
+    (1,1,0): -1+0j,                 (1,1,1): (-1-1j)/_R2,
+    (1,0,1): 0-1j,                  (1,0,0): (1-1j)/_R2,
+}
+PSK8_POINTS = np.array(list(_PSK8_TABLE.values()))
+PSK8_BITS   = np.array(list(_PSK8_TABLE.keys()), dtype=np.uint8)
+
 # 16-QAM  (Gray coded, same layout as qam_writer)
 _QAM16_TABLE: dict[tuple, complex] = {
     (0,0,0,0): -3-3j, (0,0,0,1): -3-1j, (0,0,1,1): -3+1j, (0,0,1,0): -3+3j,
@@ -360,6 +372,7 @@ QAM64_BITS   = np.array(list(_QAM64_TABLE.keys()), dtype=np.uint8)
 _MOD_TABLES: dict[int, tuple] = {
     1: (BPSK_POINTS,  BPSK_BITS),
     2: (QPSK_POINTS,  QPSK_BITS),
+    3: (PSK8_POINTS,  PSK8_BITS),
     4: (QAM16_POINTS, QAM16_BITS),
     6: (QAM64_POINTS, QAM64_BITS),
 }
@@ -367,6 +380,7 @@ _MOD_TABLES: dict[int, tuple] = {
 _MOD_ENCODE: dict[int, dict] = {
     1: _BPSK_TABLE,
     2: _QPSK_TABLE,
+    3: _PSK8_TABLE,
     4: {k: v/_R10 for k, v in _QAM16_TABLE.items()},
     6: _QAM64_TABLE,
 }
@@ -1591,7 +1605,7 @@ class BitAllocator:
         pilot_set        set of pilot indices within occupied block
         n_occupied       total occupied subcarriers
         snr_margin_db    headroom above floor (dB)
-        max_bits         maximum bits per carrier (1/2/4/6)
+        max_bits         maximum bits per carrier (1/2/3/4/6; 3 = 8-PSK)
         isi_beta         measured ISI-to-signal ratio (0 = ignore); see
                          isi_ratio()
 

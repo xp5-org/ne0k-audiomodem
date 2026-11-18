@@ -57,8 +57,8 @@ size_t ofdm_dem_workspace(int n_fft, int cp_len, int n_occupied,
 /* Carves `mem`.  Everything pointed at is COPIED, so the caller may free.
  *
  * Constellation tables are flat and concatenated in ascending `tab_b` order:
- *   tab_b[t]   bits-per-carrier this table serves (1, 2, 4, 6)
- *   tab_n[t]   points in it (2, 4, 16, 64)
+ *   tab_b[t]   bits-per-carrier this table serves (1, 2, 3, 4, 6)
+ *   tab_n[t]   points in it (2, 4, 8, 16, 64)
  *   pts_re/im  all points, table 0 first
  *   tab_bits   all bit patterns, tab_b[t] bits per point, same order
  *

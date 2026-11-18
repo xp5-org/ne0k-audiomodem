@@ -24,7 +24,7 @@ SECTION_CLASSES = {"general": mc.GeneralConfig, "output": mc.OutputConfig, "css"
 OVERVIEW = """\
 <b>OFDM in one paragraph.</b> The OFDM modem splits the audio band (Band low to Band high) into many
 narrow <i>carriers</i>, spaced sample rate / FFT size apart (1024 at 48 kHz = 46.9 Hz).  Each carrier
-carries 1, 2, 4 or 6 bits per symbol (BPSK, QPSK, 16-QAM, 64-QAM).  A <i>probe</i> measures the SNR of
+carries 1, 2, 3, 4 or 6 bits per symbol (BPSK, QPSK, 8-PSK, 16-QAM, 64-QAM).  A <i>probe</i> measures the SNR of
 every carrier and a <i>bit allocation table</i> (BAT) gives each carrier as many bits as it can hold, so a
 good channel is fast and a bad one slows down instead of failing.  A <i>cyclic prefix</i> at the front of
 each symbol absorbs echoes, <i>pilot</i> carriers track phase and level, and Reed-Solomon parity repairs
@@ -127,6 +127,10 @@ _OFDM = {
     "peer_id": ("Frames are addressed here.", "The OFDM handshake is made with this peer."),
     "channel": ("radio adds a 2 s 1000 Hz lead tone for PTT, squelch and the far receive gate; line sends the frame as is.  Wrong choice costs 2 s per burst or loses the PTT.",
                 "The lead tone precedes the OFDM probe and every burst."),
+    "keyup_lead_s": ("Length of the radio lead tone.  Too short and a PTT radio or a waking Bluetooth link eats the "
+                     "start of the frame; too long wastes air time on every burst (2 s for a PTT radio, ~0.5 s for "
+                     "a Bluetooth FM transmitter).",
+                     "The probe and the first chunk of every broadcast keying follow the tone."),
     "role": ("Decides who sends the first probe.", "Both ends cannot be initiator; auto uses the lower node id."),
     "mode": ("half alternates timed windows; oneway/stream has one sender; full is simultaneous; arq adds ACKs; bcast is continuous.  Changes the speed, delay and what the receiver may do.",
              "Chooses how frames are scheduled; the carriers and BAT are the same in every mode."),
@@ -148,7 +152,7 @@ _OFDM = {
     "probe_duration_s": ("Longer probes measure SNR more accurately and take longer.  Do not shorten it for speed on a fading radio.", "The probe measures SNR per carrier for the BAT."),
     "probe_meas_syms": ("Non-periodic symbols make the SNR estimate honest.  0 = periodic only.", "A periodic probe can look better than the channel is."),
     "snr_margin_db": ("More margin = fewer errors and fewer bits; less margin = faster and fragile.", "Subtracted from each carrier's SNR before assigning bits."),
-    "max_bits_per_bin": ("1 BPSK, 2 QPSK, 4 16-QAM, 6 64-QAM.  Higher caps allow more speed on clean channels.", "The ceiling of bit loading on any carrier."),
+    "max_bits_per_bin": ("1 BPSK, 2 QPSK, 3 8-PSK, 4 16-QAM, 6 64-QAM.  Higher caps allow more speed on clean channels.", "The ceiling of bit loading on any carrier."),
     "snr_estimator": ("percentile is more cautious than mean.", "Chooses how per-carrier SNR is summarised."),
     "isi_derate": ("1 folds the measured reverberation ceiling into the allocation.", "ISI is energy from the previous symbol beyond the prefix."),
     "window_s": ("Longer windows carry more per turn and add latency.  Both ends equal.", "Each window holds OFDM frames at the BAT rate."),
@@ -346,7 +350,7 @@ UI_GROUPS: list[tuple[str, dict[str, tuple[str, str]]]] = [
                    "bits the allocator gave it.  The first chart is what this end measured, the next what the peer "
                    "measured of us.  Right-click a chart for zoom and export."),
         "ui.bat.legend": ("BAT colours", "Bar colour = bits per symbol the allocator gave the carrier: pilot, off, BPSK (1), "
-                          "QPSK (2), 16-QAM (4), 64-QAM (6)."),
+                          "QPSK (2), 8-PSK (3), 16-QAM (4), 64-QAM (6)."),
         "ui.bat.hint": ("No probe yet", "The charts appear once an OFDM probe has been exchanged with the peer."),
     }),
     ("Log", {

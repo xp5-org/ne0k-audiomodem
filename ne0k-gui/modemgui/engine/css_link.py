@@ -279,6 +279,11 @@ class CssLink:
         return (f"busy={int(self.channel_busy())} trk={'-' if trk is None else trk} gated={int(self._gated)} "
                 f"in_burst={int(self._in_burst)} last_busy_age={time.monotonic() - self._last_busy:.1f}s "
                 f"trk_changes={getattr(st, 'busy_changes', 0)} short_bursts={self.short_bursts}"
+                + ("" if getattr(st, "clock", None) is None else
+                   " clock={state} ppm={ppm} trk_ppm={trk}".format(
+                       state=st.clock["state"],
+                       ppm="-" if st.clock["ppm"] is None else f"{st.clock['ppm']:+.1f}",
+                       trk="-" if st.clock["trk_ppm"] is None else f"{st.clock['trk_ppm']:+.0f}"))
                 + ("" if self.level_floor is None else
                    f" lvl_thr={self.level_floor.threshold_db():.1f}dB floor="
                    f"{'-' if self.level_floor.floor_db is None else f'{self.level_floor.floor_db:.1f}'}dB"))
@@ -296,8 +301,10 @@ class CssLink:
         if self.cfg.decoder == "pll_c" and self.cfg.symbol_dur <= 0.25:
             self._start_stream(pipe)
         elif self.cfg.decoder == "pll_c":
-            self.log(f"css: symbol_dur {self.cfg.symbol_dur}s > 0.25 s: decoding bursts on the "
-                     "matched-filter long-symbol decoder (reference dispatch), not the streaming PLL")
+            # Long symbols: the same matched-filter decoder, but LIVE (css_longrx): the symbol grid
+            # (the CSS clock) is tracked as the audio arrives, with the chirp tracker running beside
+            # it, instead of recording the burst and decoding it cold after it ends.
+            self._start_long(pipe)
         self._stop.clear()
         self._thread = threading.Thread(target=self._rx, args=(pipe.subscribe(1024),),
                                         name="css-rx", daemon=True)
@@ -305,6 +312,8 @@ class CssLink:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.stream is not None and hasattr(self.stream, "stop"):
+            self.stream.stop()
         if self._thread:
             self._thread.join(5.0)
             self._thread = None
@@ -336,6 +345,23 @@ class CssLink:
         pipe.tx_onset_hooks.append(self._on_tx_onset)
         self._pipe_hooked = pipe
         last_codec.update(path="pll_c", mf=None, dec="c")
+
+    def _start_long(self, pipe) -> None:
+        """decoder "pll_c" above 0.25 s: live long-symbol MF decoder + chirp tracker (css_longrx)."""
+        from .css_longrx import CssLongRx
+        _, cm, _ = _imports()
+        import css_decoder
+        sc = short_cfg(self.cfg)
+        me = self.cfg.node_id
+        self.stream = CssLongRx(
+            self.cfg, _info(self.cfg), _info(self.cfg, short=True) if sc is not None else None,
+            node_id=me, hear_own=self.cfg.hear_own, log=self.log, emit=self.session._emit,
+            emit_link=lambda kind, peer, t0, t1, d: self.session._emit(LinkEvent(kind, me, peer, t0, t1, d)),
+            decoded_cls=Decoded, unpack=cm.unpack_packet, decoder_mod=lambda: css_decoder, work=_work,
+            stop_event=self._stop)
+        pipe.tx_onset_hooks.append(self._on_tx_onset)
+        self._pipe_hooked = pipe
+        last_codec.update(path="mf_live", mf="numpy", dec="python")
 
     def _on_tx_onset(self, rx_index: int, samples) -> None:
         # sink thread: just queue it; the RX thread reads the chirp schedule off it
@@ -432,6 +458,8 @@ class CssLink:
                 elif not buf and self.on_level:
                     self.on_level(lvl)
                 if busy and not buf:
+                    if st is not None and hasattr(st, "burst_start"):
+                        st.burst_start()           # live long-symbol session: pre-roll + all that follows
                     buf.extend(pre); pre.clear()
                 self._in_burst = bool(busy or buf)
                 if busy or buf:

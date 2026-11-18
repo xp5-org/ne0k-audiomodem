@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import math
 import os
 import struct
 import sys
@@ -95,10 +96,10 @@ CONTROL_MAGICS = (BAT_MAGIC, READY_MAGIC, PING_MAGIC, POLL_MAGIC, STAT_MAGIC)
 _POLL = struct.Struct(">HIHI")         # message id, first seq, frames, table_id of the data frames
 _STAT_HDR = struct.Struct(">HIHB")     # message id, first seq, frames, flags (1 complete, 2 table follows,
                                        # 4 CRC failed: everything is resent, 8 send me a probe)
-# Bit-loading floors (dB, before the margin) as ofdm_allocate: BPSK, QPSK, 16-QAM, 64-QAM; and the
+# Bit-loading floors (dB, before the margin) as ofdm_allocate: BPSK, QPSK, 8-PSK, 16-QAM, 64-QAM; and the
 # squared minimum distance of each unit-energy constellation (ofdm_mod_table).
-_FLOOR_DB = {1: 4.0, 2: 7.0, 4: 14.0, 6: 21.0}
-_DMIN2 = {1: 4.0, 2: 2.0, 4: 0.4, 6: 4.0 / 42.0}
+_FLOOR_DB = {1: 4.0, 2: 7.0, 3: 12.5, 4: 14.0, 6: 21.0}
+_DMIN2 = {1: 4.0, 2: 2.0, 3: 4.0 * math.sin(math.pi / 8) ** 2, 4: 0.4, 6: 4.0 / 42.0}
 DEAD_HREL = 0.1                        # mean |H|^2 under 10 dB below the loaded carriers': dead carrier
 ARQ_MARGIN_DB = 3.0                    # regrade margin: measured on the data itself, so less than the probe's
                                        # snr_margin_db (64-QAM kept down to score 0.17: SER ~1e-3 before RS)
@@ -566,7 +567,7 @@ class IqLink:
         if ver != BAT_VERSION or n != nd or len(data) != _BAT_HDR.size + n + _BAT_TAIL.size:
             raise ValueError(f"BAT message v{ver} n={n} len={len(data)} (want v{BAT_VERSION} n={nd})")
         bat = list(data[_BAT_HDR.size:_BAT_HDR.size + n])
-        if any(b not in (0, 1, 2, 4, 6) or b > int(self.cfg.max_bits) for b in bat):
+        if any(b not in (0, 1, 2, 3, 4, 6) or b > int(self.cfg.max_bits) for b in bat):
             raise ValueError("BAT message holds a bit count this profile does not allow")
         if sum(bat) == 0:
             raise ValueError("BAT message holds an empty table")
@@ -965,7 +966,7 @@ class IqLink:
             table = None
             if flags & 2:
                 t = list(data[_STAT_HDR.size + nb:])
-                if len(t) == self.base.x.c.n_data_carriers and all(v in (0, 1, 2, 4, 6) for v in t) and sum(t) > 0:
+                if len(t) == self.base.x.c.n_data_carriers and all(v in (0, 1, 2, 3, 4, 6) for v in t) and sum(t) > 0:
                     table = t
             self.stats["rx_stat"] += 1
             return dict(complete=bool(flags & 1), crc_failed=bool(flags & 4), have=have, table=table,
@@ -1182,18 +1183,18 @@ class IqLink:
                 continue
             snr_db = 10 * np.log10(1.0 / max(r * _DMIN2[b] / 4.0, 1e-6))
             if r > 0.5:                       # decisions too often wrong for the estimate: two steps down
-                steps = [w for w in (6, 4, 2, 1, 0) if w < b]
+                steps = [w for w in (6, 4, 3, 2, 1, 0) if w < b]
                 new.append(steps[1] if len(steps) > 1 else 0)
                 continue
             # one step up when the data itself shows the room for it (+3 dB hysteresis), else down to fit
-            up = [w for w in (1, 2, 4, 6) if w > b and w <= int(self.cfg.max_bits)][:1]
+            up = [w for w in (1, 2, 3, 4, 6) if w > b and w <= int(self.cfg.max_bits)][:1]
             if up and snr_db >= _FLOOR_DB[up[0]] + margin + 3.0 and r < 0.1:
                 new.append(up[0])
                 continue
             # down to fit, but one step per update: under a fade the median of a few frames swings, and
             # the next update can always take another step
-            fit = [w for w in (6, 4, 2, 1) if w <= b and snr_db >= _FLOOR_DB[w] + margin]
-            one = [w for w in (6, 4, 2, 1, 0) if w < b][:1]
+            fit = [w for w in (6, 4, 3, 2, 1) if w <= b and snr_db >= _FLOOR_DB[w] + margin]
+            one = [w for w in (6, 4, 3, 2, 1, 0) if w < b][:1]
             new.append(max(fit[0] if fit else 0, one[0] if one else 0))
         if new == [int(b) for b in cur] or sum(new) == 0:
             return None

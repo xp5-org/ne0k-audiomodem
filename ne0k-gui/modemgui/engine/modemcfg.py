@@ -114,6 +114,10 @@ class OfdmConfig(_Config):
                      "radio = a keyed transmitter: every burst starts with a 2 s 1000 Hz key-up (PL) lead tone for the "
                      "PTT, squelch and the far end's receive gate.  line = SIP / dialup / fax-modem audio: no PTT, no "
                      "lead tone, the frame goes out as is.", choices=["radio", "line"])
+    keyup_lead_s: float = F(2.0, "Key-up lead tone (s)", "Link",
+                            "Length of the radio key-up (PL) lead tone.  2 s covers a PTT radio's attack and the far "
+                            "squelch; a Bluetooth audio transmitter needs only a short wake-up (0.5 s).  0 = none.",
+                            0.0, 5.0)
     role: str = F("auto", "Role", "Link", "auto = the lower node id initiates.",
                   choices=["auto", "initiator", "responder"])
     mode: str = F("half", "Mode", "Link",
@@ -137,7 +141,11 @@ class OfdmConfig(_Config):
     hs_timeout_s: float = F(300.0, "Handshake timeout (s)", "Handshake", "", 20, 3600)
     poll_s: float = F(0.5, "Receive poll (s)", "Handshake", "", 0.1, 10)
     n_fft: int = F(1024, "FFT size", "OFDM PHY (both ends equal)",
-                   "Carrier spacing = rate / FFT size.", choices=[512, 1024, 2048, 4096])
+                   "Carrier spacing = rate / FFT size.  256 and below: short symbols for a jittery channel "
+                   "(Bluetooth into an FM transmitter).  32/64/128 stream in loopback (python and C); each carrier "
+                   "is rate/FFT wide (1.5 kHz at 32, 48 kHz), so a narrow band holds only a few.  16 loses chunks "
+                   "and 8 fails the probe's measurement block, so they are not offered yet.",
+                   choices=[32, 64, 128, 256, 512, 1024, 2048, 4096])
     cp_ratio: float = F(0.25, "Cyclic prefix ratio", "OFDM PHY (both ends equal)",
                         "The echo budget: must outlast the room's reflections.",
                         choices=[0.25, 0.375, 0.5])
@@ -149,7 +157,7 @@ class OfdmConfig(_Config):
     snr_margin_db: float = F(9.0, "SNR margin (dB)", "OFDM PHY (both ends equal)",
                              "Headroom over the modulation floor; covers fade migration.", 0, 30)
     max_bits_per_bin: int = F(2, "Max bits per carrier", "OFDM PHY (both ends equal)",
-                              "1 BPSK, 2 QPSK, 4 16-QAM, 6 64-QAM.", choices=[1, 2, 4, 6])
+                              "1 BPSK, 2 QPSK, 3 8-PSK, 4 16-QAM, 6 64-QAM.", choices=[1, 2, 3, 4, 6])
     snr_estimator: str = F("mean", "SNR estimator", "OFDM PHY (both ends equal)", "",
                            choices=["mean", "percentile"])
     isi_derate: float = F(0.0, "ISI de-rating", "OFDM PHY (both ends equal)",
@@ -629,12 +637,12 @@ class IqConfig(_Config):
                        "(decision distance, dead carriers by |H|) erased: up to twice the correction on a notched "
                        "or noisy carrier.  Off = errors-only, as before 2026-11-14.")
     default_bits: int = F(2, "Bits per carrier before a probe", "Bit loading",
-                          "Every data carrier, until a probe has measured the channel.", choices=[1, 2, 4, 6])
+                          "Every data carrier, until a probe has measured the channel.", choices=[1, 2, 3, 4, 6])
     snr_margin_db: float = F(7.0, "SNR margin (dB)", "Bit loading",
-                             "Subtracted before ofdm_allocate (floors 4/7/14/21 dB for BPSK..64-QAM are "
+                             "Subtracted before ofdm_allocate (floors 4/7/12.5/14/21 dB for BPSK..64-QAM, 8-PSK at 12.5 are "
                              "raw).  7 dB: 30/30 frames just above every 16/64-QAM step (6 dB loses "
                              "frames at the QPSK edge, 3 dB loses up to half at each step).", 0.0, 20.0)
-    max_bits: int = F(6, "Most bits per carrier", "Bit loading", "", choices=[1, 2, 4, 6])
+    max_bits: int = F(6, "Most bits per carrier", "Bit loading", "", choices=[1, 2, 3, 4, 6])
     probe_syms: int = F(64, "Probe periodic symbols", "Bit loading", "", 8, 1024)
     meas_syms: int = F(32, "Probe measurement symbols", "Bit loading", "", 0, 1024)
     max_rtd_s: float = F(15.0, "Longest round trip allowed for (s)", "Link",

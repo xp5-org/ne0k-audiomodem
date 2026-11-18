@@ -114,7 +114,7 @@ int ofdm_dem_init(ofdm_dem **dp, void *mem, size_t memlen,
     if (!dp || !mem || !ce_re || !ce_im || !sy_re || !sy_im) return -1;
     if (!bits_per_bin || !tab_b || !tab_n || !pts_re || !pts_im || !tab_bits)
         return -1;
-    if (n_tabs < 1 || n_tabs > 4) return -1;
+    if (n_tabs < 1 || n_tabs > 5) return -1;
     if (bin_lo < 0 || bin_lo + n_occupied > n_fft / 2 + 1) return -1;
     for (t = 0; t < n_tabs; t++) {
         if (tab_b[t] < 1 || tab_n[t] < 1) return -1;

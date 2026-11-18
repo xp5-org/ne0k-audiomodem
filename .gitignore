@@ -8,3 +8,4 @@ info.txt
 /audiotestserver/ssh
 # captured test fixtures (small, 8 kHz) are kept
 !ne0k-gui/tests/data/*.wav
+*.wav

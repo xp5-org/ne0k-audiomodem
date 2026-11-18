@@ -82,6 +82,7 @@ extern "C" {
  * Lowering them on the strength of an AWGN bench broke a real link. */
 #define OFDM_FLOOR_BPSK   4.0
 #define OFDM_FLOOR_QPSK   7.0
+#define OFDM_FLOOR_8PSK  12.5   /* QPSK + 20log(d_qpsk/d_8psk)=5.3 dB, +0.2 */
 #define OFDM_FLOOR_16QAM 14.0
 #define OFDM_FLOOR_64QAM 21.0
 

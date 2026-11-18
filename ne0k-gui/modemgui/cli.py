@@ -613,7 +613,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--gap", type=float, default=None, help="ofdm oneway/stream: quiet between bursts, s (default 1.0)")
     p.add_argument("--hang", type=float, default=None, help="ofdm oneway/stream: burst ends after this much quiet, s (0.6)")
     p.add_argument("--stream-poll", type=float, default=None, help="ofdm stream: decode interval, s (1.0)")
-    p.add_argument("--max-bits", type=int, choices=[1, 2, 4, 6], default=None,
+    p.add_argument("--max-bits", type=int, choices=[1, 2, 3, 4, 6], default=None,
                    help="ofdm: max bits per carrier (2 = QPSK default; 4 = 16-QAM needs ~25 dB SNR)")
     p.add_argument("--snr-margin", type=float, default=None, help="ofdm: dB headroom over the modulation floor (9)")
     p.add_argument("--band-lo", type=float, default=None, help="Hz; OFDM default 400, CSS keeps its preset")
@@ -656,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--dev", required=True, help="I/Q device, e.g. iq:127.0.0.1:5601 (/sc16 for int16)")
         p.add_argument("--profile", default="iq", help="modemcfg IQ_PROFILES name (iq = 200 ksps, +-50 kHz)")
         p.add_argument("--fs", type=int); p.add_argument("--block", type=int)
-        p.add_argument("--tx-rms", type=float); p.add_argument("--bits", type=int, choices=[1, 2, 4, 6])
+        p.add_argument("--tx-rms", type=float); p.add_argument("--bits", type=int, choices=[1, 2, 3, 4, 6])
         p.add_argument("--node", type=int); p.add_argument("--peer", type=int)
         p.add_argument("--gapped", action="store_true", help="a frame gap after every frame (default: back to back)")
         p.add_argument("--no-erasures", action="store_true", help="errors-only RS decode (IqConfig.erasures off)")
@@ -726,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--listen-port", type=int, default=0, help="UDP port for incoming SIP INVITEs (the server's target)")
     p.add_argument("--ring-ms", type=int, default=3000, help="RING interval toward the DTE")
     p.add_argument("--band-lo", type=float, default=400.0); p.add_argument("--band-hi", type=float, default=3300.0)
-    p.add_argument("--max-bits", type=int, default=6, choices=[1, 2, 4, 6], help="OFDM bits per carrier cap (6 = 64-QAM)")
+    p.add_argument("--max-bits", type=int, default=6, choices=[1, 2, 3, 4, 6], help="OFDM bits per carrier cap (6 = 64-QAM)")
     p.add_argument("--carrier-timeout", type=float, default=90.0, help="seconds to wait for the OFDM handshake after answer")
     p.add_argument("--save-dir", help="received fax pages are written here")
     p.add_argument("--find-timeout", type=float, default=60.0, help="seconds to wait for the 86Box pty")

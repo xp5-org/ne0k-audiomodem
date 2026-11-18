@@ -40,15 +40,15 @@ struct ofdm_mod {
     /* value -> point index per width.  The tables are point->bits; the encoder
      * needs the inverse, and at 64 entries max it is a direct-mapped array
      * rather than a search per carrier per symbol. */
-    int      map[4][64];
-    int      map_b[4];
+    int      map[5][64];
+    int      map_b[5];
 };
 
 static size_t al8(size_t v) { return (v + 7u) & ~(size_t)7u; }
 
 static int width_ok(int b)
 {
-    return b == 0 || b == 1 || b == 2 || b == 4 || b == 6;
+    return b == 0 || b == 1 || b == 2 || b == 3 || b == 4 || b == 6;
 }
 
 static int bits_sum(const int *bpb, int n)
@@ -116,7 +116,7 @@ int ofdm_mod_init(ofdm_mod **mp, void *mem, size_t memlen,
     unsigned char *p = (unsigned char *)mem;
     size_t need, fftw, rsw;
     int    i, t, rc, bps, depth, k, wire, ds, body, T, n_even, nw;
-    int    widths[4];
+    int    widths[5];
     double amp;
 
     if (!mp || !mem || !c || !bits_per_bin) return -1;
@@ -176,7 +176,7 @@ int ofdm_mod_init(ofdm_mod **mp, void *mem, size_t memlen,
     amp = OFDM_REF_SYM_BOOST / sqrt(2.0);
     ofdm_known_bpsk(m->ce_re, c->n_occupied, OFDM_SEED_CE, amp);
 
-    nw = ofdm_bat_widths(m->bpb, c->n_data_carriers, widths, 4);
+    nw = ofdm_bat_widths(m->bpb, c->n_data_carriers, widths, 5);
     if (nw < 0) return -1;
     m->n_maps = 0;
     for (t = 0; t < nw; t++) {

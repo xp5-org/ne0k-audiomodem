@@ -180,7 +180,7 @@ def keyup(session, audio: np.ndarray, fs: int, lead_s: float | None = None, idle
 
     ``session.keyup_tone`` False (OfdmConfig.channel = line: SIP / dialup / fax-modem audio, no PTT, no PL) drops
     the lead tone; the OWN_GAP_S spacing and the transmit-end mark stay, the receivers' burst gate needs them."""
-    lead = KEYUP_LEAD_S if lead_s is None else lead_s
+    lead = getattr(session, "keyup_lead_s", KEYUP_LEAD_S) if lead_s is None else lead_s   # OfdmConfig.keyup_lead_s
     if not getattr(session, "keyup_tone", True):
         lead = 0.0
     idle = KEYUP_IDLE_S if idle_s is None else idle_s
@@ -351,6 +351,15 @@ class _Capture:
 class OfdmLink:
     def __init__(self, session, cfg: OfdmConfig | None = None, log=lambda m: None) -> None:
         self.session, self.cfg, self.log = session, cfg or OfdmConfig(), log
+        # The engine runs on the carrier grid, not on the raw settings: refuse a combination with no usable
+        # carriers, and put freq_lo / freq_hi ON the carriers so the log, the saved BAT and every band computation
+        # below name what is actually on the air (engine/ofdmgrid.py).
+        from . import ofdmgrid
+        try:
+            self.cfg, self.grid = ofdmgrid.snap(self.cfg)
+        except ofdmgrid.GridError as ex:
+            raise ValueError(f"ofdm grid: {ex}") from None
+        log(f"ofdm grid: {self.grid.describe()}")
         c = self.cfg
         self.role = c.role if c.role != "auto" else ("initiator" if c.node_id < c.peer_id
                                                       else "responder")
@@ -823,6 +832,8 @@ class OfdmLink:
                 self._mark_rx(listen, "probe")
                 self._emit_probe("measured", c.peer_id, c.node_id, info["spectrum"],
                                  info["bat_summary"])
+                from . import batstore           # BAT GET on the control port: the table for a one-way sender
+                batstore.record(c.peer_id, c.node_id, bat_bytes, c, info)
                 sm.heard_probe(bat_bytes, self._hs_now())
         return listen
 

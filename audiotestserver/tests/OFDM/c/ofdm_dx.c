@@ -153,16 +153,16 @@ int ofdm_dx_init(ofdm_dx **out, void *mem, size_t memlen, const ofdm_dx_params *
     struct ofdm_dx *d;
     unsigned char *b = (unsigned char *)mem;
     size_t off, need;
-    int i, rc, tab_b[4], tab_n[4], n_pts, n_bits;
-    double pts_re[96], pts_im[96];
-    unsigned char tab_bits[480];
+    int i, rc, tab_b[5], tab_n[5], n_pts, n_bits;
+    double pts_re[128], pts_im[128];
+    unsigned char tab_bits[512];
     const ofdm_cfg *r;
     unsigned char *m_t, *m_r, *m_rs, *m_sy, *m_de;
     double amp;
 
     if (!out || !mem || !p) return -1;
     if (dx_plan_make(&pl, p) != 0) return -1;
-    if (pl.n_pts > 96 || pl.n_bits > 480) return -4;
+    if (pl.n_pts > 128 || pl.n_bits > 512) return -4;
     need = dx_layout(&pl, p, 0, 0);
     if (memlen < need) return -2;
 
@@ -193,7 +193,7 @@ int ofdm_dx_init(ofdm_dx **out, void *mem, size_t memlen, const ofdm_dx_params *
         for (i = 0; i < r->n_data_carriers; i++) d->rx_bat[i] = p->rx_bat[i];
 
         rc = ofdm_mod_tables_flat(pl.widths, pl.n_w, tab_b, tab_n, pts_re, pts_im,
-                                  tab_bits, 96, 480, &n_pts, &n_bits);
+                                  tab_bits, 128, 512, &n_pts, &n_bits);
         if (rc != 0) return -3;
         if (ofdm_dem_init(&d->dem, m_de, pl.sz_dem, r->n_fft, r->cp_len, r->bin_lo,
                           r->n_occupied, d->ce_re, d->ce_im, d->ce_re, d->ce_im,

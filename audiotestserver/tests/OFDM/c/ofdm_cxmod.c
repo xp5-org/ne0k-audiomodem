@@ -27,8 +27,8 @@ struct ofdm_cxmod {
     double     *occ_re, *occ_im;
     double     *symbuf;             /* 2 * (symbol_samples + 2T)    */
     unsigned char *msg, *enc, *blk, *padbuf, *bits;
-    int         map[4][64];         /* value -> point index per width */
-    int         map_b[4];
+    int         map[5][64];         /* value -> point index per width */
+    int         map_b[5];
     int         fec;                /* OFDM_CXFEC_*                   */
     long        ncod, pstep;        /* coded bits, interleaver step   */
     unsigned char *info, *cod;      /* wire bits (scrambled), coded   */
@@ -38,7 +38,7 @@ static size_t al8(size_t v) { return (v + 7u) & ~(size_t)7u; }
 
 static int width_ok(int b)
 {
-    return b == 0 || b == 1 || b == 2 || b == 4 || b == 6;
+    return b == 0 || b == 1 || b == 2 || b == 3 || b == 4 || b == 6;
 }
 
 static int bits_sum(const int *bpb, int n)
@@ -125,7 +125,7 @@ int ofdm_cxmod_init_fec(ofdm_cxmod **mp, void *mem, size_t memlen,
     unsigned char *p = (unsigned char *)mem;
     size_t need, symw, rsw;
     int    i, j, t, bps, depth, k, wire, ds, body, T, n_sc, nw, len;
-    int    widths[4];
+    int    widths[5];
 
     if (!mp || !mem || !x || !bits_per_bin) return -1;
     c = &x->c;
@@ -187,7 +187,7 @@ int ofdm_cxmod_init_fec(ofdm_cxmod **mp, void *mem, size_t memlen,
     /* CE and SYNC: the same known BPSK at the same level as the real path. */
     ofdm_known_bpsk(m->ce_re, c->n_occupied, OFDM_SEED_CE, OFDM_REF_SYM_BOOST / sqrt(2.0));
 
-    nw = ofdm_bat_widths(m->bpb, c->n_data_carriers, widths, 4);
+    nw = ofdm_bat_widths(m->bpb, c->n_data_carriers, widths, 5);
     if (nw < 0) return -1;
     m->n_maps = 0;
     for (t = 0; t < nw; t++) {

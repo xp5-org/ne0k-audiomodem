@@ -453,6 +453,7 @@ class MainWindow(QMainWindow):
         self._show_mode()
         self.diag.log("modem powered on")
         self._restart_link()
+        self.diag.snapshot(self.app.dump())
         if self.app.cssbcast.autostart and not (self.udp or self.serial or self.bcast):
             self._start_bcast()
         elif self.app.udp.autostart and not self.udp and not self.serial:
@@ -716,6 +717,7 @@ class MainWindow(QMainWindow):
     def _restart_link(self) -> None:
         self.session.ignore_busy = bool(self.app.general.ignore_busy)   # read by every pre-TX silence check
         self.session.keyup_tone = self.app.ofdm.channel != "line"       # read by ofdm_link.keyup() on every burst
+        self.session.keyup_lead_s = float(self.app.ofdm.keyup_lead_s)
         self._apply_sense()
         if self.link:
             self.link.stop(); self.link = None

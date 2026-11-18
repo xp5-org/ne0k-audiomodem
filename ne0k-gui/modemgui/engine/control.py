@@ -169,6 +169,11 @@ class EngineHost(ControlHost):
         br = self.bridge
         return [("link", type(br.link).__name__)]
 
+    def actions(self) -> dict:
+        from . import batstore
+        return {"BAT": ("LIST | GET [peer] | CLEAR  the BATs this modem measured from its peers' probes "
+                        "(GET = saved-BAT JSON on one line); PUT needs the GUI host", direct(batstore.command))}
+
 
 # -- server -------------------------------------------------------------------
 
@@ -563,6 +568,13 @@ class ControlServer:
         v = parse_value(f, raw)
         how = self.host.run(lambda: self.host.set_param(sec, key, v))
         out.append(f"{sec}.{key}={fmt_value(v)}")
+        from . import ofdmgrid
+        obj = self.host.run(self.host.sections).get(sec)
+        if key in ofdmgrid.KEYS and all(hasattr(obj, k) for k in ofdmgrid.KEYS):
+            try:                     # say where the band really lands: the engine snaps it onto the carriers
+                out.append(f"{sec}.grid={ofdmgrid.check(obj).describe()}")
+            except ofdmgrid.GridError as ex:
+                out.append(f"{sec}.grid=REFUSED: {ex}")
         return how
 
     # -- debug ------------------------------------------------------------------------

@@ -577,9 +577,10 @@ int ofdm_allocate(const double *snr_db_occupied, int n_occupied,
                   int pilot_spacing, double snr_margin_db, int max_bits,
                   double isi_beta, int *bits_out, int cap)
 {
-    static const int    lv[4] = { 6, 4, 2, 1 };
-    static const double fl[4] = { OFDM_FLOOR_64QAM, OFDM_FLOOR_16QAM,
-                                  OFDM_FLOOR_QPSK,  OFDM_FLOOR_BPSK };
+    static const int    lv[5] = { 6, 4, 3, 2, 1 };
+    static const double fl[5] = { OFDM_FLOOR_64QAM, OFDM_FLOOR_16QAM,
+                                  OFDM_FLOOR_8PSK,  OFDM_FLOOR_QPSK,
+                                  OFDM_FLOOR_BPSK };
     int    i, j, cnt = 0;
     double m_lin;
 
@@ -605,7 +606,7 @@ int ofdm_allocate(const double *snr_db_occupied, int n_occupied,
         if (isi_beta > 0.0) lin = lin / (1.0 + isi_beta * lin);
         usable = 10.0 * log10(lin < 1e-12 ? 1e-12 : lin);
 
-        for (j = 0; j < 4; j++) {
+        for (j = 0; j < 5; j++) {
             if (lv[j] > max_bits) continue;
             if (usable >= fl[j]) { assigned = lv[j]; break; }
         }

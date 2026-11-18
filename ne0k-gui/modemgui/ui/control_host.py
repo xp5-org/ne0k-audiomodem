@@ -13,6 +13,7 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -20,7 +21,7 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal
 
 from .. import native
 from ..audio import SINK, SOURCE, hostmixer
-from ..engine import calibrate, ranging, volcal
+from ..engine import batstore, calibrate, lineprobe, linesweep, ofdmgrid, ranging, volcal
 from ..engine.control import ControlError, ControlHost, direct
 from .appsettings import SECTIONS
 
@@ -104,7 +105,14 @@ class GuiHost(ControlHost):
         w = self.w
         cur = getattr(w.app, section)
         # A fresh object: the running link / bridge keep the copy they were built with until the modem restarts.
-        setattr(w.app, section, dataclasses.replace(cur, **{key: value}))
+        if section == "ofdm":
+            try:                     # the engine refuses a rate / FFT / band combination with no usable carriers
+                new = ofdmgrid.validate_set(cur, key, value)
+            except ofdmgrid.GridError as ex:
+                raise ControlError(str(ex)) from None
+        else:
+            new = dataclasses.replace(cur, **{key: value})
+        setattr(w.app, section, new)
         w._after_settings()
         if section in self.live_sections:
             return "applied"
@@ -131,6 +139,10 @@ class GuiHost(ControlHost):
             rows += self._level_rows()
         # diag.wav_rx / wav_tx / event_db write here (rx_*.wav, tx_*.wav, events_*.sqlite)
         rows += [("diag.dir", str(w.diag.dir) if w.diag.dir else "none")]
+        try:                         # the carrier grid the next link start will run on (band snapped to carriers)
+            rows.append(("ofdm.grid", ofdmgrid.check(w.app.ofdm).describe()))
+        except ofdmgrid.GridError as ex:
+            rows.append(("ofdm.grid", f"REFUSED: {ex}"))
         g = w.app.general
         rows += [("modem", "on" if w.modem_on else "off"), ("modem.mode", g.modem), ("modem.topology", g.topology),
                  ("modem.node_id", g.node_id), ("modem.peer_id", g.peer_id)]
@@ -356,6 +368,108 @@ class GuiHost(ControlHost):
         res = calibrate.analyse(probe, rec, floor)
         return kv(res.rows("cal", cur)) + self._mixer_rows_kv()
 
+    _LP_USAGE = ("LINEPROBE PLAN | SEND | LISTEN  [lo=Hz] [hi=Hz] [spacing=150] [m=2] [rates=44100,48000] "
+                 "[omit_every=8] [secs=] [peak=0.5]  the stage-3 multi-tone comb (engine/lineprobe.py): SEND plays "
+                 "secs (default 4) of it, LISTEN records secs (default 10), finds the comb and reports per-tone "
+                 "level / SNR / phase, gap and empty-slot noise, clock ppm and timing jitter (modem off; same comb "
+                 "args on both hosts; lo/hi default to the OFDM band) | LINEPROBE SWEEP SEND|LISTEN|PLAN [lo=] [hi=] "
+                 "[peak=0.5] [tones=12] [secs=]  stages 0-2 (engine/linesweep.py): quiet floor, single tones, level "
+                 "steps, tone pairs, far pair between two sync chirps (~14 s); LISTEN (default 25 s) reports per-tone "
+                 "gain / SNR / PM / THD / IMD3 and ls.finding.* lines: clock, floor/spurs, band edge, tilt + EQ "
+                 "curve, noise mechanism, nonlinearity, timing jitter, codec noise, dropouts")
+
+    def _lineprobe(self, a: str):
+        kw = dict(w.split("=", 1) for w in a.split() if "=" in w)
+        words = [w for w in a.split() if "=" not in w]
+        op = words[0].upper() if words else ""
+        if op == "SWEEP":
+            return self._linesweep(words[1].upper() if len(words) == 2 else "", kw)
+        if op not in ("PLAN", "SEND", "LISTEN") or len(words) > 1 or \
+                set(kw) - {"lo", "hi", "spacing", "m", "rates", "omit_every", "secs", "peak"}:
+            raise ControlError(self._LP_USAGE)
+
+        def grab():
+            w = self.w
+            if op != "PLAN":
+                if w.session.pipe is None:
+                    raise ControlError("audio is not open (AUDIO OPEN <rx> <tx>)")
+                if w.modem_on:
+                    raise ControlError("modem is on (POWER OFF first: the link would transmit over the comb)")
+            return w.session.pipe, w.session.spec.rate, (w.app.ofdm.freq_lo, w.app.ofdm.freq_hi)
+        pipe, fs, band = self.run(grab)
+        try:
+            rates = sorted({int(fs), *(int(r) for r in kw.get("rates", "44100,48000").split(","))})
+            plan = lineprobe.plan_comb(float(kw.get("lo", band[0])), float(kw.get("hi", band[1])), rates=rates,
+                                       spacing_hz=float(kw.get("spacing", 150)),
+                                       window_periods=int(kw.get("m", 2)), omit_every=int(kw.get("omit_every", 8)))
+            peak = float(kw.get("peak", 0.5))
+            secs = float(kw.get("secs", 4.0 if op == "SEND" else 10.0))
+        except ValueError as ex:
+            raise ControlError(f"{ex}  ({self._LP_USAGE})") from None
+        if not (0.01 <= peak <= 1.0 and 0.5 <= secs <= 29.0):
+            raise ControlError("peak 0.01..1, secs 0.5..29")
+        kv = (lambda rows: [f"{k}={v}" for k, v in rows])
+        if op == "PLAN":
+            return kv([("lp.plan", plan.describe()), ("lp.tones_hz", ",".join(f"{f:g}" for f in plan.tone_hz)),
+                       ("lp.empty_hz", ",".join(f"{f:g}" for f in plan.omitted_hz))])
+        L = plan.window_periods * plan.periods[int(fs)]
+        if op == "SEND":
+            x = lineprobe.synth(plan, int(fs), max(3, int(secs * fs) // L) * plan.window_periods, peak=peak)
+            ramp = min(int(0.01 * fs), len(x) // 4)                  # 10 ms fades: no click for the FM limiter
+            x[:ramp] *= np.linspace(0.0, 1.0, ramp)
+            x[len(x) - ramp:] *= np.linspace(1.0, 0.0, ramp)
+            pipe.play(x.astype(np.float32))
+            if not pipe.wait_tx(len(x) / fs + 10):
+                raise ControlError("TX did not drain")
+            return kv([("lp.sent_s", f"{len(x) / fs:.2f}"), ("lp.peak", f"{peak:g}"), ("lp.plan", plan.describe())])
+        x = self._record(pipe, secs)
+        try:
+            s0, s1 = lineprobe.steady_span(plan, x, int(fs))
+            res = lineprobe.analyze(plan, x[s0:s1], int(fs))
+        except ValueError as ex:
+            return kv([("lp.ok", "no"), ("lp.error", f"{ex}  (same comb args on both hosts? SEND within secs?)")])
+        return kv([("lp.ok", "yes"), ("lp.span_s", f"{s0 / fs:.2f}-{s1 / fs:.2f}")] +
+                  lineprobe.report_rows(plan, res))
+
+    def _linesweep(self, op: str, kw: dict):
+        if op not in ("PLAN", "SEND", "LISTEN") or set(kw) - {"lo", "hi", "peak", "tones", "secs"}:
+            raise ControlError(self._LP_USAGE)
+
+        def grab():
+            w = self.w
+            if op != "PLAN":
+                if w.session.pipe is None:
+                    raise ControlError("audio is not open (AUDIO OPEN <rx> <tx>)")
+                if w.modem_on:
+                    raise ControlError("modem is on (POWER OFF first: the link would transmit over the sweep)")
+            return w.session.pipe, w.session.spec.rate, (w.app.ofdm.freq_lo, w.app.ofdm.freq_hi)
+        pipe, fs, band = self.run(grab)
+        try:
+            seq = linesweep.plan_sweep(float(kw.get("lo", band[0])), float(kw.get("hi", band[1])),
+                                       peak=float(kw.get("peak", 0.5)), n_tones=int(kw.get("tones", 12)))
+            secs = float(kw.get("secs", 25.0))
+        except ValueError as ex:
+            raise ControlError(f"{ex}  ({self._LP_USAGE})") from None
+        kv = (lambda rows: [f"{k}={v}" for k, v in rows])
+        if op == "PLAN":
+            return kv([("ls.plan", seq.describe())] +
+                      [(f"ls.seg.{i}", f"{s.kind} {s.start_s:.3f}+{s.dur_s:.3f}s {s.label}")
+                       for i, s in enumerate(seq.segments)])
+        if op == "SEND":
+            x = linesweep.synth(seq, int(fs))
+            pipe.play(x.astype(np.float32))
+            if not pipe.wait_tx(len(x) / fs + 10):
+                raise ControlError("TX did not drain")
+            return kv([("ls.sent_s", f"{len(x) / fs:.2f}"), ("ls.plan", seq.describe())])
+        if not (seq.dur_s + 1.0 <= secs <= 29.0):
+            raise ControlError(f"secs {seq.dur_s + 1:.0f}..29 for this sweep")
+        x = self._record(pipe, secs)
+        try:
+            res = linesweep.analyze(seq, x, int(fs))
+        except ValueError as ex:
+            return kv([("ls.ok", "no"), ("ls.error", str(ex))])
+        return kv([("ls.ok", "yes")] + linesweep.report_rows(seq, res, linesweep.classify(res)))
+
     _VOL_USAGE = ("CALIBRATE VOLUME [from=0.2] [to=1.0] [steps=9] [level=-6] [band=lo-hi] [apply=0|1] [stop=1|0]  "
                   "sweep the OS output volume with the digital level held at level= dBFS peak; recommends the system "
                   "volume (modem off; restores the volume after unless apply=1)")
@@ -539,6 +653,45 @@ class GuiHost(ControlHost):
                 f"capture.peak_dbfs={20 * np.log10(max(float(np.abs(x).max()) if len(x) else 0.0, 1e-9)):.1f}",
                 "capture.wav_b64=" + base64.b64encode(buf.getvalue()).decode("ascii")]
 
+    DIAG_CHUNK_MAX = 8 << 20
+
+    def _diag_root(self) -> Path:
+        d = self.w.diag
+        root = Path(getattr(d.cfg, "out_dir", "") or "~/modemgui-diagnostics").expanduser()
+        return root.resolve()
+
+    def _diag(self, a: str):
+        """``DIAG LIST`` | ``DIAG GET <session>/<file> [offset] [nbytes]``: the diagnostics captures (rx_*.wav,
+        tx_*.wav, events_*.sqlite) for offline decode on another host; GET returns base64 chunks (max 8 MiB), only
+        from inside the diagnostics folder."""
+        words = a.split()
+        verb = words[0].upper() if words else "LIST"
+        root = self._diag_root()
+        if verb == "LIST":
+            out = [f"diag.root={root}", f"diag.current={self.w.diag.dir or 'none'}"]
+            if root.is_dir():
+                for s in sorted(p for p in root.iterdir() if p.is_dir()):
+                    for f in sorted(s.iterdir()):
+                        if f.is_file():
+                            out.append(f"diag.file={s.name}/{f.name} {f.stat().st_size}")
+            return out
+        if verb == "GET" and len(words) >= 2:
+            p = (root / words[1]).resolve()
+            if root not in p.parents or not p.is_file():
+                raise ControlError(f"no such diagnostics file: {words[1]}")
+            try:
+                off = int(words[2]) if len(words) > 2 else 0
+                n = min(int(words[3]) if len(words) > 3 else self.DIAG_CHUNK_MAX, self.DIAG_CHUNK_MAX)
+            except ValueError:
+                raise ControlError("DIAG GET <session>/<file> [offset] [nbytes]") from None
+            size = p.stat().st_size
+            with open(p, "rb") as fh:
+                fh.seek(off)
+                data = fh.read(n)
+            return [f"diag.size={size}", f"diag.offset={off}", f"diag.n={len(data)}",
+                    "diag.b64=" + base64.b64encode(data).decode("ascii")]
+        raise ControlError("DIAG LIST | DIAG GET <session>/<file> [offset] [nbytes]")
+
     def _mixer_rows_kv(self) -> list[str]:
         """The mixer state the measurement was taken at, so a result can be reproduced."""
         try:
@@ -563,11 +716,19 @@ class GuiHost(ControlHost):
             "RANGE": ("RESPOND [secs] | INIT [secs] | SOLVE rtt= turn=  two-way acoustic ranging with a CSS Barker "
                       "burst: RESPOND arms one host, INIT on the other times the round trip; SOLVE turns the two "
                       "into metres (modem off)", direct(self._range)),
+            "LINEPROBE": (self._LP_USAGE[len("LINEPROBE "):], direct(self._lineprobe)),
             "CAPTURE": ("[secs]  the last secs (default 20, max 29) of received audio as a base64 16-bit WAV on one "
                         "line (capture.wav_b64=); works with the modem on", direct(self._capture)),
+            "DIAG": ("LIST | GET <session>/<file> [offset] [nbytes]  list / fetch the diagnostics captures (rx/tx "
+                     "WAV, event db) in base64 chunks of up to 8 MiB, for offline decode", direct(self._diag)),
             "MIXER": ("[GET] | SET in|out <0..1|N%> | MUTE in|out on|off | SNAPSHOT | RESTORE  the host OS volume / "
                       "mute / AGC of the open audio devices (CoreAudio, Pulse, ALSA)", direct(self._mixer)),
             "PORT": ("OPEN|CLOSE  the virtual serial port (Ctrl+P)", self._port),
+            "UDP": ("OPEN|CLOSE  the UDP data port (OFDM broadcast; Settings > UDP port, udp.bat_file)", self._udp),
+            "BAT": ("LIST | GET [peer] | PUT [name=N] <json> | CLEAR  programmable BAT: the tables this modem "
+                    "measured from its peers' probes (GET = saved-BAT JSON on one line, bat.json=), and PUT on a "
+                    "one-way sender to store one and point udp.bat_file at it (no air return path needed)",
+                    direct(lambda a: batstore.command(a, put=self._bat_put))),
             "IDENT": ("  send the station ID now", lambda a: self._after(self.w._send_id_now)),
             "TEXT": ("<message>  send one message on the mesh link (not while the serial port owns it)",
                      lambda a: self._after(lambda: self.w.send_text(a)) if a else self._need("TEXT <message>")),
@@ -651,6 +812,33 @@ class GuiHost(ControlHost):
                 w._restart_link()
             return self._msg()
         raise ControlError("PORT OPEN or PORT CLOSE")
+
+    def _udp(self, a: str) -> str:
+        w = self.w
+        a = a.upper()
+        if a == "OPEN":
+            if w.udp is None:
+                if w.serial is not None:
+                    raise ControlError("the serial port is open: PORT CLOSE first")
+                w._start_udp()
+            if w.udp is None:
+                raise ControlError(self._msg() or "UDP port did not open")
+            return self._msg()
+        if a == "CLOSE":
+            if w.udp is not None:
+                w._stop_udp()
+                w._restart_link()
+            return self._msg()
+        raise ControlError("UDP OPEN or UDP CLOSE")
+
+    # -- programmable BAT ---------------------------------------------------------------------------------------
+
+    def _bat_put(self, saved: dict, name: str) -> list[str]:
+        """BAT PUT: store the saved BAT beside the settings and make it this node's udp.bat_file (control thread)."""
+        d = os.path.join(os.path.dirname(os.path.abspath(self.w.app.qs.fileName())), "ne0k-bats")
+        path = batstore.write(saved, d, name)
+        how = self.run(lambda: self.set_param("udp", "bat_file", path))
+        return [f"bat.file={path}", f"bat.loaded={batstore.describe(saved)}", f"udp.bat_file={how}"]
 
     # -- named setting profiles ---------------------------------------------------------------------------------
 

@@ -636,8 +636,37 @@ def decode_longsym_mf(cfg, stop_event=None):
         clock drift / alignment (the longer-running historic view);
       • detect the Barker preamble in the clean up/down stream and decode each
         frame through the same FEC/CRC pipeline as decode().
+
+    Live / embedded use (all optional cfg keys; absent = the reference behaviour):
+      input_stream   context manager whose read(n) -> (float32 array, overflowed); an empty array
+                     is end of stream.  Replaces the sounddevice input.
+      print          f(str) replacing print() for this decoder's log lines (a host thread must
+                     not redirect the process stdout).
+      on_symbol      f(dict) per decided symbol: the running grid (the CSS clock) and the decision.
+      on_event       f(dict) per state change: acquire, preamble, frame, frame_error, rescan,
+                     relock, cadence_drop.
+      mf_dedupe_seqs False: a continuous receiver hears chunk seq 0, 1, ... once per PACKET, so
+                     repeated chunk numbers are new chunks, not duplicates (the host reassembles).
+      mf_rescan      tier 3 on a failed frame CRC: re-scan the chunk's own audio (wide per-symbol
+                     search, local grid refit, preamble offsets, least-confident-symbol chase)
+                     before declaring it lost.  Default on.
     """
-    import sounddevice as sd
+    import builtins
+    print = cfg.get("print") or builtins.print        # noqa: A001 -- see "print" above
+    if cfg.get("input_stream") is not None:
+        sd = None
+    else:
+        import sounddevice as sd
+    _on_sym_hook = cfg.get("on_symbol")
+    _on_ev_hook = cfg.get("on_event")
+
+    def _hook(fn, d):
+        if fn is None:
+            return
+        try:
+            fn(d)
+        except Exception as _he:                     # a host hook must never kill decoding
+            print(f"hook error: {_he}", flush=True)
 
     info_path   = Path(cfg.get("info",        "css_info.json"))
     result_path = Path(cfg.get("result_out",  "css_decode_result.json"))
@@ -1012,7 +1041,9 @@ def decode_longsym_mf(cfg, stop_event=None):
             _log_audio_interface("input", device, fs, channels=1)
         except Exception:
             pass
-    if hasattr(sd, "query_devices"):
+    if sd is None:
+        _input_ctx = cfg["input_stream"]
+    elif hasattr(sd, "query_devices"):
         _input_ctx = _QueuedInputStream(sd, fs, device, channels=1)
     else:
         _input_ctx = sd.InputStream(samplerate=fs, channels=1, dtype="float32",
@@ -1043,6 +1074,25 @@ def decode_longsym_mf(cfg, stop_event=None):
     peak_rms  = 0.0
     sym       = 0
 
+    # Tier-3 chunk re-scan (see the docstring's mf_rescan): keep the raw audio of one whole frame
+    # period plus margin, independent of buf (which the tracking loop trims to ~2 symbols).
+    _do_rescan = bool(cfg.get("mf_rescan", True))
+    _rh = deque()
+    # Preamble offsets tier 3 tries (payload start vs where the accepted preamble put it), nearest
+    # first.  A false preamble lock is an 11/13 Barker match inside the alternating training run-in
+    # (the payload is then read EARLY: up to train_n + P symbols) or inside the payload itself after
+    # the cadence lattice re-anchored (read LATE).  Both seen over the air (2026-11-18 BT/FM, 16-symbol
+    # run-in: +24 and -13).  Beyond +-1 an offset is only tried where the shifted window spells Barker.
+    _off_pos = train_n + P
+    _off_neg = frame_symbols - 1
+    _rescan_offsets = [0, -1, 1] + [d for j in range(2, max(_off_pos, _off_neg) + 1)
+                                    for d in (j, -j) if -_off_neg <= d <= _off_pos]
+    _rh_keep = (((train_n + P + frame_symbols + _off_neg + _off_pos + 8) * sps_eff + 2 * sps)
+                if _do_rescan else 0)
+    _chase_max = int(cfg.get("mf_rescan_chase_bits", 3))
+    _dedupe = bool(cfg.get("mf_dedupe_seqs", True))
+    _lost_syms = int(cfg.get("mf_lost_syms", 3))      # 0 = no PLL-lost re-phase
+
     def _read_more():
         nonlocal buf, total_abs, eos, peak_rms
         try:
@@ -1058,12 +1108,196 @@ def decode_longsym_mf(cfg, stop_event=None):
         if r > peak_rms:
             peak_rms = r
         buf = np.concatenate([buf, chunk])
+        if _rh_keep:
+            _rh.append((total_abs, chunk))
+            while len(_rh) > 1 and _rh[1][0] <= total_abs + chunk.size - _rh_keep:
+                _rh.popleft()
         total_abs += chunk.size
         if stop_event is not None and stop_event.is_set():
             eos = True
         if stop_file and Path(stop_file).exists():
             eos = True
         return chunk.size
+
+    def _rh_slice(a, b):
+        """Raw RX audio for absolute samples [a, b) clipped to what _rh still holds: (start, array)."""
+        if not _rh:
+            return a, None
+        a = max(a, _rh[0][0]); b = min(b, total_abs)
+        parts = [ch[max(0, a - s0):min(len(ch), b - s0)] for s0, ch in _rh
+                 if s0 < b and s0 + len(ch) > a]
+        return a, (np.concatenate(parts) if parts and b > a else None)
+
+    # Quadrature templates for the tier-3 timing envelope (|analytic MF| has no carrier ripple, so its
+    # argmax is the chirp, not a fringe of it).
+    def _quad(r):
+        R = np.fft.fft(r); h = np.zeros(len(r)); h[0] = 1
+        h[1:(len(r) + 1) // 2] = 2
+        if len(r) % 2 == 0:
+            h[len(r) // 2] = 1
+        return np.imag(np.fft.ifft(R * h)).astype(np.float64)
+    _env_refs = None
+
+    def _envelope(x):
+        """|matched filter| of x against up and down chirps; index k = a chirp ENDING at x[k]."""
+        nonlocal _env_refs
+        L = len(up_ref)
+        nf = 1 << (len(x) + L - 1).bit_length()
+        if _env_refs is None or _env_refs[0] != nf:
+            _env_refs = (nf, [np.fft.rfft(r[::-1], nf) for r in
+                              (up_ref, _quad(up_ref), down_ref, _quad(down_ref))])
+        X = np.fft.rfft(np.asarray(x, np.float64), nf)
+        c = [np.fft.irfft(X * R, nf)[:len(x)] for R in _env_refs[1]]
+        return np.hypot(c[0], c[1]), np.hypot(c[2], c[3])
+
+    def _lost_scan(sym_now):
+        """Whole-symbol search over the last _lost_syms slots: the phase delta (samples) of a strong,
+        consistent chirp train off the current grid, or None."""
+        ks = list(range(sym_now - _lost_syms + 1, sym_now + 1))
+        a = int(grid_t0 + ks[0] * grid_sps) - sps - sps_eff
+        b = int(grid_t0 + ks[-1] * grid_sps) + sps_eff // 2
+        while total_abs < b + 8 and not eos:       # the newest slot's whole-symbol window, read ahead
+            if _read_more() == 0:
+                break
+        a0, x = _rh_slice(a, b)
+        if x is None or len(x) < (len(ks) + 1) * sps_eff:
+            return None
+        eu, ed = _envelope(x)
+        env = np.maximum(eu, ed)
+        floor = float(np.median(env)) + 1e-12
+        half = sps_eff // 2
+        ds = []
+        for k in ks:
+            cpos = int(round(grid_t0 + k * grid_sps)) - 1 - a0
+            lo, hi = max(0, cpos - half), min(len(env), cpos + half)
+            if hi - lo < half:
+                return None
+            j = int(np.argmax(env[lo:hi])) + lo
+            if env[j] / floor < relock_min_ratio:
+                return None
+            ds.append(j - cpos)
+        if max(ds) - min(ds) > lock_verify_tol * sps_eff:
+            return None
+        d = float(np.mean(ds))
+        return d if abs(d) > track_search else None
+
+    def _rescan(sym_end, live_b, live_c):
+        """Tier 3: the chunk whose last payload symbol is ``sym_end`` failed its CRC on the live
+        grid.  Re-read it from its own retained audio, simple to complex, and stop at the first
+        CRC-valid alignment:
+          1. live decisions, flipping the least-confident symbols (a single flipped chirp);
+          2. a local grid refit: every symbol of the chunk searched over a WHOLE symbol
+             (not ±track_search), robust line fit, then re-decided at the payload's registered
+             offset and one symbol either side (a mis-registered preamble);
+          3. the same chase on the refit decisions.
+        Returns None when the audio is gone, else a dict (ok, seq, dat, how, grid, pts)."""
+        nonlocal grid_t0, grid_sps
+        import itertools
+        fp = (lambda b, c: _pipeline(b, c))
+
+        def chase(bits, confs, tag):
+            order = sorted(range(len(bits)), key=lambda i: abs(confs[i]))[:_chase_max]
+            for r in range(1, len(order) + 1):
+                for idx in itertools.combinations(order, r):
+                    fb = list(bits)
+                    for i in idx:
+                        fb[i] ^= 1
+                    ok_, seq_, dat_, _ = fp(fb, confs)
+                    if ok_:
+                        return dict(ok=True, seq=seq_, dat=dat_, how=f"{tag}_flip{r}")
+            return None
+
+        got = chase(live_b, live_c, "live")
+        if got:
+            return {**got, "grid": None, "pts": 0, "d": 0}
+        # fit over the chunk's whole transmission (training run-in + preamble + payload), decide far
+        # enough either side for every preamble offset
+        k_lo = sym_end - frame_symbols - P - max(train_n, _off_neg) - 1
+        k_hi = sym_end + _off_pos + 1
+        a = int(grid_t0 + k_lo * grid_sps) - sps - sps_eff
+        b = int(grid_t0 + k_hi * grid_sps) + sps_eff + track_search
+        while total_abs < b + 8 and not eos:
+            if _read_more() == 0:
+                break
+        a0, x = _rh_slice(a, b)
+        # near the start of the audio the history is shorter than the widest offset needs: decide what
+        # there is (each symbol and each offset is bounds-checked below)
+        if x is None or len(x) < (frame_symbols + 2) * sps_eff:
+            return None
+        eu, ed = _envelope(x)
+        env = np.maximum(eu, ed)
+        ks, ps, amps = [], [], []
+        half = sps_eff // 2
+        for k in range(k_lo, k_hi + 1):
+            cpos = int(round(grid_t0 + k * grid_sps)) - 1 - a0     # chirp-end index in x
+            lo, hi = max(0, cpos - half), min(len(env), cpos + half)
+            if hi - lo < half:
+                continue
+            j = int(np.argmax(env[lo:hi])) + lo
+            ks.append(k); ps.append(a0 + j + 1); amps.append(float(env[j]))
+        out = {"ok": False, "seq": None, "dat": None, "how": "lost", "grid": None, "pts": 0, "d": 0}
+        if len(ks) < 6:
+            return out
+        ks = np.array(ks, float); ps = np.array(ps, float); amps = np.array(amps)
+        strong_m = amps >= 0.5 * np.median(amps)
+        kk, pp = ks[strong_m], ps[strong_m]
+        grids = []
+        if len(kk) >= 6:
+            # Theil-Sen: the median pairwise slope shrugs off the impulse / reflection peaks that
+            # a least-squares fit over a whole-symbol search would chase.
+            i, j = np.triu_indices(len(kk), 1)
+            sl = np.median((pp[j] - pp[i]) / (kk[j] - kk[i]))
+            sl = float(np.clip(sl, sps_eff * 0.98, sps_eff * 1.02))
+            t0n = float(np.median(pp - sl * kk))
+            inl = np.abs(pp - (t0n + sl * kk)) <= track_search
+            if inl.sum() >= max(6, 0.5 * len(kk)):
+                A = np.vstack([np.ones(inl.sum()), kk[inl]]).T
+                coef, *_ = np.linalg.lstsq(A, pp[inl], rcond=None)
+                t0n, sl = float(coef[0]), float(np.clip(coef[1], sps_eff * 0.98, sps_eff * 1.02))
+                grids.append(("refit", t0n, sl, list(zip(kk[inl], pp[inl]))))
+        grids.append(("live", float(grid_t0), float(grid_sps), []))
+        for tag, g0, gs, pts in grids:
+            bits, confs = {}, {}
+            for k in range(k_lo, k_hi + 1):
+                pred = int(round(g0 + k * gs))
+                lo = pred - sps - track_search - a0
+                hi = pred + track_search - a0
+                if lo < 0 or hi > len(x):
+                    continue
+                c_, _pk, _snr, _w = _mf_symbol(x[lo:hi], sps + track_search)
+                bits[k] = 1 if c_ >= 0 else 0; confs[k] = c_
+            pay0 = sym_end - frame_symbols + 1
+            for d in _rescan_offsets:
+                rng_ = range(pay0 + d, sym_end + 1 + d)
+                if not all(k in bits for k in rng_):
+                    continue
+                if abs(d) >= 2:
+                    pre_k = range(pay0 + d - P, pay0 + d)
+                    if not all(k in bits for k in pre_k) or (
+                            sum(1 for i, k in enumerate(pre_k) if bits[k] == preamble[i]) / P < bark_thr):
+                        continue
+                fb = [bits[k] for k in rng_]; fc = [confs[k] for k in rng_]
+                if tag == "live" and d == 0:
+                    continue                     # identical to the live decision (step 1)
+                ok_, seq_, dat_, _ = fp(fb, fc)
+                if not ok_ and d == 0:
+                    got = chase(fb, fc, tag)
+                    if got:
+                        ok_, seq_, dat_ = True, got["seq"], got["dat"]
+                        tag = got["how"]
+                if ok_:
+                    out = dict(ok=True, seq=seq_, dat=dat_, how=f"{tag}" + (f"_off{d:+d}" if d else ""),
+                               grid=(g0, gs), pts=len(pts), d=d)
+                    if pts and tag.startswith("refit"):
+                        # Keep the clock on what the chunk itself says: re-centre the live grid
+                        # and seed the historic fit with the chunk's own chirp positions.
+                        grid_t0, grid_sps = g0, gs
+                        hist.clear()
+                        hist.extend((int(k), float(p)) for k, p in pts[-hist_len:])
+                    return out
+        if grids and grids[0][0] == "refit":
+            out["grid"] = (grids[0][1], grids[0][2]); out["pts"] = len(grids[0][3])
+        return out
 
     try:
         with _input_ctx as stream:
@@ -1210,9 +1444,17 @@ def decode_longsym_mf(cfg, stop_event=None):
                 while anchor - sps_eff >= buf_start + sps + track_search:
                     anchor -= sps_eff
                 grid_t0  = anchor          # peak_abs of symbol index 0
-                grid_sps = float(sps_eff)
+                # mf_grid_sps_seed: the sender's clock as a host already measured it (a live receiver
+                # carries it across bursts), so the first frame starts on the right rate, not nominal.
+                grid_sps = float(np.clip(float(cfg.get("mf_grid_sps_seed") or sps_eff),
+                                         sps_eff * 0.98, sps_eff * 1.02))
                 print(f"MF_ACQUIRE chirp@{t0_abs} ({t0_abs/fs:.2f}s) "
                       f"grid_anchor={int(anchor)} sps_eff={sps_eff}", flush=True)
+                _hook(_on_ev_hook, {"event": "acquire", "abs": int(t0_abs),
+                                    "grid_t0": float(grid_t0), "grid_sps": grid_sps,
+                                    "sps_eff": sps_eff})
+                _frame_doubt = 0
+                _lost_run = 0
                 hist     = deque(maxlen=hist_len)
                 stream_bits = []; stream_confs = []
                 # Running noise |conf| baseline for the preamble cstr gate:
@@ -1331,6 +1573,7 @@ def decode_longsym_mf(cfg, stop_event=None):
                                   f"ended, lattice dropped", flush=True)
                             _last_pre_sym = None
                             _post_gap = True
+                            _hook(_on_ev_hook, {"event": "cadence_drop", "sym": sym})
                     else:
                         _weak_run = 0
 
@@ -1398,6 +1641,44 @@ def decode_longsym_mf(cfg, stop_event=None):
                             grid_sps = float(np.clip(coef[1], sps_eff * 0.98,
                                                      sps_eff * 1.02))
                             grid_t0  = float(coef[0])
+                    # PLL in doubt: a symbol inside a frame that is weak or sits far off the grid
+                    _doubt = (not strong) or abs(found_abs - pred_abs) > 0.7 * track_search
+                    if state == "COLLECT" and _doubt:
+                        _frame_doubt += 1
+                    _hook(_on_sym_hook, {"sym": sym, "abs": int(found_abs), "pred": int(pred_abs),
+                                         "te": int(found_abs - pred_abs), "grid_t0": float(grid_t0),
+                                         "grid_sps": float(grid_sps), "sps_eff": sps_eff,
+                                         "snr_db": float(snr_db), "strong": bool(strong),
+                                         "bit": int(bit), "conf": float(c), "state": state,
+                                         "doubt": bool(_doubt), "hist": len(hist)})
+
+                    # ── PLL lost: whole-symbol re-phase (any symbol length) ──
+                    # A slip larger than ±track_search (lost or inserted samples on
+                    # the RX path, a BT stall) leaves every later symbol off the
+                    # predicted window: weak, so the historic fit never sees the
+                    # chirps again.  After _lost_syms consecutive in-doubt symbols,
+                    # scan the last symbols over a WHOLE symbol each; re-phase only
+                    # onto a strong train (>= relock_min_ratio over the envelope
+                    # median, every slot) at ONE consistent new phase.  An echo
+                    # cannot trigger it: with the direct path on-grid the symbols
+                    # are strong, not in doubt.
+                    _lost_run = _lost_run + 1 if _doubt else 0
+                    if _lost_syms and _lost_run >= _lost_syms and _rh_keep:
+                        _lost_run = 0
+                        _ld = _lost_scan(sym)
+                        if _ld is not None:
+                            grid_t0 += _ld
+                            hist.clear()
+                            if state == "SEARCH":
+                                stream_bits = []; stream_confs = []
+                            _last_pre_sym = None
+                            diag["lost_relocks"] = diag.get("lost_relocks", 0) + 1
+                            print(f"MF_RELOCK sym={sym} lost delta={int(_ld)}smp "
+                                  f"({_ld / sps_eff:+.2f}sym) state={state}", flush=True)
+                            _hook(_on_ev_hook, {"event": "relock", "sym": sym, "delta": int(_ld),
+                                                "grid_t0": float(grid_t0), "reason": "lost",
+                                                "state": state})
+                            continue    # re-decode this sym on the new phase
 
                     # ── Lock-verify watchdog (see the config block above) ────
                     # Evaluated only in SEARCH (never mid-frame).  Every
@@ -1447,6 +1728,8 @@ def decode_longsym_mf(cfg, stop_event=None):
                                   f"delta={int(_lv_delta)}smp "
                                   f"({_lv_delta / sps_eff:+.2f}sym) "
                                   f"new_grid_t0={grid_t0:.0f}", flush=True)
+                            _hook(_on_ev_hook, {"event": "relock", "sym": sym,
+                                                "delta": int(_lv_delta), "grid_t0": float(grid_t0)})
                             continue    # re-decode this sym on the new grid
                         else:
                             _lv_pending = _lv_delta     # first sighting — confirm next window
@@ -1503,6 +1786,9 @@ def decode_longsym_mf(cfg, stop_event=None):
                                        "sps": sps, "sps_eff": sps_eff,
                                        "fr": frame_symbols})
                                 state = "COLLECT"; payload_b = []; payload_c = []
+                                _frame_doubt = 0
+                                _hook(_on_ev_hook, {"event": "preamble", "sym": sym,
+                                                    "grid_sps": float(grid_sps)})
                         # Barker preamble search — only if the wake path above
                         # did NOT just transition us to COLLECT (same iteration).
                         #
@@ -1692,6 +1978,9 @@ def decode_longsym_mf(cfg, stop_event=None):
                                        "sps": sps, "sps_eff": sps_eff,
                                        "fr": frame_symbols})
                                 state = "COLLECT"; payload_b = []; payload_c = []
+                                _frame_doubt = 0
+                                _hook(_on_ev_hook, {"event": "preamble", "sym": sym,
+                                                    "grid_sps": float(grid_sps)})
                             elif (m >= bark_thr and _cad_ok and _pre_strong_ok
                                   and _post_gap_ok):
                                 # Bit pattern matches but confidence sits below
@@ -1718,7 +2007,33 @@ def decode_longsym_mf(cfg, stop_event=None):
                             ok, seq, dat, rs_fail = _pipeline(payload_b, payload_c)
                             fsnr = (float(np.mean(snr_log[-frame_symbols:]))
                                     if snr_log else 0.0)
-                            if ok and seq not in _decoded_seqs:
+                            _how = "live"
+                            if not ok and _do_rescan:
+                                # tier 3: the chunk failed on the live grid -- re-scan its audio
+                                _t3 = time.perf_counter()
+                                _rs = _rescan(sym, payload_b, payload_c)
+                                _how = "lost" if _rs is None else _rs["how"]
+                                print(f"MF_RESCAN sym={sym} result={_how} "
+                                      f"{'' if not _rs or not _rs['grid'] else 'grid_sps=%.2f pts=%d ' % (_rs['grid'][1], _rs['pts'])}"
+                                      f"doubt={_frame_doubt} {time.perf_counter() - _t3:.2f}s", flush=True)
+                                _hook(_on_ev_hook, {"event": "rescan", "sym": sym, "how": _how,
+                                                    "ok": bool(_rs and _rs["ok"]),
+                                                    "grid": None if not _rs else _rs["grid"],
+                                                    "doubt": _frame_doubt})
+                                if _rs and _rs["ok"]:
+                                    ok, seq, dat, rs_fail = True, _rs["seq"], _rs["dat"], None
+                                    diag["rescued"] = diag.get("rescued", 0) + 1
+                                    if _rs.get("d") and _last_pre_sym is not None:
+                                        # the accepted preamble was a false lock: the cadence
+                                        # lattice moves to where the real one was
+                                        _last_pre_sym += _rs["d"]
+                                elif _last_pre_sym is not None:
+                                    # a lost frame's preamble may have been a false lock: never
+                                    # let it anchor the lattice that rejects the real ones (the
+                                    # next lock must clear the post-gap 12/13 bar instead)
+                                    _last_pre_sym = None
+                                    _post_gap = True
+                            if ok and (not _dedupe or seq not in _decoded_seqs):
                                 # The frame CRC has already validated integrity.
                                 # Payloads may be arbitrary BINARY (modem-layer
                                 # packets), so we do NOT gate on UTF-8 — that
@@ -1744,7 +2059,8 @@ def decode_longsym_mf(cfg, stop_event=None):
                                               "at_sample": _at_sample,
                                               "grid_sps": round(float(grid_sps), 3),
                                               "snr_db": round(fsnr, 1),
-                                              "source": "mf"}
+                                              "source": "mf" if _how == "live" else f"mf_{_how}",
+                                              "doubt": _frame_doubt}
                                 decoded_frames.append(_frame_rec)
                                 _decoded_seqs.add(seq); frames_decoded += 1
                                 if _on_frame is not None:
@@ -1770,11 +2086,19 @@ def decode_longsym_mf(cfg, stop_event=None):
                                 # ── [D] frame telemetry ──────────────────
                                 _send({"t": "frame", "seq": seq,
                                        "n": frames_decoded, "sc": sym})
+                                _hook(_on_ev_hook, {"event": "frame", "sym": sym, "seq": seq,
+                                                    "how": _how, "snr_db": fsnr,
+                                                    "grid_sps": float(grid_sps),
+                                                    "doubt": _frame_doubt})
                             elif not (ok and seq in _decoded_seqs):
                                 frames_errored += 1
                                 print(f"MF_FRAME_ERROR "
                                       f"reason={'rs' if rs_fail else 'crc'} "
                                       f"snr={fsnr:.1f}dB", flush=True)
+                                _hook(_on_ev_hook, {"event": "frame_error", "sym": sym,
+                                                    "reason": "rs" if rs_fail else "crc",
+                                                    "snr_db": fsnr, "doubt": _frame_doubt,
+                                                    "at": int(round(grid_t0 + sym * grid_sps))})
                             state = "SEARCH"
                             if expected_frames and frames_decoded >= expected_frames:
                                 break
@@ -2272,6 +2596,11 @@ def decode(cfg, stop_event=None):
     # once and rises onset_floor_rise_db per symbol.  0 = silence_thr only (the old behaviour).
     onset_rel_db        = float(cfg.get("onset_rel_db", 6.0))
     onset_floor_rise_db = float(cfg.get("onset_floor_rise_db", 0.2))
+    # ... and 0.02 dB per symbol while symbols are over it (a burst must not drag the floor up to itself and make
+    # its own low-SNR symbols read quiet); a relative onset needs onset_sustain_syms symbols over the floor in a
+    # row (one loud noise symbol is not a transmission), and anchors HARD at the first of them.
+    onset_floor_rise_busy_db = float(cfg.get("onset_floor_rise_busy_db", 0.02))
+    onset_sustain_syms  = int(cfg.get("onset_sustain_syms", 2))
     # Phase-step recovery while synced.  A jitter buffer that inserts or
     # drops a packet's worth of audio mid-frame (measured on the SIP conference:
     # +1026 smp, 21.4 ms) moves every later chirp outside the +-post_acq_search
@@ -2541,6 +2870,8 @@ def decode(cfg, stop_event=None):
     _quiet_run = 0         # consecutive symbols without signal (onset guard)
     _onset_floor = None    # onset guard's room floor (symbol rms, pre-sync)
     _quiet_rel_run = 0     # consecutive symbols under that floor + onset_rel_db
+    _rel_sig_run = 0       # consecutive symbols over it
+    _quiet_rel_before = 0  # the quiet run that preceded the current signal run
     _step_ref_snr = None   # running tracked-symbol snr (phase-step recovery)
     _step_cand = None      # (offset, wide conf, bit_stream index) awaiting confirmation
     _step_fix = None       # (bit_stream index, conf) to re-decide at the next append
@@ -3693,22 +4024,31 @@ def decode(cfg, stop_event=None):
                 if onset_rel_db > 0.0 and _onset_floor is not None:
                     _othr = max(_othr, _onset_floor * 10.0 ** (onset_rel_db / 20.0))
                 _onset_sig = _sym_rms > _othr
+                if _onset_sig:
+                    if _rel_sig_run == 0:
+                        _quiet_rel_before = _quiet_rel_run
+                    _rel_sig_run += 1
+                    _quiet_rel_run = 0
+                else:
+                    _rel_sig_run = 0
+                    _quiet_rel_run += 1
                 if not sync_found and onset_guard_silence_syms > 0:
                     if signal_present and _quiet_run >= onset_guard_silence_syms:
                         _last_resync_sym = sym_count - 2     # css_pll_mark_onset(), ahead 0
                         _last_resync_soft = False
-                    elif _onset_sig and _quiet_rel_run >= onset_guard_silence_syms:
-                        # room-relative onset: soft, so a high-score or non-alternating (real preamble)
-                        # window stays eligible -- noise can pass floor+rel mid-burst at low SNR
-                        _last_resync_sym = sym_count - 2
-                        _last_resync_soft = True
+                    elif (onset_rel_db > 0.0 and _rel_sig_run == onset_sustain_syms
+                          and _quiet_rel_before >= onset_guard_silence_syms):
+                        # room-relative onset, HARD like the absolute one (a soft anchor trusts partial-preamble
+                        # windows: 0.48 locks), placed at the first of the sustained symbols
+                        _last_resync_sym = sym_count - 2 - (onset_sustain_syms - 1)
+                        _last_resync_soft = False
                 _quiet_run = 0 if signal_present else _quiet_run + 1
-                _quiet_rel_run = 0 if _onset_sig else _quiet_rel_run + 1
                 if not sync_found:
                     if _onset_floor is None or _sym_rms < _onset_floor:
                         _onset_floor = _sym_rms
-                    else:
-                        _onset_floor *= 10.0 ** (onset_floor_rise_db / 20.0)
+                    else:   # follows the room up on quiet symbols, barely while something is on the air
+                        _onset_floor *= 10.0 ** ((onset_floor_rise_db if not _onset_sig
+                                                  else onset_floor_rise_busy_db) / 20.0)
                 if not sync_found:
                     tim_flush_thr = int(cfg.get("syndet_flush_terr", sps // 2))
                     if abs(timing_err) <= tim_flush_thr:

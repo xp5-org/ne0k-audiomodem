@@ -16,8 +16,8 @@ from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
 from ..engine import ProbeReport
 
 BAT_COLORS = {-1: (240, 196, 25), 0: (201, 206, 214), 1: (109, 168, 224), 2: (47, 127, 208),
-              4: (31, 157, 85), 6: (142, 68, 173)}
-BAT_NAMES = {-1: "pilot", 0: "off", 1: "BPSK", 2: "QPSK", 4: "16-QAM", 6: "64-QAM"}
+              3: (22, 160, 160), 4: (31, 157, 85), 6: (142, 68, 173)}
+BAT_NAMES = {-1: "pilot", 0: "off", 1: "BPSK", 2: "QPSK", 3: "8-PSK", 4: "16-QAM", 6: "64-QAM"}
 MAX_CHARTS = 8
 
 

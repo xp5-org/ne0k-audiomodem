@@ -103,6 +103,22 @@ class Diagnostics:
             if self._log_f:
                 self._log_f.close(); self._log_f = None
 
+    def snapshot(self, settings: dict) -> None:
+        """At every modem start while an RX recording runs: the settings in force and where in rx_*.wav they took
+        effect, as settings_<HHMMSS>.json beside it, so the recording can be decoded offline per segment."""
+        rx = self._rx
+        if rx is None:
+            return
+        try:
+            import json
+            p = rx.path.parent / f"settings_{time.strftime('%H%M%S')}.json"
+            p.write_text(json.dumps({"time": time.time(), "rx_wav": rx.path.name, "rx_wav_index": rx.n,
+                                     "rate": self._session.spec.rate if self._session else None,
+                                     "header": self.header, "settings": settings}, indent=1, default=str))
+            self.log(f"settings snapshot -> {p.name} at rx sample {rx.n}")
+        except Exception as e:                      # diagnostics never break the modem
+            self.log(f"settings snapshot failed: {e}")
+
     # -- audio -------------------------------------------------------------
 
     def attach(self, session) -> None:

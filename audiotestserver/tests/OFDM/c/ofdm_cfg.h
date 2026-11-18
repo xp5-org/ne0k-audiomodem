@@ -115,7 +115,7 @@ int ofdm_n_syncs(const ofdm_cfg *c, int data_syms);
  * every second frame is discarded at large n_fft. */
 int ofdm_frame_min_gap(const ofdm_cfg *c, int n_body_syms);
 
-/* Gray-coded constellation for `bits` in {1,2,4,6}.  Points are unit average
+/* Gray-coded constellation for `bits` in {1,2,3,4,6} (3 = 8-PSK).  Points are unit average
  * power.  `bits_tab` holds n_pts*bits entries, MSB-first per point, in the same
  * order as the points.  Returns 0 ok, -1 no such table.
  *

@@ -191,6 +191,30 @@ Framework (phase 1) and the generic I/O panel + spectrograph (phases 2-3, minus 
   + `css.carrier_margin_db` 10 dB), floor = 10th percentile of 5 s of window RMS, falls at once, rises 0.5 dB/s
   (0.02 dB/s inside a burst, so a 450 s frame cannot cut itself off).  Weak signals still hold the channel via
   the chirp tracker.  OFDM's `carrier_db` (mesh_rx) is the same design defect and is not changed yet.
+- **FIXED (2026-11-17, decoder py + C): the Mac's repeat CSS decode failures.**  Mac sync scores were bimodal:
+  1.00 (good) vs 0.46-0.70 (25 of 68 syncs; m6600 had 2 of 52), the weak ones -> FRAME_ERROR / RETRO_GATE with
+  every symbol at 29 dB.  They came 1.2-2.9 s after the peer keyed, the good ones 5.6 s: early locks on the
+  training run-in (partial-preamble windows), read at the wrong offset.  The onset guard that blocks them anchors
+  on "signal after >= 2 silent symbols" and "silent" was rms < silence_threshold 0.002 (-54 dBFS) absolute; the
+  MacBook mic floor runs -64..-44 dBFS (noise gate +15 dB once open), so no symbol was silent and the guard
+  never anchored.  Fix: `onset_rel_db` 6 (silent also = under the pre-sync room floor + 6 dB; floor falls at once,
+  rises 0.2 dB/sym on quiet symbols, 0.02 while loud), `onset_sustain_syms` 2 loud symbols in a row, anchor HARD
+  (a soft anchor trusts partial-preamble windows: tried, made 0.48 locks, net worse).  Corpus (tools/
+  corpus_replay.py, 80 vCPU): Mac-room mixes 81 -> 91 packets, frame errors 16 -> 6, weak syncs 33 -> 9; group
+  runs 567 units identical; laptops +1; 0 regressions.  Parity case pll_015_room_lead; fixture test
+  tests/test_css_onset_room.py (real capture + Mac room audio).  Today's laptop sessions (fetched with DIAG,
+  404 units, 0.15 s): 49 -> 50 packets, 0 regressions, the one changed unit a real Mac 0.49/0.53 lock now 1.00.
+  Live on builds 105/106: 10/10 sends first try (56-81 s), m6600 0 weak syncs, Mac 2 -- both right after a burst
+  ended (room tail, "carrier idle"), no packet lost.  OPEN: those post-burst tail locks (would blind the decoder
+  ~14 s if an ACK followed at once); 61 weak syncs remain across the sessions; 0.5 s (MF path) not in the corpus
+  replay yet.
+- **Corpus replay** (`tools/corpus_replay.py`): real RX recordings (laptop diag sessions, group-run per-member
+  rx.wav, CAPTURE grabs) cut into burst units and decoded in a process pool under decode() variants; judges a
+  receiver change by packets / frame errors / weak syncs and lists every unit that differs.  Corpus lives in
+  test_objoutput/css_corpus/ (group_runs = symlinks to meshsip output, laptops_*, mac_noise_mix).  New control
+  command `DIAG LIST | GET` pulls laptop session files; each modem start now writes settings_<time>.json (+ rx
+  sample index) beside rx_*.wav so sessions decode per segment.  Seen in passing: group-run CSS units show 330
+  frame errors / 398 weak syncs against 319 packets -- worth its own look.
 - **FIXED (2026-11-17): PLL bar LOCKED for minutes on an idle Mac.**  Relit by the CSS decoder's preamble sync on
   room noise (score 0.50), tracker grid locks on own-TX echoes, and CW-ident guesses on noise (`rx`, peer -1), 8 s
   per relight.  CSS sync / grid lock are now LinkEvent `sync` (pianoroll shows them; css_bcast still takes them

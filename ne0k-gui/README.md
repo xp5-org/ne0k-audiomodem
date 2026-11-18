@@ -243,6 +243,33 @@ frames as the point-to-point modes) and the multi-host test rig. Not done anywhe
 (`MSG_BAND` is supported by the state machine but off), the C engine for modes other than `full`, a GUI tab for the
 link, over-the-air runs (everything was exercised on loop/mix buses and PulseAudio null sinks).
 
+#### CSS receive for long symbols (`css.symbol_dur` > 0.25 s, `css.decoder pll_c`)
+
+`engine/css_longrx.py`. The C streaming PLL stops at 0.25 s symbols. Above that, the receiver used to record
+each burst and decode it cold after it ended, with no timing loop running meanwhile. Now the CSS clock is
+tracked live while the burst arrives, and stays tracked through every decode step:
+
+- The C chirp tracker (`TrkStream`, the PLL bank) runs on every sample, across bursts: per-station grids,
+  ppm against our clock, carrier sense.
+- Each burst gets a live session of `css_decoder.decode_longsym_mf`, fed sample by sample, re-acquired
+  per burst and seeded with the sender's last measured clock (`mf_grid_sps_seed`).
+- Tiers inside the session:
+  1. the current symbol on the historic grid fit (t0, samples/symbol);
+  2. each symbol searched in a predicted window with a 12-slice matched filter;
+  3. on a chunk CRC failure, a re-scan of that chunk's own audio: chase the least-confident symbols,
+     search each symbol over a whole symbol, refit the grid locally, try preamble offsets ±1, then
+     re-centre the live grid on the result (`mf_rescan`). Three in-doubt symbols in a row (weak or off
+     the grid) trigger a whole-symbol re-phase, at any symbol length, onto a strong, consistent chirp
+     train (`mf_lost_syms`; an echo cannot trip it while the direct path is on-grid);
+  4. at burst end, a missing chunk number, a CRC failure tiers 1-3 did not fix, or fewer chunks than
+     the burst could hold re-scans the whole burst on the session thread, merged by chunk number;
+  5. still missing: the loss is declared (`tier5` log line, `err` link event). A packet whose
+     unrecovered failure might be a trailing chunk is delivered with `ok=False`, never silently short.
+
+`INFO` shows the live clock in `css.cs` as `clock=<state> ppm=<grid> trk_ppm=<tracker>`. Tests:
+`tests/test_css_longrx.py` (the BT/FM link's −529.6 ppm clock, a weak flipped symbol, 0.3-symbol sample
+slips inside a payload and inside a training run-in, two bursts, a dead fade through tiers 4-5, noise).
+
 #### Hub & spoke (General > Topology `hub` / `hub_relay`, ofdm_only)
 
 `engine/hub_mac.py`, in place of the mesh announce round. One leader, `hub_id`, runs the channel; every other
@@ -341,6 +368,55 @@ containing `c/rs255.c`, `OFDM/c`, `CSS/c`); override with `make REF=/path/to/tes
   Pluto/Pico connectors, PyInstaller packaging.
 - Spectrograph has no scroll-back, own-TX shading or time axis yet (the data is in
   `Spectrum.tx_active` and `AudioPipe.history`).
+- **TODO: BAT file delivery over the TCP control port and the serial console (2026-11-18).** A one-way link
+  (mac BT-Car FM transmitter -> m6600 RTL-SDR) can be probed, since the receiver measures the BAT, but the
+  measured table cannot get back to the sender: `udp.bat_file` is only a path on the sender's disk, and a
+  release node has no file push (no ssh; the agent only deploys modem zips). Needed: control-port commands
+  (e.g. `BAT GET` on the receiver -> saved-BAT JSON on one line, `BAT PUT <json>` / `BAT SAVE <path>` on the
+  sender) and the same verbs on the serial console's `.ctl` socket, so a BAT measured ahead of time can be
+  loaded on both ends of a stream with no return path on the air.
+  **Done 2026-11-18 (builds 109/110):** `BAT LIST | GET [peer] | PUT [name=N] <json> | CLEAR` and `UDP OPEN|CLOSE`
+  on the GUI's control port (`engine/batstore.py`, `tests/test_bat_control.py`); the serial CLI's control port has
+  `BAT LIST | GET | CLEAR`.  Still open: the same verbs on the serial `.ctl` socket.
+- **TODO (calibration engine): TX EQ / pre-emphasis from the measured BAT slope (2026-11-18).** On the
+  BT-Car FM transmitter -> RTL-SDR link (receiver de-emphasis 75 us) the probe's BAT slopes down slowly toward
+  9 kHz (64-QAM low, 16-QAM / QPSK near the top), so the upper carriers carry fewer bits.  The calibration engine
+  should fit the per-carrier SNR tilt from the probe and offer a TX EQ / pre-emphasis curve (or a matching
+  de-emphasis choice: 50 vs 75 us, transmitter unknown), then re-probe to confirm the flatter BAT.
+- **TODO: second chunk after key-up is lost on air (2026-11-18).** One-way OFDM bcast streams over the BT-Car
+  FM transmitter -> RTL-SDR link (builds 111/112, BAT moved with `BAT GET`/`BAT PUT`) lose the 2nd chunk of
+  every burst: records P01/P02 of each 6-burst trial are missing at n_fft 512 (84/96) and 256 (83/96), with a
+  2.0 s or a 0.5 s `ofdm.keyup_lead_s` alike.  Loopback with the same BAT delivers 32/32 and no corrupt record
+  was ever delivered, so it is the air path: suspects are the Bluetooth/FM AGC or limiter settling after the
+  first chunk, or the receiver's timing/channel estimate carried from chunk 1 into chunk 2.  Next: record the
+  RX audio around a burst on m6600 (`parec` on `rtlsdr.monitor`), decode it offline, and see whether chunk 2
+  is distorted (level/EVM) or mistimed (sync offset).
+- **TODO: n_fft 16 and 8 (2026-11-18).** The C engine has no size floor: `ofdm_cfg_build` takes any power of two
+  >= 4, and the C acquisition's only limit (top_k > n_occupied) is now clamped in `ofdm_acq_c.py`.  In loopback
+  (probe -> BAT -> UDP bcast stream, 48 kHz):
+  - 128, 64 and 32 deliver 8/8 records on both backends, at 64-QAM and with cp 0.5 and a 0.5 s lead.  They are
+    now in the `ofdm.n_fft` choices.
+  - 16 (3 kHz carriers, 5 active over 400-20000 Hz) loses about 1 chunk in 4 with no corrupt chunk ("bcast gap"
+    lines).  Suspects are frame acquisition and SYNC on 20-sample symbols.
+  - 8 decodes the probe's periodic block (44.5 dB), but the non-periodic measurement block reads -16 dB, so the
+    BAT comes out all off.  `ChannelProbe._align_meas` (and `ofdm_probe.c`) matched-filters ONE 10-sample
+    symbol, which is ambiguous; it should correlate over several measurement symbols.  Fix it in Python and C
+    together.
+
+  Remember the physics: carrier spacing = rate / n_fft, so 8 at 48 kHz has three 6 kHz carriers and a narrow
+  band may hold none.
+- **Done 2026-11-18: the engine enforces the carrier grid** (`engine/ofdmgrid.py`, `tests/test_ofdmgrid.py`).  The
+  PHY always rounded freq_lo / freq_hi onto the carriers (k * fs / n_fft) silently, and accepted combinations with
+  no usable carrier.  Now one function computes the same geometry as `ofdm_modem.build_config` and the C
+  `ofdm_cfg_build` (checked against both, 44.1 / 48 kHz x n_fft 32-4096 x six bands) and:
+  - refuses an n_fft outside 32-4096 (or not a power of two), and a band with fewer than 2 data carriers;
+  - runs the link on the band snapped to carriers, so the log line `ofdm grid: ...` and the saved BAT name the
+    frequencies on the air (400-9000 Hz at n_fft 256 runs 562.5-9000 Hz);
+  - refuses a SET on the control port that would make a dead grid, and answers every grid SET with an
+    `ofdm.grid=` line; INFO has `ofdm.grid` too.
+
+  The line-probe comb is built on the same grid (`lineprobe.plan_for_grid`).  Still open: the settings dialog
+  does not show the snapped band or refuse a dead grid while editing.  A dead grid shows up at link start instead.
 
 ## Ham mode (station identification)
 
